@@ -457,3 +457,8 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Claude Code
+# Ignore local settings (machine-specific permissions)
+.claude/settings.local.json
+# Keep rules/ and skills/ tracked (shared team knowledge)

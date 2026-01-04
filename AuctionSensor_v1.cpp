@@ -2031,6 +2031,25 @@ static void PopulateEffortBaselines(
     int totalImbalanceBars[AMT::EFFORT_BUCKET_COUNT] = {0};
     int marketStateSessionsContributed[AMT::EFFORT_BUCKET_COUNT] = {0};
 
+    // Synthetic bar aggregation tracking per bucket (for regime baseline pre-warm)
+    // Aggregates N raw bars into synthetic bars for stable regime classification
+    // Uses TRUE RANGE to capture gaps between synthetic bars (critical for RTH open)
+    constexpr int SYNTHETIC_AGGREGATION_BARS = 5;  // Match VolatilityEngine default
+    double synthRunningHigh[AMT::EFFORT_BUCKET_COUNT];
+    double synthRunningLow[AMT::EFFORT_BUCKET_COUNT];
+    double synthLastClose[AMT::EFFORT_BUCKET_COUNT] = {0.0};    // Last close in current window
+    double synthPrevClose[AMT::EFFORT_BUCKET_COUNT] = {0.0};    // Previous synthetic bar's close
+    bool synthPrevCloseValid[AMT::EFFORT_BUCKET_COUNT] = {false};
+    int synthBarCount[AMT::EFFORT_BUCKET_COUNT] = {0};
+    double synthDurationSec[AMT::EFFORT_BUCKET_COUNT] = {0.0};
+    int synthSamplesPushed = 0;
+
+    // Initialize running high/low
+    for (int i = 0; i < AMT::EFFORT_BUCKET_COUNT; ++i) {
+        synthRunningHigh[i] = -1e9;
+        synthRunningLow[i] = 1e9;
+    }
+
     int sessionsProcessed = 0;
     int totalBarsPushed = 0;
     int sessionsSkippedPartial = 0;
@@ -2113,6 +2132,46 @@ static void PopulateEffortBaselines(
             if (barDurationMin > 0.001) {
                 const double rangeVelocity = barRangeTicks / barDurationMin;
                 dist.range_velocity.push(rangeVelocity);
+            }
+
+            // Synthetic bar aggregation for regime baseline pre-warm
+            // Track running high/low across N bars, then push TRUE RANGE metrics
+            synthRunningHigh[bucketIdx] = (std::max)(synthRunningHigh[bucketIdx], barHigh);
+            synthRunningLow[bucketIdx] = (std::min)(synthRunningLow[bucketIdx], barLow);
+            synthLastClose[bucketIdx] = barClose;  // Track last close for True Range
+            synthBarCount[bucketIdx]++;
+            synthDurationSec[bucketIdx] += barIntervalSec;
+
+            // When we have enough bars, push TRUE RANGE synthetic metrics and reset
+            if (synthBarCount[bucketIdx] >= SYNTHETIC_AGGREGATION_BARS) {
+                // Compute TRUE RANGE using DRY helper (AMT_Volatility.h)
+                double trueHigh, trueLow;
+                AMT::ComputeTrueRange(synthRunningHigh[bucketIdx], synthRunningLow[bucketIdx],
+                                      synthPrevClose[bucketIdx], synthPrevCloseValid[bucketIdx],
+                                      trueHigh, trueLow);
+
+                const double synthTrueRangeTicks = (trueHigh - trueLow) / tickSize;
+                const double synthDurationMin = synthDurationSec[bucketIdx] / 60.0;
+
+                if (synthTrueRangeTicks > 0.0) {
+                    dist.synthetic_bar_range.push(synthTrueRangeTicks);
+
+                    if (synthDurationMin > 0.001) {
+                        const double synthVelocity = synthTrueRangeTicks / synthDurationMin;
+                        dist.synthetic_range_velocity.push(synthVelocity);
+                    }
+                    synthSamplesPushed++;
+                }
+
+                // Save current close as previous for next synthetic bar
+                synthPrevClose[bucketIdx] = synthLastClose[bucketIdx];
+                synthPrevCloseValid[bucketIdx] = true;
+
+                // Reset for next synthetic bar
+                synthRunningHigh[bucketIdx] = -1e9;
+                synthRunningLow[bucketIdx] = 1e9;
+                synthBarCount[bucketIdx] = 0;
+                synthDurationSec[bucketIdx] = 0.0;
             }
 
             // avg_trade_size: only push when numTrades > 0 (no fallback, no contamination)
@@ -2318,8 +2377,8 @@ static void PopulateEffortBaselines(
     if (diagLevel >= 1) {
         char buf[512];
         snprintf(buf, sizeof(buf),
-            "[EFFORT-BASELINE] Processed %d sessions, %d bars total (skipped: %d partial)",
-            sessionsProcessed, totalBarsPushed, sessionsSkippedPartial);
+            "[EFFORT-BASELINE] Processed %d sessions, %d bars total, %d synthetic bars (skipped: %d partial)",
+            sessionsProcessed, totalBarsPushed, synthSamplesPushed, sessionsSkippedPartial);
         sc.AddMessageToLog(buf, 0);
 
         // Log per-bucket status
@@ -4241,7 +4300,8 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
         // Use ComputeFromRawBar for synthetic bar aggregation on 1-min charts
         // This aggregates N bars before computing regime (default: 5 bars = 5-min synthetic)
         st->lastVolResult = st->volatilityEngine.ComputeFromRawBar(
-            sc.High[curBarIdx], sc.Low[curBarIdx], barDurationSec, tickSize, 0.0);
+            sc.High[curBarIdx], sc.Low[curBarIdx], sc.Close[curBarIdx],
+            barDurationSec, tickSize, 0.0);
 
         // Populate synthetic baseline when a new synthetic bar forms
         // This happens every N raw bars (e.g., every 5 bars for 5-bar aggregation)
@@ -7639,26 +7699,92 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                 }
 
                 // Volatility Engine state line (context gate for trigger trustworthiness)
-                // Shows: regime + stability + percentile + tradability rules
+                // Condensed format: regime + ER/chop + trend/CV + pace + shock + stop + gap
                 {
                     const AMT::VolatilityResult& vol = st->lastVolResult;
                     if (vol.IsReady()) {
+                        // Build condensed log string
+                        SCString volLine;
                         const char* transStr = vol.isTransitioning ? " TRANS" : "";
-                        msg.Format("VOL: %s pctl=%.0f stable=%d%s | expect=%.1fx | entries=%s bkout=%s pos=%.2fx",
+
+                        // Base: REGIME p=XX s=XX
+                        volLine.Format("VOL: %s p=%.0f s=%d%s",
                             AMT::VolatilityRegimeToShortString(vol.regime),
                             vol.rangePercentile,
                             vol.stabilityBars,
-                            transStr,
-                            vol.expectedRangeMultiplier,
-                            vol.tradability.allowNewEntries ? "OK" : "BLOCK",
-                            vol.tradability.blockBreakouts ? "BLOCK" : "OK",
-                            vol.tradability.positionSizeMultiplier);
+                            transStr);
+
+                        // Efficiency Ratio + chop (if valid)
+                        if (vol.efficiencyValid) {
+                            msg.Format(" | ER=%.2f chop=%.2f", vol.efficiencyRatio, vol.chopSeverity);
+                            volLine += msg;
+                        }
+
+                        // Volatility trend + CV (if valid)
+                        if (vol.volMomentumValid || vol.stabilityValid) {
+                            const char* trendStr = "?";
+                            if (vol.volMomentumValid) {
+                                switch (vol.volTrend) {
+                                    case AMT::VolatilityTrend::EXPANDING:   trendStr = "EXPAND"; break;
+                                    case AMT::VolatilityTrend::CONTRACTING: trendStr = "CONTRACT"; break;
+                                    case AMT::VolatilityTrend::STABLE:      trendStr = "STABLE"; break;
+                                    default: trendStr = "?"; break;
+                                }
+                            }
+                            if (vol.stabilityValid) {
+                                msg.Format(" | %s cv=%.2f", trendStr, vol.volCV);
+                            } else {
+                                msg.Format(" | %s", trendStr);
+                            }
+                            volLine += msg;
+                        }
+
+                        // Pace
+                        if (vol.paceReady) {
+                            msg.Format(" | %s", AMT::AuctionPaceToShortString(vol.pace));
+                            volLine += msg;
+                        }
+
+                        // Shock/aftershock
+                        if (vol.shockFlag) {
+                            volLine += " | SHOCK=Y";
+                        } else if (vol.aftershockActive) {
+                            msg.Format(" | SHOCK=N after=%d", vol.barsSinceShock);
+                            volLine += msg;
+                        } else {
+                            volLine += " | SHOCK=N";
+                        }
+
+                        // Stop guidance (if active)
+                        if (vol.IsStopGuidanceReady()) {
+                            msg.Format(" | stop>=%.1ft", vol.stopGuidance.minStopTicks);
+                            volLine += msg;
+                        }
+
+                        // Gap context (diagnostic, if present)
+                        if (vol.HasGapContext()) {
+                            const char* respChar = "?";
+                            if (vol.gapResponse == AMT::EarlyResponse::ACCEPTING) respChar = "A";
+                            else if (vol.gapResponse == AMT::EarlyResponse::REJECTING) respChar = "R";
+                            else if (vol.gapResponse == AMT::EarlyResponse::UNRESOLVED) respChar = "U";
+
+                            if (vol.IsGapUp()) {
+                                msg.Format(" | GAP=+%.0ft(%s)", vol.gapFromValueTicks, respChar);
+                            } else if (vol.IsGapDown()) {
+                                msg.Format(" | GAP=-%.0ft(%s)", vol.gapFromValueTicks, respChar);
+                            } else {
+                                msg.Format(" | GAP=IN(%s)", respChar);
+                            }
+                            volLine += msg;
+                        }
+
+                        st->logManager.LogToSC(LogCategory::AMT, volLine, false);
                     } else {
                         msg.Format("VOL: %s (reason=%s)",
                             vol.IsWarmup() ? "WARMUP" : "ERROR",
                             AMT::VolatilityErrorToString(vol.errorReason));
+                        st->logManager.LogToSC(LogCategory::AMT, msg, false);
                     }
-                    st->logManager.LogToSC(LogCategory::AMT, msg, false);
                 }
 
                 // Delta Engine state line (participation pressure classification)

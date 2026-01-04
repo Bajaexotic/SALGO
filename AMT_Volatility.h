@@ -43,6 +43,32 @@
 namespace AMT {
 
 // ============================================================================
+// TRUE RANGE HELPER (DRY - used by SyntheticBarAggregator and baseline pre-warm)
+// ============================================================================
+// True Range extends simple high/low to include gap from previous close.
+// Critical for capturing overnight gaps at RTH open.
+//
+// Formula:
+//   TrueHigh = max(simpleHigh, prevClose)
+//   TrueLow = min(simpleLow, prevClose)
+//   TrueRange = TrueHigh - TrueLow
+// ============================================================================
+
+inline void ComputeTrueRange(
+    double simpleHigh, double simpleLow, double prevClose, bool prevCloseValid,
+    double& outTrueHigh, double& outTrueLow)
+{
+    if (prevCloseValid) {
+        outTrueHigh = (std::max)(simpleHigh, prevClose);
+        outTrueLow = (std::min)(simpleLow, prevClose);
+    } else {
+        // No previous close - True Range = simple range
+        outTrueHigh = simpleHigh;
+        outTrueLow = simpleLow;
+    }
+}
+
+// ============================================================================
 // SYNTHETIC BAR AGGREGATOR
 // ============================================================================
 // Aggregates N 1-minute bars into synthetic periods for regime detection.
@@ -73,6 +99,7 @@ namespace AMT {
 struct SyntheticBarData {
     double high = 0.0;
     double low = 0.0;
+    double close = 0.0;       // For True Range calculation
     double durationSec = 0.0;
     bool valid = false;
 };
@@ -93,6 +120,26 @@ private:
     double syntheticLow_ = 0.0;
     double syntheticDurationSec_ = 0.0;
     bool cacheValid_ = false;
+
+    // True Range tracking (captures gaps between synthetic bars)
+    // At RTH open, the gap from GLOBEX close is critical for regime classification
+    double prevSyntheticClose_ = 0.0;     // Close of previous synthetic bar
+    bool prevSyntheticCloseValid_ = false;
+    double syntheticTrueHigh_ = 0.0;      // max(syntheticHigh_, prevSyntheticClose_)
+    double syntheticTrueLow_ = 0.0;       // min(syntheticLow_, prevSyntheticClose_)
+    double lastCloseInWindow_ = 0.0;      // Close of most recent bar in current window
+
+    // Efficiency Ratio tracking (Kaufman-style chop detection)
+    // ER = |Close(end) - Close(start)| / Σ|Close(i) - Close(i-1)|
+    // Range: 0.0 (pure chop) to 1.0 (perfect trend)
+    double firstCloseInWindow_ = 0.0;     // Close of first bar in window (for net change)
+    double pathLengthSum_ = 0.0;          // Σ|close[i] - close[i-1]| (total path traveled)
+    double lastPushedClose_ = 0.0;        // Previous bar's close (for path calculation)
+    bool lastPushedCloseValid_ = false;   // Track if we have a valid previous close
+    int barsInCurrentWindow_ = 0;         // Count bars in current synthetic window
+
+    // Minimum path for valid ER calculation (2 ticks)
+    static constexpr double MIN_PATH_FOR_VALID_ER_TICKS = 2.0;
 
     // Synthetic bar boundary tracking
     // Used to detect when a NEW synthetic bar forms (every N raw bars)
@@ -137,12 +184,17 @@ public:
     /**
      * Push a new bar's data into the aggregator.
      * Call once per closed 1-min bar.
+     * @param high Bar high price
+     * @param low Bar low price
+     * @param close Bar close price (for True Range calculation)
+     * @param durationSec Bar duration in seconds
      * @return true if this bar completes a new synthetic bar (boundary crossed)
      */
-    bool Push(double high, double low, double durationSec) {
+    bool Push(double high, double low, double close, double durationSec) {
         SyntheticBarData& slot = buffer_[writeIdx_];
         slot.high = high;
         slot.low = low;
+        slot.close = close;
         slot.durationSec = durationSec;
         slot.valid = true;
 
@@ -153,11 +205,39 @@ public:
 
         // Track synthetic bar boundary
         rawBarCounter_++;
-        newSyntheticBarFormed_ = (rawBarCounter_ % aggregationBars_ == 0) && IsReady();
+        const bool boundaryReached = (rawBarCounter_ % aggregationBars_ == 0) && IsReady();
+
+        // =========================================================================
+        // Efficiency Ratio tracking (Kaufman-style)
+        // Track path length within current synthetic window
+        // =========================================================================
+        if (barsInCurrentWindow_ == 0) {
+            // First bar of new synthetic window - record starting close
+            firstCloseInWindow_ = close;
+            pathLengthSum_ = 0.0;
+        } else if (lastPushedCloseValid_) {
+            // Subsequent bars - accumulate path length
+            pathLengthSum_ += std::abs(close - lastPushedClose_);
+        }
+        lastPushedClose_ = close;
+        lastPushedCloseValid_ = true;
+        barsInCurrentWindow_++;
 
         // Recompute cached values
         ComputeSynthetic();
 
+        // When synthetic bar completes, save close for next True Range calculation
+        // and reset efficiency tracking for next window
+        if (boundaryReached) {
+            prevSyntheticClose_ = lastCloseInWindow_;
+            prevSyntheticCloseValid_ = true;
+
+            // Reset efficiency tracking for next synthetic window
+            // (but preserve lastPushedClose_ for first path segment of next window)
+            barsInCurrentWindow_ = 0;
+        }
+
+        newSyntheticBarFormed_ = boundaryReached;
         return newSyntheticBarFormed_;
     }
 
@@ -225,6 +305,57 @@ public:
         return cacheValid_ ? syntheticLow_ : 0.0;
     }
 
+    // =========================================================================
+    // TRUE RANGE ACCESSORS (captures gaps between synthetic bars)
+    // =========================================================================
+
+    /**
+     * Get synthetic TRUE RANGE in ticks.
+     * True Range extends high/low to include gap from previous synthetic close.
+     * Critical for RTH open when overnight gap exists.
+     */
+    double GetSyntheticTrueRangeTicks(double tickSize) const {
+        if (!cacheValid_ || tickSize <= 0.0) return 0.0;
+        return (syntheticTrueHigh_ - syntheticTrueLow_) / tickSize;
+    }
+
+    /**
+     * Get synthetic TRUE RANGE in price units.
+     */
+    double GetSyntheticTrueRangePrice() const {
+        if (!cacheValid_) return 0.0;
+        return syntheticTrueHigh_ - syntheticTrueLow_;
+    }
+
+    /**
+     * Check if True Range includes a gap (true high/low differs from simple high/low).
+     */
+    bool HasGap() const {
+        if (!cacheValid_ || !prevSyntheticCloseValid_) return false;
+        return (syntheticTrueHigh_ != syntheticHigh_) || (syntheticTrueLow_ != syntheticLow_);
+    }
+
+    /**
+     * Get the gap component in ticks (True Range - Simple Range).
+     * Positive = gap included in True Range.
+     */
+    double GetGapTicks(double tickSize) const {
+        if (!cacheValid_ || tickSize <= 0.0) return 0.0;
+        double simpleRange = syntheticHigh_ - syntheticLow_;
+        double trueRange = syntheticTrueHigh_ - syntheticTrueLow_;
+        return (trueRange - simpleRange) / tickSize;
+    }
+
+    /**
+     * Get True Range velocity (ticks per minute, using True Range).
+     */
+    double GetSyntheticTrueRangeVelocity(double tickSize) const {
+        if (!cacheValid_ || tickSize <= 0.0) return 0.0;
+        double durationMin = syntheticDurationSec_ / 60.0;
+        if (durationMin <= 0.001) return 0.0;
+        return GetSyntheticTrueRangeTicks(tickSize) / durationMin;
+    }
+
     /**
      * Get range velocity for synthetic bar (ticks per minute).
      */
@@ -233,6 +364,71 @@ public:
         double durationMin = syntheticDurationSec_ / 60.0;
         if (durationMin < 0.001) return 0.0;
         return GetSyntheticRangeTicks(tickSize) / durationMin;
+    }
+
+    // =========================================================================
+    // EFFICIENCY RATIO ACCESSORS (Kaufman-style chop detection)
+    // =========================================================================
+
+    /**
+     * Check if efficiency ratio is valid for this synthetic window.
+     * Returns false if path length is too small to measure meaningfully.
+     * @param tickSize Tick size for minimum path calculation
+     */
+    bool IsEfficiencyValid(double tickSize) const {
+        if (!cacheValid_ || tickSize <= 0.0) return false;
+        // Need at least MIN_PATH_FOR_VALID_ER_TICKS of travel to measure efficiency
+        return (pathLengthSum_ / tickSize) >= MIN_PATH_FOR_VALID_ER_TICKS;
+    }
+
+    /**
+     * Get Kaufman Efficiency Ratio for current synthetic window.
+     * ER = |Close(end) - Close(start)| / Σ|Close(i) - Close(i-1)|
+     * @param tickSize Tick size (used only for validity check)
+     * @return 0.0 (pure chop) to 1.0 (perfect trend), 0.5 if invalid
+     */
+    double GetEfficiencyRatio(double tickSize) const {
+        if (!IsEfficiencyValid(tickSize)) return 0.5;  // Neutral when undefined
+        if (pathLengthSum_ < 1e-10) return 0.5;  // Avoid div by zero
+
+        double netChange = std::abs(lastCloseInWindow_ - firstCloseInWindow_);
+        double er = netChange / pathLengthSum_;
+
+        // Clamp to [0, 1] for safety (should naturally be in range)
+        return (std::max)(0.0, (std::min)(1.0, er));
+    }
+
+    /**
+     * Get net close-to-close change in price units.
+     * This is the "progress" component of efficiency.
+     */
+    double GetNetCloseChange() const {
+        if (!cacheValid_) return 0.0;
+        return std::abs(lastCloseInWindow_ - firstCloseInWindow_);
+    }
+
+    /**
+     * Get total path length in price units.
+     * This is the "travel" component of efficiency.
+     */
+    double GetPathLength() const {
+        return pathLengthSum_;
+    }
+
+    /**
+     * Get total path length in ticks.
+     */
+    double GetPathLengthTicks(double tickSize) const {
+        if (tickSize <= 0.0) return 0.0;
+        return pathLengthSum_ / tickSize;
+    }
+
+    /**
+     * Get net close-to-close change in ticks.
+     */
+    double GetNetChangeTicks(double tickSize) const {
+        if (tickSize <= 0.0 || !cacheValid_) return 0.0;
+        return std::abs(lastCloseInWindow_ - firstCloseInWindow_) / tickSize;
     }
 
     // =========================================================================
@@ -251,12 +447,27 @@ public:
         syntheticDurationSec_ = 0.0;
         rawBarCounter_ = 0;
         newSyntheticBarFormed_ = false;
+
+        // True Range state
+        prevSyntheticClose_ = 0.0;
+        prevSyntheticCloseValid_ = false;
+        syntheticTrueHigh_ = 0.0;
+        syntheticTrueLow_ = 0.0;
+        lastCloseInWindow_ = 0.0;
+
+        // Efficiency Ratio state
+        firstCloseInWindow_ = 0.0;
+        pathLengthSum_ = 0.0;
+        lastPushedClose_ = 0.0;
+        lastPushedCloseValid_ = false;
+        barsInCurrentWindow_ = 0;
     }
 
 private:
     /**
      * Compute synthetic values from buffer.
      * Uses the most recent aggregationBars_ entries.
+     * Also computes True Range extending to previous synthetic bar's close.
      */
     void ComputeSynthetic() {
         if (validCount_ < aggregationBars_) {
@@ -267,6 +478,7 @@ private:
         double maxHigh = -1e30;
         double minLow = 1e30;
         double totalDuration = 0.0;
+        double lastClose = 0.0;
 
         // Walk backwards from most recent entry
         int idx = (writeIdx_ - 1 + MAX_AGGREGATION_BARS) % MAX_AGGREGATION_BARS;
@@ -281,12 +493,23 @@ private:
             if (slot.low < minLow) minLow = slot.low;
             totalDuration += slot.durationSec;
 
+            // Most recent bar (i=0) provides the close for this synthetic bar
+            if (i == 0) {
+                lastClose = slot.close;
+            }
+
             idx = (idx - 1 + MAX_AGGREGATION_BARS) % MAX_AGGREGATION_BARS;
         }
 
         syntheticHigh_ = maxHigh;
         syntheticLow_ = minLow;
         syntheticDurationSec_ = totalDuration;
+        lastCloseInWindow_ = lastClose;
+
+        // Compute True Range using DRY helper
+        ComputeTrueRange(maxHigh, minLow, prevSyntheticClose_, prevSyntheticCloseValid_,
+                         syntheticTrueHigh_, syntheticTrueLow_);
+
         cacheValid_ = true;
     }
 };
@@ -438,6 +661,94 @@ inline bool IsVolatilityWarmup(VolatilityErrorReason r) {
 }
 
 // ============================================================================
+// VOLATILITY TREND (Direction of Volatility Change)
+// ============================================================================
+// Measures whether volatility is expanding, contracting, or stable.
+// Uses log ratio of current vs prior synthetic range.
+// Symmetric thresholds: +/- 0.18 (~1.2x / 0.83x)
+
+enum class VolatilityTrend : int {
+    UNKNOWN = 0,
+    CONTRACTING = 1,   // volMomentum < -0.18 (shrinking ranges)
+    STABLE = 2,        // -0.18 <= volMomentum <= +0.18
+    EXPANDING = 3      // volMomentum > +0.18 (widening ranges)
+};
+
+inline const char* VolatilityTrendToString(VolatilityTrend t) {
+    switch (t) {
+        case VolatilityTrend::UNKNOWN:     return "UNKNOWN";
+        case VolatilityTrend::CONTRACTING: return "CONTRACTING";
+        case VolatilityTrend::STABLE:      return "STABLE";
+        case VolatilityTrend::EXPANDING:   return "EXPANDING";
+    }
+    return "UNK";
+}
+
+// ============================================================================
+// VOLATILITY STABILITY (How Consistent is Volatility Itself)
+// ============================================================================
+// Measures coefficient of variation of recent ranges.
+// High CV = vol is whipsawing (dangerous), Low CV = predictable vol.
+
+enum class VolatilityStability : int {
+    UNKNOWN = 0,
+    UNSTABLE = 1,    // CV > 0.5 - volatility is whipsawing
+    MODERATE = 2,    // 0.2 < CV <= 0.5
+    STABLE = 3       // CV <= 0.2 - predictable volatility
+};
+
+inline const char* VolatilityStabilityToString(VolatilityStability s) {
+    switch (s) {
+        case VolatilityStability::UNKNOWN:  return "UNKNOWN";
+        case VolatilityStability::UNSTABLE: return "UNSTABLE";
+        case VolatilityStability::MODERATE: return "MODERATE";
+        case VolatilityStability::STABLE:   return "STABLE";
+    }
+    return "UNK";
+}
+
+// ============================================================================
+// GAP CONTEXT (DIAGNOSTIC ONLY)
+// ============================================================================
+// Gap context describes where the market opened relative to prior value area.
+// This is computed at SENSOR level (not volatility engine) and injected here.
+// Strictly diagnostic - NOT a gate or regime modifier.
+
+enum class GapLocation : int {
+    UNKNOWN = 0,      // Gap not determined (before RTH or insufficient data)
+    ABOVE_VALUE = 1,  // Open > prior VAH (gap up above value)
+    BELOW_VALUE = 2,  // Open < prior VAL (gap down below value)
+    IN_VALUE = 3      // Open between prior VAL and VAH (inside value)
+};
+
+inline const char* GapLocationToString(GapLocation g) {
+    switch (g) {
+        case GapLocation::UNKNOWN:     return "UNKNOWN";
+        case GapLocation::ABOVE_VALUE: return "ABOVE_VALUE";
+        case GapLocation::BELOW_VALUE: return "BELOW_VALUE";
+        case GapLocation::IN_VALUE:    return "IN_VALUE";
+    }
+    return "UNK";
+}
+
+enum class EarlyResponse : int {
+    UNKNOWN = 0,    // Not determined (too early in session or no gap)
+    ACCEPTING = 1,  // Moving further from value (gap acceptance)
+    REJECTING = 2,  // Returning toward value (gap rejection)
+    UNRESOLVED = 3  // Mixed/ambiguous (no clear direction)
+};
+
+inline const char* EarlyResponseToString(EarlyResponse r) {
+    switch (r) {
+        case EarlyResponse::UNKNOWN:    return "UNKNOWN";
+        case EarlyResponse::ACCEPTING:  return "ACCEPTING";
+        case EarlyResponse::REJECTING:  return "REJECTING";
+        case EarlyResponse::UNRESOLVED: return "UNRESOLVED";
+    }
+    return "UNK";
+}
+
+// ============================================================================
 // TRADABILITY RULES
 // ============================================================================
 // What constraints to apply based on volatility regime.
@@ -455,14 +766,25 @@ struct TradabilityRules {
     double paceConfirmationMultiplier = 1.0;  // FAST/EXTREME require more confirmation
     double paceSizeMultiplier = 1.0;          // FAST/EXTREME reduce position size
 
+    // Chop-derived multipliers (Efficiency Ratio based)
+    // chopSeverity ranges 0.0 (efficient) to 1.0 (max chop)
+    // These use smooth scaling based on chopSeverity rather than discrete states
+    double chopSizeMultiplier = 1.0;           // = 1.0 - 0.5 * chopSeverity
+    double chopConfirmationMultiplier = 1.0;   // = 1.0 + chopSeverity
+
     // Convenience check
     bool IsRestricted() const {
         return !allowNewEntries || requireHigherConfidence;
     }
 
-    // Get combined size multiplier (regime × pace)
+    // Get combined size multiplier (regime × pace × chop)
     double GetCombinedSizeMultiplier() const {
-        return positionSizeMultiplier * paceSizeMultiplier;
+        return positionSizeMultiplier * paceSizeMultiplier * chopSizeMultiplier;
+    }
+
+    // Get combined confirmation multiplier (pace × chop)
+    double GetCombinedConfirmationMultiplier() const {
+        return paceConfirmationMultiplier * chopConfirmationMultiplier;
     }
 };
 
@@ -574,6 +896,140 @@ struct VolatilityResult {
     bool newSyntheticBarFormed = false;        // True if this bar completed a new synthetic bar
     double syntheticRangeVelocity = 0.0;       // Synthetic velocity (ticks/min) for baseline
 
+    // TRUE RANGE DIAGNOSTICS (captures gaps)
+    double syntheticSimpleRangeTicks = 0.0;    // Simple range (H-L) without gap
+    bool syntheticHasGap = false;              // True if True Range > Simple Range
+    double syntheticGapTicks = 0.0;            // Gap component in ticks
+
+    // =========================================================================
+    // EFFICIENCY RATIO (Kaufman-style chop detection)
+    // =========================================================================
+    // ER = |Close(end) - Close(start)| / Σ|Close(i) - Close(i-1)|
+    // Range: 0.0 (pure chop) to 1.0 (perfect trend)
+    //
+    // 2x2 Matrix:
+    //   High Vol + High ER = Discovery with follow-through (tradeable)
+    //   High Vol + Low ER = Violent chop (DANGER - account killer)
+    //   Low Vol + High ER = Grindy directional drift (selective)
+    //   Low Vol + Low ER = Compression rotation (stand down)
+
+    double efficiencyRatio = 0.5;              // 0.0 (chop) to 1.0 (trend), 0.5 = neutral
+    bool efficiencyValid = false;              // False if path too small to measure
+    double efficiencyPercentile = 50.0;        // vs phase baseline (when baselined)
+
+    // Chop severity (scalar 0-1 for smooth downstream scaling)
+    // chopSeverity = 1.0 - efficiencyRatio (when valid)
+    // 0.0 = efficient (trending), 1.0 = max chop
+    double chopSeverity = 0.0;
+    bool chopActive = false;                   // True when high vol + high chopSeverity
+
+    // Path metrics (for diagnostics)
+    double pathLengthTicks = 0.0;              // Total close-to-close travel
+    double netChangeTicks = 0.0;               // Net close-to-close change
+
+    // =========================================================================
+    // SHOCK DETECTOR (Single-bar Anomaly)
+    // =========================================================================
+    // Shock = extreme bar (P99+ range or velocity) - orthogonal to regime.
+    // Shocks can occur INSIDE any regime. They matter for:
+    //   - Slippage risk (execution physics temporarily degraded)
+    //   - Signal reliability (confirmations less trustworthy)
+    //   - Stop distance (wider stops needed)
+    //
+    // Aftershock = decay window after shock. Microstructure hangover persists
+    // for N synthetic bars (wide spreads, depth discontinuities, erratic fills).
+
+    bool shockFlag = false;                    // True if this bar is a shock (P99+)
+    bool aftershockActive = false;             // True if within decay window of a shock
+    int barsSinceShock = 999;                  // Bars since last shock (999 = no recent shock)
+    double shockMagnitude = 0.0;               // Z-score or percentile of shock (for severity)
+
+    // =========================================================================
+    // VOLATILITY MOMENTUM + STABILITY
+    // =========================================================================
+    // Momentum: Direction of volatility change (expanding/contracting).
+    // volMomentum = log(currentRange / priorRange)
+    // Symmetric thresholds: +/- 0.18 (~1.2x expansion / 0.83x contraction)
+    //
+    // Stability: How consistent is volatility itself?
+    // CV = stddev / mean of recent ranges.
+    // High CV = vol is whipsawing (dangerous), Low CV = predictable.
+
+    VolatilityTrend volTrend = VolatilityTrend::UNKNOWN;
+    double volMomentum = 0.0;                  // Log ratio (+ = expanding, - = contracting)
+    bool volMomentumValid = false;             // False if prior range not available
+
+    VolatilityStability volStability = VolatilityStability::UNKNOWN;
+    double volCV = 0.0;                        // Coefficient of variation of recent ranges
+    bool stabilityValid = false;               // False if mean too small for CV
+    double stabilityConfidenceMultiplier = 1.0; // 0.7 for UNSTABLE, 1.0 otherwise
+
+    // =========================================================================
+    // MINIMUM STOP DISTANCE (Physics Constraint)
+    // =========================================================================
+    // Physics-based floor for stop distance - not a strategy, a constraint.
+    //
+    // minStopTicks = p75RangeTicks * paceMultiplier * regimeMultiplier
+    //
+    // CRITICAL INVARIANT: If the physics-based stop floor exceeds the structural
+    // invalidation stop for the setup, THE TRADE IS INADMISSIBLE. Don't widen
+    // the stop beyond structural invalidation - skip the trade entirely.
+    //
+    // This keeps stop guidance as a CONSTRAINT, not a suggestion that turns
+    // bad trades into "tradable" ones by stretching risk.
+
+    struct StopGuidance {
+        double minStopTicks = 0.0;             // Absolute floor - structural stop MUST exceed this
+        double suggestedTicks = 0.0;           // Comfortable buffer (1.5x floor)
+        bool isConstraintActive = false;       // True if calculated (not warmup)
+        double paceMultiplier = 1.0;           // For diagnostics
+        double regimeMultiplier = 1.0;         // For diagnostics
+        double shockMultiplier = 1.0;          // For diagnostics
+        double baseRangeTicks = 0.0;           // P75 range ticks (base)
+
+        // Helper for admissibility check
+        // Returns true if the structural stop is wide enough to be physics-safe
+        bool IsAdmissible(double structuralStopTicks) const {
+            if (!isConstraintActive) return true;  // No constraint = admissible
+            return structuralStopTicks >= minStopTicks;
+        }
+
+        // Returns reason string if inadmissible (for logging)
+        const char* GetInadmissibleReason(double structuralStopTicks) const {
+            if (!isConstraintActive) return nullptr;
+            if (structuralStopTicks < minStopTicks) {
+                return "structural_stop_below_physics_floor";
+            }
+            return nullptr;
+        }
+    } stopGuidance;
+
+    // =========================================================================
+    // GAP CONTEXT (DIAGNOSTIC ONLY - Injected by Sensor)
+    // =========================================================================
+    // These fields are populated by AuctionSensor at RTH open, not by the
+    // volatility engine. They describe where the market opened relative to
+    // prior value area and early response behavior.
+    //
+    // NOTE: Strictly diagnostic. NOT a gate or regime modifier. Do not use
+    // these to block or modify trades - they are for observational logging only.
+
+    GapLocation gapLocation = GapLocation::UNKNOWN;
+    EarlyResponse gapResponse = EarlyResponse::UNKNOWN;
+    double gapFromValueTicks = 0.0;     // Distance from VAH (if above) or VAL (if below)
+    int barsIntoSession = 0;            // For tracking early response window
+
+    // Setters for sensor injection
+    void SetGapContext(GapLocation loc, double distTicks) {
+        gapLocation = loc;
+        gapFromValueTicks = distTicks;
+    }
+
+    void SetGapResponse(EarlyResponse resp, int bars) {
+        gapResponse = resp;
+        barsIntoSession = bars;
+    }
+
     // =========================================================================
     // VALIDITY / ERROR
     // =========================================================================
@@ -634,6 +1090,75 @@ struct VolatilityResult {
     double GetCombinedConfirmationMultiplier() const {
         return tradability.paceConfirmationMultiplier;
     }
+
+    // =========================================================================
+    // SHOCK ACCESSORS
+    // =========================================================================
+
+    // True if shock or aftershock active (execution physics degraded)
+    bool IsShockOrAftershock() const { return shockFlag || aftershockActive; }
+
+    // True if currently in shock (this bar, not aftershock)
+    bool IsShock() const { return shockFlag; }
+
+    // True if in aftershock decay window (not shock, but recent shock)
+    bool IsAftershock() const { return aftershockActive && !shockFlag; }
+
+    // Get size multiplier for shock conditions
+    // Shock = 50% reduction, Aftershock = 25% reduction
+    double GetShockSizeMultiplier() const {
+        if (shockFlag) return 0.5;
+        if (aftershockActive) return 0.75;
+        return 1.0;
+    }
+
+    // =========================================================================
+    // STOP GUIDANCE ACCESSORS
+    // =========================================================================
+
+    // Check if stop guidance is ready
+    bool IsStopGuidanceReady() const { return stopGuidance.isConstraintActive; }
+
+    // Get minimum stop in ticks
+    double GetMinStopTicks() const { return stopGuidance.minStopTicks; }
+
+    // Get suggested stop in ticks (1.5x floor)
+    double GetSuggestedStopTicks() const { return stopGuidance.suggestedTicks; }
+
+    // Check if a structural stop is admissible (physics-safe)
+    bool IsStopAdmissible(double structuralStopTicks) const {
+        return stopGuidance.IsAdmissible(structuralStopTicks);
+    }
+
+    // Get comprehensive size multiplier including all conditions
+    // Combines: regime × pace × chop × shock × stability
+    double GetFullSizeMultiplier() const {
+        double mult = tradability.positionSizeMultiplier;      // Regime base
+        mult *= tradability.paceSizeMultiplier;                // Pace adjustment
+        mult *= tradability.chopSizeMultiplier;                // Chop adjustment
+        mult *= GetShockSizeMultiplier();                      // Shock adjustment
+        mult *= stabilityConfidenceMultiplier;                 // Stability adjustment
+        return mult;
+    }
+
+    // Get comprehensive confirmation multiplier including all conditions
+    double GetFullConfirmationMultiplier() const {
+        double mult = tradability.paceConfirmationMultiplier;  // Pace base
+        mult *= tradability.chopConfirmationMultiplier;        // Chop adjustment
+        return mult;
+    }
+
+    // =========================================================================
+    // GAP CONTEXT ACCESSORS (Diagnostic Only)
+    // =========================================================================
+
+    bool HasGapContext() const { return gapLocation != GapLocation::UNKNOWN; }
+    bool IsGapUp() const { return gapLocation == GapLocation::ABOVE_VALUE; }
+    bool IsGapDown() const { return gapLocation == GapLocation::BELOW_VALUE; }
+    bool IsInValue() const { return gapLocation == GapLocation::IN_VALUE; }
+
+    bool IsGapAccepting() const { return gapResponse == EarlyResponse::ACCEPTING; }
+    bool IsGapRejecting() const { return gapResponse == EarlyResponse::REJECTING; }
 };
 
 // ============================================================================
@@ -843,12 +1368,35 @@ public:
     int rawBarsProcessed = 0;           // Raw bars since last synthetic update
 
     // =========================================================================
+    // SHOCK DETECTOR STATE
+    // =========================================================================
+    // Shock = single-bar extreme (P99+ range or velocity)
+    // Aftershock = decay window after shock (microstructure hangover)
+    int barsSinceLastShock_ = 999;      // Large = no recent shock
+    static constexpr int AFTERSHOCK_DECAY_BARS = 3;  // 3 synthetic bars = ~15 min decay
+    static constexpr double SHOCK_PERCENTILE_THRESHOLD = 99.0;  // P99 = shock
+
+    // =========================================================================
+    // VOLATILITY MOMENTUM + STABILITY STATE
+    // =========================================================================
+    // Momentum tracking
+    double priorSyntheticRange_ = 0.0;      // Previous synthetic bar range
+    bool priorSyntheticRangeValid_ = false; // True after first synthetic bar
+
+    // Stability tracking (small rolling window)
+    RollingDist recentVolatility_;          // Recent synthetic ranges for CV calculation
+    static constexpr int STABILITY_WINDOW = 10;     // Track 10 synthetic bars
+    static constexpr double VOL_MOMENTUM_THRESHOLD = 0.18;  // +/- 0.18 = symmetric
+    static constexpr double MIN_MEAN_FOR_CV_TICKS = 3.0;    // Min mean for valid CV
+
+    // =========================================================================
     // CONSTRUCTOR / INITIALIZATION
     // =========================================================================
 
     VolatilityEngine() {
         atrBaseline.reset(300);  // Track 300 bars of ATR
         syntheticAggregator.SetAggregationBars(config.syntheticAggregationBars);
+        recentVolatility_.reset(STABILITY_WINDOW);  // Track recent synthetic ranges
     }
 
     void SetEffortStore(const EffortBaselineStore* store) {
@@ -1108,12 +1656,14 @@ public:
     //
     // Returns: VolatilityResult with usingSyntheticBars flag set appropriately
     //
-    VolatilityResult ComputeFromRawBar(double barHigh, double barLow, double barDurationSec,
-                                        double tickSize, double atrValue = 0.0) {
+    VolatilityResult ComputeFromRawBar(double barHigh, double barLow, double barClose,
+                                        double barDurationSec, double tickSize,
+                                        double atrValue = 0.0) {
         rawBarsProcessed++;
 
         // Always push to aggregator (even if synthetic mode is off, for flexibility)
-        syntheticAggregator.Push(barHigh, barLow, barDurationSec);
+        // Include close for True Range calculation
+        syntheticAggregator.Push(barHigh, barLow, barClose, barDurationSec);
 
         if (syntheticModeActive && config.useSyntheticBars) {
             // Synthetic mode: use aggregated data
@@ -1128,22 +1678,182 @@ public:
                 return result;
             }
 
-            // Get synthetic values
-            const double synthRangeTicks = syntheticAggregator.GetSyntheticRangeTicks(tickSize);
+            // Get synthetic values - USE TRUE RANGE for regime classification
+            // This captures overnight gaps at RTH open
+            const double synthTrueRangeTicks = syntheticAggregator.GetSyntheticTrueRangeTicks(tickSize);
+            const double synthSimpleRangeTicks = syntheticAggregator.GetSyntheticRangeTicks(tickSize);
             const double synthDurationSec = syntheticAggregator.GetSyntheticDurationSec();
-            const double synthVelocity = syntheticAggregator.GetSyntheticRangeVelocity(tickSize);
+            const double synthVelocity = syntheticAggregator.GetSyntheticTrueRangeVelocity(tickSize);
             const bool newSynthBar = syntheticAggregator.DidNewSyntheticBarForm();
+            const bool hasGap = syntheticAggregator.HasGap();
+            const double gapTicks = syntheticAggregator.GetGapTicks(tickSize);
 
-            // Compute with synthetic data using SYNTHETIC BASELINE
-            VolatilityResult result = Compute(synthRangeTicks, synthDurationSec, atrValue,
+            // Compute with TRUE RANGE using SYNTHETIC BASELINE
+            VolatilityResult result = Compute(synthTrueRangeTicks, synthDurationSec, atrValue,
                                                true /* useSyntheticBaseline */);
             result.usingSyntheticBars = true;
             result.syntheticAggregationBars = syntheticAggregator.GetAggregationBars();
             result.syntheticBarsCollected = syntheticAggregator.GetAggregationBars();
-            result.syntheticRangeTicks = synthRangeTicks;
+            result.syntheticRangeTicks = synthTrueRangeTicks;  // Report True Range
             result.syntheticDurationSec = synthDurationSec;
             result.newSyntheticBarFormed = newSynthBar;
             result.syntheticRangeVelocity = synthVelocity;
+
+            // True Range diagnostics
+            result.syntheticSimpleRangeTicks = synthSimpleRangeTicks;
+            result.syntheticHasGap = hasGap;
+            result.syntheticGapTicks = gapTicks;
+
+            // EFFICIENCY RATIO (Kaufman-style chop detection)
+            // Computed from synthetic window: net change / total path
+            result.efficiencyValid = syntheticAggregator.IsEfficiencyValid(tickSize);
+            result.efficiencyRatio = syntheticAggregator.GetEfficiencyRatio(tickSize);
+            result.pathLengthTicks = syntheticAggregator.GetPathLengthTicks(tickSize);
+            result.netChangeTicks = syntheticAggregator.GetNetChangeTicks(tickSize);
+
+            // chopSeverity = 1 - ER (when valid, else 0.5 = neutral)
+            if (result.efficiencyValid) {
+                result.chopSeverity = 1.0 - result.efficiencyRatio;
+            } else {
+                result.chopSeverity = 0.5;  // Neutral when undefined
+            }
+
+            // chopActive = high volatility + high chop severity
+            // High vol = EXPANSION or EVENT regime
+            // High chop = chopSeverity > 0.6 (i.e., ER < 0.4)
+            const bool highVol = (result.regime == VolatilityRegime::EXPANSION ||
+                                  result.regime == VolatilityRegime::EVENT);
+            const bool highChop = (result.efficiencyValid && result.chopSeverity > 0.6);
+            result.chopActive = highVol && highChop;
+
+            // Chop-scaled multipliers for tradability
+            // Size reduction: scale down position when chop is high
+            // Formula: 1.0 - 0.5 * chopSeverity (so at max chop, 50% reduction)
+            result.tradability.chopSizeMultiplier = 1.0 - 0.5 * result.chopSeverity;
+
+            // Confirmation increase: require more confirmation when chop is high
+            // Formula: 1.0 + chopSeverity (so at max chop, 2x confirmation)
+            result.tradability.chopConfirmationMultiplier = 1.0 + result.chopSeverity;
+
+            // SHOCK DETECTION (P99+ range or velocity = shock)
+            // Shocks are orthogonal to regime - can occur inside any regime
+            // Note: Only update shock counter when a new synthetic bar forms
+            const double maxPctile = (std::max)(result.rangePercentile,
+                                                 result.rangeVelocityPercentile);
+            result.shockFlag = (result.rangeReady && maxPctile >= SHOCK_PERCENTILE_THRESHOLD);
+
+            if (newSynthBar) {
+                // Only update counter on synthetic bar boundaries
+                if (result.shockFlag) {
+                    result.shockMagnitude = maxPctile;
+                    barsSinceLastShock_ = 0;
+                } else if (barsSinceLastShock_ < 999) {
+                    barsSinceLastShock_++;
+                }
+            } else if (result.shockFlag) {
+                // Shock can still be detected mid-window (based on current aggregate)
+                result.shockMagnitude = maxPctile;
+            }
+
+            result.barsSinceShock = barsSinceLastShock_;
+            result.aftershockActive = (barsSinceLastShock_ <= AFTERSHOCK_DECAY_BARS);
+
+            // VOLATILITY MOMENTUM + STABILITY (only update on synthetic bar boundaries)
+            if (newSynthBar && synthTrueRangeTicks > 0.001) {
+                // Momentum: log ratio of current vs prior range
+                if (priorSyntheticRangeValid_ && priorSyntheticRange_ > 0.001) {
+                    result.volMomentum = std::log(synthTrueRangeTicks / priorSyntheticRange_);
+                    result.volMomentumValid = true;
+
+                    // Classify trend (symmetric thresholds)
+                    if (result.volMomentum > VOL_MOMENTUM_THRESHOLD) {
+                        result.volTrend = VolatilityTrend::EXPANDING;
+                    } else if (result.volMomentum < -VOL_MOMENTUM_THRESHOLD) {
+                        result.volTrend = VolatilityTrend::CONTRACTING;
+                    } else {
+                        result.volTrend = VolatilityTrend::STABLE;
+                    }
+                }
+
+                // Update prior for next bar
+                priorSyntheticRange_ = synthTrueRangeTicks;
+                priorSyntheticRangeValid_ = true;
+
+                // Stability: CV of recent ranges (with mean floor guardrail)
+                recentVolatility_.push(synthTrueRangeTicks);
+                if (recentVolatility_.size() >= 5) {
+                    const double meanRange = recentVolatility_.mean();
+
+                    // Only compute CV if mean is meaningful (avoids CV explosion on tiny moves)
+                    if (meanRange >= MIN_MEAN_FOR_CV_TICKS) {
+                        // Compute stddev manually (RollingDist doesn't have stddev)
+                        double sumSq = 0.0;
+                        for (double v : recentVolatility_.values) {
+                            double diff = v - meanRange;
+                            sumSq += diff * diff;
+                        }
+                        double variance = sumSq / static_cast<double>(recentVolatility_.size());
+                        double stddev = std::sqrt(variance);
+
+                        result.volCV = stddev / meanRange;
+                        result.stabilityValid = true;
+
+                        // Classify stability
+                        if (result.volCV > 0.5) {
+                            result.volStability = VolatilityStability::UNSTABLE;
+                            result.stabilityConfidenceMultiplier = 0.7;  // Reduce confidence
+                        } else if (result.volCV > 0.2) {
+                            result.volStability = VolatilityStability::MODERATE;
+                            result.stabilityConfidenceMultiplier = 1.0;
+                        } else {
+                            result.volStability = VolatilityStability::STABLE;
+                            result.stabilityConfidenceMultiplier = 1.0;
+                        }
+                    }
+                }
+            }
+
+            // =================================================================
+            // STOP GUIDANCE COMPUTATION (Synthetic Mode)
+            // =================================================================
+            // Physics-based stop floor: p75Range × pace × regime × shock
+            // This is a CONSTRAINT, not a suggestion.
+
+            if (result.IsReady() && result.p75RangeTicks > 0.0) {
+                // Base: 75th percentile of recent ranges
+                result.stopGuidance.baseRangeTicks = result.p75RangeTicks;
+
+                // Pace adjustment
+                result.stopGuidance.paceMultiplier = 1.0;
+                if (result.pace == AuctionPace::FAST) {
+                    result.stopGuidance.paceMultiplier = 1.3;
+                } else if (result.pace == AuctionPace::EXTREME) {
+                    result.stopGuidance.paceMultiplier = 1.5;
+                }
+
+                // Regime adjustment (requireWideStop flag)
+                result.stopGuidance.regimeMultiplier = result.tradability.requireWideStop ? 1.5 : 1.0;
+
+                // Shock/aftershock adjustment
+                result.stopGuidance.shockMultiplier = 1.0;
+                if (result.shockFlag) {
+                    result.stopGuidance.shockMultiplier = 1.5;
+                } else if (result.aftershockActive) {
+                    result.stopGuidance.shockMultiplier = 1.2;
+                }
+
+                // Compute minimum stop floor
+                result.stopGuidance.minStopTicks = result.stopGuidance.baseRangeTicks
+                    * result.stopGuidance.paceMultiplier
+                    * result.stopGuidance.regimeMultiplier
+                    * result.stopGuidance.shockMultiplier;
+
+                // Suggested = 1.5x minimum (comfortable buffer)
+                result.stopGuidance.suggestedTicks = result.stopGuidance.minStopTicks * 1.5;
+
+                result.stopGuidance.isConstraintActive = true;
+            }
+
             return result;
         } else {
             // Raw mode: compute from individual bar using RAW BASELINE
@@ -1151,6 +1861,69 @@ public:
             VolatilityResult result = Compute(rawRangeTicks, barDurationSec, atrValue,
                                                false /* useSyntheticBaseline */);
             result.usingSyntheticBars = false;
+
+            // Efficiency ratio not meaningful in raw mode (no synthetic window)
+            // Set neutral/undefined values
+            result.efficiencyValid = false;
+            result.efficiencyRatio = 0.5;  // Neutral
+            result.chopSeverity = 0.5;     // Neutral
+            result.chopActive = false;
+            result.pathLengthTicks = 0.0;
+            result.netChangeTicks = 0.0;
+            result.tradability.chopSizeMultiplier = 1.0;         // No adjustment
+            result.tradability.chopConfirmationMultiplier = 1.0; // No adjustment
+
+            // SHOCK DETECTION (works in raw mode too)
+            const double maxPctile = (std::max)(result.rangePercentile,
+                                                 result.rangeVelocityPercentile);
+            result.shockFlag = (result.rangeReady && maxPctile >= SHOCK_PERCENTILE_THRESHOLD);
+
+            if (result.shockFlag) {
+                result.shockMagnitude = maxPctile;
+                barsSinceLastShock_ = 0;
+            } else if (barsSinceLastShock_ < 999) {
+                barsSinceLastShock_++;
+            }
+
+            result.barsSinceShock = barsSinceLastShock_;
+            result.aftershockActive = (barsSinceLastShock_ <= AFTERSHOCK_DECAY_BARS);
+
+            // Momentum/stability not meaningful in raw mode (no prior tracking)
+            result.volMomentumValid = false;
+            result.volTrend = VolatilityTrend::UNKNOWN;
+            result.stabilityValid = false;
+            result.volStability = VolatilityStability::UNKNOWN;
+            result.stabilityConfidenceMultiplier = 1.0;
+
+            // STOP GUIDANCE (works in raw mode too, uses same formula)
+            if (result.IsReady() && result.p75RangeTicks > 0.0) {
+                result.stopGuidance.baseRangeTicks = result.p75RangeTicks;
+
+                result.stopGuidance.paceMultiplier = 1.0;
+                if (result.pace == AuctionPace::FAST) {
+                    result.stopGuidance.paceMultiplier = 1.3;
+                } else if (result.pace == AuctionPace::EXTREME) {
+                    result.stopGuidance.paceMultiplier = 1.5;
+                }
+
+                result.stopGuidance.regimeMultiplier = result.tradability.requireWideStop ? 1.5 : 1.0;
+
+                result.stopGuidance.shockMultiplier = 1.0;
+                if (result.shockFlag) {
+                    result.stopGuidance.shockMultiplier = 1.5;
+                } else if (result.aftershockActive) {
+                    result.stopGuidance.shockMultiplier = 1.2;
+                }
+
+                result.stopGuidance.minStopTicks = result.stopGuidance.baseRangeTicks
+                    * result.stopGuidance.paceMultiplier
+                    * result.stopGuidance.regimeMultiplier
+                    * result.stopGuidance.shockMultiplier;
+
+                result.stopGuidance.suggestedTicks = result.stopGuidance.minStopTicks * 1.5;
+                result.stopGuidance.isConstraintActive = true;
+            }
+
             return result;
         }
     }
@@ -1224,6 +1997,14 @@ public:
         // Synthetic bar aggregator reset
         syntheticAggregator.Reset();
         rawBarsProcessed = 0;
+
+        // Shock detector reset
+        barsSinceLastShock_ = 999;  // No recent shocks
+
+        // Volatility momentum/stability reset
+        priorSyntheticRange_ = 0.0;
+        priorSyntheticRangeValid_ = false;
+        recentVolatility_.reset(STABILITY_WINDOW);
 
         // priors PRESERVED
     }
