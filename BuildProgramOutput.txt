@@ -1,0 +1,11 @@
+
+E:\SierraChart\ACS_Source>call "C:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Auxiliary\Build\vcvarsall.bat" amd64 
+**********************************************************************
+** Visual Studio 2026 Developer Command Prompt v18.3.0-insiders
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+AuctionSensor_v1.cpp
+   Creating library AuctionSensor_v1.lib and object AuctionSensor_v1.exp
+Generating code
+Finished generating code

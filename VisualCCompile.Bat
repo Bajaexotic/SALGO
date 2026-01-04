@@ -1,0 +1,2 @@
+call "C:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Auxiliary\Build\vcvarsall.bat" amd64
+cl /Zc:wchar_t /GS /GL /W3 /O2 /Zc:inline /D "NDEBUG" /D "_WINDOWS" /D "_USRDLL" /D "_WINDLL" /Oy /Gd /Gy /Oi /GR- /GF /Ot /fp:precise /MT /std:c++17 /LD /EHa /WX- /nologo "E:\SierraChart\ACS_Source\AuctionSensor_v1.cpp"  /link "Gdi32.lib" "User32.lib" /DLL /DYNAMICBASE /INCREMENTAL:NO /OPT:REF /OPT:ICF /MACHINE:X64 /OUT:"E:\SierraChart\Data\AuctionSensor_v1_64.dll"
