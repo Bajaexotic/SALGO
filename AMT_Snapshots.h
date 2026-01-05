@@ -570,8 +570,9 @@ struct EffortBucketDistribution {
     // Synthetic bar distributions (for 1-min chart regime detection)
     // These are populated once per N bars (when synthetic bar completes)
     // Regime detection queries these instead of bar_range when in synthetic mode
-    RollingDist synthetic_bar_range;     // Synthetic range: max(highs) - min(lows) over N bars
+    RollingDist synthetic_bar_range;      // Synthetic range: max(highs) - min(lows) over N bars
     RollingDist synthetic_range_velocity; // Synthetic velocity: synthetic_range / synthetic_duration
+    RollingDist synthetic_efficiency;     // Kaufman ER: |net change| / path length [0-1]
 
     // Session tracking
     int sessionsContributed = 0;     // How many sessions have pushed bars to this bucket
@@ -593,6 +594,7 @@ struct EffortBucketDistribution {
         // 6000/5 = 1200 synthetic entries (5-bar aggregation)
         synthetic_bar_range.reset(window / 5);
         synthetic_range_velocity.reset(window / 5);
+        synthetic_efficiency.reset(window / 5);
         sessionsContributed = 0;
         totalBarsPushed = 0;
         expectedBarsPerSession = 0;

@@ -30,6 +30,7 @@
 #include "AMT_Signals.h"   // For ActivityClassifier
 #include "AMT_DayType.h"   // For DaltonDayType, DayTypeClassifier (merged)
 #include <vector>
+#include <deque>
 #include <algorithm>
 #include <cmath>
 
@@ -88,6 +89,545 @@ inline const char* RangeExtensionTypeToString(RangeExtensionType type) {
         default:                          return "INVALID";
     }
 }
+
+// ============================================================================
+// OVERNIGHT INVENTORY POSITION (Jan 2025)
+// ============================================================================
+// Net position from overnight (GLOBEX) session relative to prior RTH.
+// Per ShadowTrader: position = (onClose - onMidpoint) / (onRange/2)
+// ============================================================================
+
+enum class InventoryPosition : int {
+    NEUTRAL = 0,      // Close near midpoint (-0.2 to +0.2)
+    NET_LONG = 1,     // Close > midpoint (score > +0.2)
+    NET_SHORT = 2     // Close < midpoint (score < -0.2)
+};
+
+inline const char* InventoryPositionToString(InventoryPosition pos) {
+    switch (pos) {
+        case InventoryPosition::NEUTRAL:   return "NEUTRAL";
+        case InventoryPosition::NET_LONG:  return "NET_LONG";
+        case InventoryPosition::NET_SHORT: return "NET_SHORT";
+        default:                           return "INVALID";
+    }
+}
+
+// ============================================================================
+// GAP TYPE (Jan 2025)
+// ============================================================================
+// Per ShadowTrader Gap Rules: True gaps (outside prior range) vs value gaps.
+// Gap classification at RTH open relative to prior RTH session.
+// ============================================================================
+
+enum class GapType : int {
+    NO_GAP = 0,           // Open inside prior day's range
+    VALUE_GAP_UP = 1,     // Open above prior VA but inside range
+    VALUE_GAP_DOWN = 2,   // Open below prior VA but inside range
+    TRUE_GAP_UP = 3,      // Open above prior day high
+    TRUE_GAP_DOWN = 4     // Open below prior day low
+};
+
+inline const char* GapTypeToString(GapType type) {
+    switch (type) {
+        case GapType::NO_GAP:         return "NO_GAP";
+        case GapType::VALUE_GAP_UP:   return "VAL_GAP_UP";
+        case GapType::VALUE_GAP_DOWN: return "VAL_GAP_DN";
+        case GapType::TRUE_GAP_UP:    return "TRUE_UP";
+        case GapType::TRUE_GAP_DOWN:  return "TRUE_DN";
+        default:                      return "INVALID";
+    }
+}
+
+// ============================================================================
+// OPENING TYPE (Jan 2025)
+// ============================================================================
+// Dalton's 4 opening types, classified in first 15-30 minutes of RTH.
+// Per "The Nature of Markets" - opening type predicts day structure.
+// ============================================================================
+
+enum class OpeningType : int {
+    UNKNOWN = 0,
+    OPEN_DRIVE_UP = 1,               // Strong directional, no return to open
+    OPEN_DRIVE_DOWN = 2,
+    OPEN_TEST_DRIVE_UP = 3,          // Tests one side, reverses, then drives
+    OPEN_TEST_DRIVE_DOWN = 4,
+    OPEN_REJECTION_REVERSE_UP = 5,   // Tests extreme, rejected, reverses
+    OPEN_REJECTION_REVERSE_DOWN = 6,
+    OPEN_AUCTION = 7                 // Rotational, probing both sides
+};
+
+inline const char* OpeningTypeToString(OpeningType type) {
+    switch (type) {
+        case OpeningType::UNKNOWN:                   return "UNKNOWN";
+        case OpeningType::OPEN_DRIVE_UP:             return "OD_UP";
+        case OpeningType::OPEN_DRIVE_DOWN:           return "OD_DN";
+        case OpeningType::OPEN_TEST_DRIVE_UP:        return "OTD_UP";
+        case OpeningType::OPEN_TEST_DRIVE_DOWN:      return "OTD_DN";
+        case OpeningType::OPEN_REJECTION_REVERSE_UP: return "ORR_UP";
+        case OpeningType::OPEN_REJECTION_REVERSE_DOWN: return "ORR_DN";
+        case OpeningType::OPEN_AUCTION:              return "OA";
+        default:                                     return "INVALID";
+    }
+}
+
+// ============================================================================
+// OVERNIGHT SESSION (Jan 2025)
+// ============================================================================
+// Captures GLOBEX structure at RTH open for session bridge analysis.
+// ============================================================================
+
+struct OvernightSession {
+    // Overnight extremes
+    double onHigh = 0.0;
+    double onLow = 0.0;
+    double onClose = 0.0;
+    double onMidpoint = 0.0;
+
+    // Overnight value area (if VbP available)
+    double onPOC = 0.0;
+    double onVAH = 0.0;
+    double onVAL = 0.0;
+
+    // Mini-IB (first 30 min of GLOBEX)
+    double miniIBHigh = 0.0;
+    double miniIBLow = 0.0;
+    bool miniIBFrozen = false;
+
+    // 1TF/2TF pattern from overnight
+    TimeframePattern overnightPattern = TimeframePattern::UNKNOWN;
+    int overnightRotation = 0;
+
+    // Validity
+    bool valid = false;
+    int barCount = 0;
+
+    double GetRange() const { return onHigh - onLow; }
+    bool HasValidRange() const { return GetRange() > 0.0; }
+
+    void Reset() {
+        onHigh = onLow = onClose = onMidpoint = 0.0;
+        onPOC = onVAH = onVAL = 0.0;
+        miniIBHigh = miniIBLow = 0.0;
+        miniIBFrozen = false;
+        overnightPattern = TimeframePattern::UNKNOWN;
+        overnightRotation = 0;
+        valid = false;
+        barCount = 0;
+    }
+};
+
+// ============================================================================
+// OVERNIGHT INVENTORY (Jan 2025)
+// ============================================================================
+// Per ShadowTrader: Inventory = where overnight closed relative to its range.
+// Score [-1, +1] indicates net long (+) or net short (-) positioning.
+// ============================================================================
+
+struct OvernightInventory {
+    InventoryPosition position = InventoryPosition::NEUTRAL;
+    double score = 0.0;           // -1.0 (full short) to +1.0 (full long)
+    double distanceFromMid = 0.0; // In price units
+
+    bool IsNetLong() const { return position == InventoryPosition::NET_LONG; }
+    bool IsNetShort() const { return position == InventoryPosition::NET_SHORT; }
+    bool IsNeutral() const { return position == InventoryPosition::NEUTRAL; }
+
+    /**
+     * Calculate inventory from overnight session.
+     * score = (onClose - onMidpoint) / (onRange / 2)
+     */
+    static OvernightInventory Calculate(const OvernightSession& on) {
+        OvernightInventory inv;
+        const double range = on.GetRange();
+        if (range <= 0.0) return inv;
+
+        inv.distanceFromMid = on.onClose - on.onMidpoint;
+        inv.score = inv.distanceFromMid / (range / 2.0);
+        inv.score = (std::max)(-1.0, (std::min)(1.0, inv.score));  // clamp
+
+        if (inv.score > 0.2) {
+            inv.position = InventoryPosition::NET_LONG;
+        } else if (inv.score < -0.2) {
+            inv.position = InventoryPosition::NET_SHORT;
+        } else {
+            inv.position = InventoryPosition::NEUTRAL;
+        }
+
+        return inv;
+    }
+};
+
+// ============================================================================
+// GAP CONTEXT (Jan 2025)
+// ============================================================================
+// Per ShadowTrader Gap Rules: Gap classification and fill tracking.
+// ============================================================================
+
+struct GapContext {
+    GapType type = GapType::NO_GAP;
+    double gapSize = 0.0;         // In ticks (signed: + = up, - = down)
+    double gapFillTarget = 0.0;   // Price to fill gap
+    bool gapFilled = false;
+    int barsSinceOpen = 0;
+
+    // ES-specific thresholds (20 pts = 80 ticks for ES)
+    static constexpr double LARGE_GAP_TICKS = 80;
+
+    bool IsLargeGap() const { return std::abs(gapSize) >= LARGE_GAP_TICKS; }
+    bool IsGapUp() const { return type == GapType::TRUE_GAP_UP || type == GapType::VALUE_GAP_UP; }
+    bool IsGapDown() const { return type == GapType::TRUE_GAP_DOWN || type == GapType::VALUE_GAP_DOWN; }
+    bool IsTrueGap() const { return type == GapType::TRUE_GAP_UP || type == GapType::TRUE_GAP_DOWN; }
+    bool IsValueGap() const { return type == GapType::VALUE_GAP_UP || type == GapType::VALUE_GAP_DOWN; }
+    bool HasGap() const { return type != GapType::NO_GAP; }
+
+    /**
+     * Update gap fill status based on price action.
+     */
+    void CheckFill(double high, double low) {
+        if (gapFilled) return;
+
+        if (IsGapUp() && low <= gapFillTarget) {
+            gapFilled = true;
+        } else if (IsGapDown() && high >= gapFillTarget) {
+            gapFilled = true;
+        }
+        barsSinceOpen++;
+    }
+
+    void Reset() {
+        type = GapType::NO_GAP;
+        gapSize = gapFillTarget = 0.0;
+        gapFilled = false;
+        barsSinceOpen = 0;
+    }
+};
+
+// ============================================================================
+// SESSION BRIDGE (Jan 2025)
+// ============================================================================
+// Coordinates GLOBEX → RTH transition, storing overnight context for RTH use.
+// ============================================================================
+
+struct SessionBridge {
+    // Prior RTH session (for gap calculation)
+    double priorRTHHigh = 0.0;
+    double priorRTHLow = 0.0;
+    double priorRTHClose = 0.0;
+    double priorRTHPOC = 0.0;
+    double priorRTHVAH = 0.0;
+    double priorRTHVAL = 0.0;
+
+    // Overnight context
+    OvernightSession overnight;
+    OvernightInventory inventory;
+    GapContext gap;
+
+    // Opening type (classified in first 15-30 min of RTH)
+    OpeningType openingType = OpeningType::UNKNOWN;
+    int openingClassificationBar = -1;  // Bar when classified
+    bool openingClassified = false;
+
+    bool valid = false;
+
+    bool HasPriorRTH() const { return priorRTHHigh > 0.0 && priorRTHLow > 0.0; }
+    bool HasOvernight() const { return overnight.valid; }
+
+    void Reset() {
+        priorRTHHigh = priorRTHLow = priorRTHClose = 0.0;
+        priorRTHPOC = priorRTHVAH = priorRTHVAL = 0.0;
+        overnight.Reset();
+        inventory = OvernightInventory();
+        gap.Reset();
+        openingType = OpeningType::UNKNOWN;
+        openingClassificationBar = -1;
+        openingClassified = false;
+        valid = false;
+    }
+
+    /**
+     * Classify gap at RTH open.
+     * @param rthOpen RTH opening price
+     * @param tickSize Tick size for gap size calculation
+     */
+    void ClassifyGap(double rthOpen, double tickSize) {
+        gap.Reset();
+
+        if (!HasPriorRTH()) return;
+
+        // Calculate gap size in ticks
+        const double gapFromClose = (rthOpen - priorRTHClose) / tickSize;
+        gap.gapSize = gapFromClose;
+
+        // Classify gap type
+        if (rthOpen > priorRTHHigh) {
+            gap.type = GapType::TRUE_GAP_UP;
+            gap.gapFillTarget = priorRTHHigh;
+        } else if (rthOpen < priorRTHLow) {
+            gap.type = GapType::TRUE_GAP_DOWN;
+            gap.gapFillTarget = priorRTHLow;
+        } else if (rthOpen > priorRTHVAH && priorRTHVAH > 0.0) {
+            gap.type = GapType::VALUE_GAP_UP;
+            gap.gapFillTarget = priorRTHVAH;
+        } else if (rthOpen < priorRTHVAL && priorRTHVAL > 0.0) {
+            gap.type = GapType::VALUE_GAP_DOWN;
+            gap.gapFillTarget = priorRTHVAL;
+        } else {
+            gap.type = GapType::NO_GAP;
+            gap.gapFillTarget = 0.0;
+        }
+    }
+};
+
+// ============================================================================
+// GLOBEX MINI-IB TRACKER (Jan 2025)
+// ============================================================================
+// Tracks the first 30 minutes of GLOBEX session as a "mini Initial Balance".
+// Used to detect overnight range extension (breakout from mini-IB).
+// ============================================================================
+
+class GlobexMiniIBTracker {
+public:
+    struct Config {
+        int miniIBDurationMinutes = 30;  // Shorter than RTH IB (60 min)
+    };
+
+    struct MiniIBState {
+        double high = 0.0;
+        double low = 0.0;
+        double range = 0.0;
+        bool frozen = false;
+        RangeExtensionType extension = RangeExtensionType::NONE;
+
+        // Session extremes (for extension detection)
+        double sessionHigh = 0.0;
+        double sessionLow = 0.0;
+        bool extendedAbove = false;
+        bool extendedBelow = false;
+    };
+
+    GlobexMiniIBTracker() : config_() {}
+    explicit GlobexMiniIBTracker(const Config& cfg) : config_(cfg) {}
+
+    /**
+     * Update mini-IB tracking with new bar data.
+     *
+     * @param high                  Current bar high
+     * @param low                   Current bar low
+     * @param minutesFromGlobexOpen Minutes since GLOBEX session open
+     * @return                      Current MiniIBState
+     */
+    MiniIBState Update(double high, double low, int minutesFromGlobexOpen) {
+        // During mini-IB period, expand the range
+        if (minutesFromGlobexOpen <= config_.miniIBDurationMinutes) {
+            if (!state_.frozen) {
+                if (state_.high == 0.0 || high > state_.high) {
+                    state_.high = high;
+                }
+                if (state_.low == 0.0 || low < state_.low) {
+                    state_.low = low;
+                }
+                state_.range = state_.high - state_.low;
+            }
+        } else if (!state_.frozen) {
+            // Mini-IB period just ended
+            state_.frozen = true;
+        }
+
+        // Always update session extremes
+        if (state_.sessionHigh == 0.0 || high > state_.sessionHigh) {
+            state_.sessionHigh = high;
+        }
+        if (state_.sessionLow == 0.0 || low < state_.sessionLow) {
+            state_.sessionLow = low;
+        }
+
+        // Track extension (only after mini-IB frozen)
+        if (state_.frozen && state_.range > 0.0) {
+            if (high > state_.high) {
+                state_.extendedAbove = true;
+            }
+            if (low < state_.low) {
+                state_.extendedBelow = true;
+            }
+
+            // Determine extension type
+            if (state_.extendedAbove && state_.extendedBelow) {
+                state_.extension = RangeExtensionType::BOTH;
+            } else if (state_.extendedAbove) {
+                state_.extension = RangeExtensionType::BUYING;
+            } else if (state_.extendedBelow) {
+                state_.extension = RangeExtensionType::SELLING;
+            } else {
+                state_.extension = RangeExtensionType::NONE;
+            }
+        }
+
+        return state_;
+    }
+
+    void Reset() {
+        state_ = MiniIBState();
+    }
+
+    const MiniIBState& GetState() const { return state_; }
+    bool IsFrozen() const { return state_.frozen; }
+    double GetMiniIBHigh() const { return state_.high; }
+    double GetMiniIBLow() const { return state_.low; }
+    double GetMiniIBRange() const { return state_.range; }
+
+private:
+    Config config_;
+    MiniIBState state_;
+};
+
+// ============================================================================
+// OPENING TYPE CLASSIFIER (Jan 2025)
+// ============================================================================
+// Classifies Dalton's 4 opening types in first 15-30 minutes of RTH.
+// - Open-Drive: Strong directional, no return to open
+// - Open-Test-Drive: Tests one side, reverses, drives opposite
+// - Open-Rejection-Reverse: Tests extreme, rejected, reverses
+// - Open-Auction: Rotational, probing both sides
+// ============================================================================
+
+class OpeningTypeClassifier {
+public:
+    struct Config {
+        int classificationWindowMinutes = 30;  // 30 min to classify
+        double driveThresholdTicks = 20.0;     // 5 pts minimum for "drive"
+        int minDriveBars = 3;                  // Sustained move
+        double returnToOpenTolerance = 4.0;    // Ticks tolerance for "return"
+    };
+
+    OpeningTypeClassifier() : config_() {}
+    explicit OpeningTypeClassifier(const Config& cfg) : config_(cfg) {}
+
+    /**
+     * Update classifier with new bar data.
+     * Call each bar during first 30 min of RTH.
+     *
+     * @param high              Current bar high
+     * @param low               Current bar low
+     * @param close             Current bar close
+     * @param rthOpen           RTH opening price
+     * @param minutesFromRTHOpen Minutes since RTH open
+     * @param barIndex          Current bar index
+     * @param tickSize          Tick size
+     */
+    void Update(double high, double low, double close, double rthOpen,
+                int minutesFromRTHOpen, int barIndex, double tickSize) {
+        if (classified_) return;  // Already classified
+
+        // Initialize on first call
+        if (rthOpen_ == 0.0) {
+            rthOpen_ = rthOpen;
+            highSinceOpen_ = high;
+            lowSinceOpen_ = low;
+        }
+
+        // Update extremes
+        if (high > highSinceOpen_) highSinceOpen_ = high;
+        if (low < lowSinceOpen_) lowSinceOpen_ = low;
+
+        // Calculate distances in ticks
+        const double distAboveOpen = (highSinceOpen_ - rthOpen_) / tickSize;
+        const double distBelowOpen = (rthOpen_ - lowSinceOpen_) / tickSize;
+        const double closeVsOpen = (close - rthOpen_) / tickSize;
+
+        // Track "tested" flags (went significantly in one direction)
+        if (distAboveOpen >= config_.driveThresholdTicks) {
+            testedAbove_ = true;
+        }
+        if (distBelowOpen >= config_.driveThresholdTicks) {
+            testedBelow_ = true;
+        }
+
+        // Check if returned to open
+        const bool returnedToOpen = std::abs(closeVsOpen) <= config_.returnToOpenTolerance;
+
+        // Count bars above/below open
+        if (close > rthOpen_) barsAboveOpen_++;
+        if (close < rthOpen_) barsBelowOpen_++;
+
+        // Classification at window end
+        if (minutesFromRTHOpen >= config_.classificationWindowMinutes) {
+            Classify(distAboveOpen, distBelowOpen, closeVsOpen, returnedToOpen);
+            classificationBar_ = barIndex;
+        }
+    }
+
+    /**
+     * Get classification (may be UNKNOWN until window complete).
+     */
+    OpeningType GetOpeningType() const { return type_; }
+    bool IsClassified() const { return classified_; }
+    int GetClassificationBar() const { return classificationBar_; }
+
+    void Reset() {
+        type_ = OpeningType::UNKNOWN;
+        classified_ = false;
+        rthOpen_ = 0.0;
+        highSinceOpen_ = 0.0;
+        lowSinceOpen_ = 0.0;
+        barsAboveOpen_ = 0;
+        barsBelowOpen_ = 0;
+        testedAbove_ = false;
+        testedBelow_ = false;
+        classificationBar_ = -1;
+    }
+
+private:
+    Config config_;
+    OpeningType type_ = OpeningType::UNKNOWN;
+    bool classified_ = false;
+    double rthOpen_ = 0.0;
+    double highSinceOpen_ = 0.0;
+    double lowSinceOpen_ = 0.0;
+    int barsAboveOpen_ = 0;
+    int barsBelowOpen_ = 0;
+    bool testedAbove_ = false;
+    bool testedBelow_ = false;
+    int classificationBar_ = -1;
+
+    void Classify(double distAboveOpen, double distBelowOpen,
+                  double closeVsOpen, bool returnedToOpen) {
+        // OPEN-DRIVE: Strong move in one direction, never returned to open
+        // Pattern: immediate directional conviction
+        if (testedAbove_ && !testedBelow_ && !returnedToOpen && closeVsOpen > 0) {
+            type_ = OpeningType::OPEN_DRIVE_UP;
+        }
+        else if (testedBelow_ && !testedAbove_ && !returnedToOpen && closeVsOpen < 0) {
+            type_ = OpeningType::OPEN_DRIVE_DOWN;
+        }
+        // OPEN-TEST-DRIVE: Tested one side, then drove the other
+        // Pattern: false move, then real move
+        else if (testedAbove_ && testedBelow_) {
+            // Determine which side was the "real" move based on close
+            if (closeVsOpen > config_.driveThresholdTicks) {
+                type_ = OpeningType::OPEN_TEST_DRIVE_UP;
+            } else if (closeVsOpen < -config_.driveThresholdTicks) {
+                type_ = OpeningType::OPEN_TEST_DRIVE_DOWN;
+            } else {
+                // Tested both but inconclusive close = Open Auction
+                type_ = OpeningType::OPEN_AUCTION;
+            }
+        }
+        // OPEN-REJECTION-REVERSE: Tested extreme, rejected, reversed
+        // Pattern: hit overnight/prior extreme, bounced hard
+        else if (testedAbove_ && closeVsOpen < 0) {
+            type_ = OpeningType::OPEN_REJECTION_REVERSE_DOWN;
+        }
+        else if (testedBelow_ && closeVsOpen > 0) {
+            type_ = OpeningType::OPEN_REJECTION_REVERSE_UP;
+        }
+        // OPEN-AUCTION: Rotational, probing both sides, no conviction
+        else {
+            type_ = OpeningType::OPEN_AUCTION;
+        }
+
+        classified_ = true;
+    }
+};
 
 // ============================================================================
 // ROTATION TRACKER
@@ -158,9 +698,9 @@ public:
 
         periods_.push_back(current);
 
-        // Keep only lookback window
+        // Keep only lookback window (O(1) with deque)
         while (periods_.size() > static_cast<size_t>(config_.lookbackBars + 1)) {
-            periods_.erase(periods_.begin());
+            periods_.pop_front();
         }
 
         // Need at least 2 periods for comparison
@@ -199,11 +739,11 @@ public:
 
     // Getters
     int GetSessionRotation() const { return sessionRotation_; }
-    const std::vector<PeriodData>& GetPeriods() const { return periods_; }
+    const std::deque<PeriodData>& GetPeriods() const { return periods_; }
 
 private:
     Config config_;
-    std::vector<PeriodData> periods_;
+    std::deque<PeriodData> periods_;  // deque for O(1) pop_front
     int sessionRotation_ = 0;
 
     void DetectTimeframePattern(RotationResult& result) {
@@ -348,6 +888,11 @@ public:
                 if (close < state_.ibHigh && state_.barsAboveIB == 1) {
                     state_.failedAuctionAbove = true;
                 }
+                // Reset failed auction if price re-establishes above IB
+                // (sustained close above for 3+ bars = valid extension, not failed)
+                else if (close > state_.ibHigh && state_.barsAboveIB >= 3) {
+                    state_.failedAuctionAbove = false;
+                }
             }
 
             // Extension below IB
@@ -359,6 +904,11 @@ public:
                 // Check for failed auction (returned inside IB within 1 bar)
                 if (close > state_.ibLow && state_.barsBelowIB == 1) {
                     state_.failedAuctionBelow = true;
+                }
+                // Reset failed auction if price re-establishes below IB
+                // (sustained close below for 3+ bars = valid extension, not failed)
+                else if (close < state_.ibLow && state_.barsBelowIB >= 3) {
+                    state_.failedAuctionBelow = false;
                 }
             }
 
@@ -546,6 +1096,17 @@ struct DaltonState {
     ExcessType excess = ExcessType::NONE;
 
     // ========================================================================
+    // EXTREME DELTA (SSOT - persistence-validated)
+    // Per-bar extreme: 70%+ one-sided volume (>0.7 or <0.3)
+    // Session extreme: percentile >= 85 (top 15% magnitude)
+    // Combined: both must be true for confirmed extreme
+    // ========================================================================
+    bool isExtremeDeltaBar = false;      // Per-bar: deltaConsistency > 0.7 or < 0.3
+    bool isExtremeDeltaSession = false;  // Session: sessionDeltaPctile >= 85
+    bool isExtremeDelta = false;         // Combined: bar && session (persistence-validated)
+    bool directionalCoherence = false;   // Session delta sign matches bar delta direction
+
+    // ========================================================================
     // VALUE CONTEXT
     // ========================================================================
     ValueLocation location = ValueLocation::INSIDE_VALUE;
@@ -595,6 +1156,24 @@ struct DaltonState {
     LevelTestOutcome vahOutcome = LevelTestOutcome::UNTESTED;  // VAH test result
     LevelTestOutcome valOutcome = LevelTestOutcome::UNTESTED;  // VAL test result
 
+    // ========================================================================
+    // SESSION CONTEXT (Jan 2025)
+    // ========================================================================
+    bool isGlobexSession = false;    // True during GLOBEX, false during RTH
+
+    // ========================================================================
+    // OVERNIGHT CONTEXT (Jan 2025)
+    // ========================================================================
+    // Populated at RTH open with overnight structure for session bridge analysis.
+    SessionBridge bridge;
+
+    // ========================================================================
+    // OPENING TYPE (Jan 2025)
+    // ========================================================================
+    // Dalton's 4 opening types, classified in first 30 min of RTH.
+    OpeningType openingType = OpeningType::UNKNOWN;
+    bool openingClassified = false;
+
     /**
      * Compute acceptance state based on time at level.
      * "One hour of trading at a new level constitutes initial acceptance"
@@ -620,10 +1199,28 @@ struct DaltonState {
     }
 
     /**
-     * Derive AMTMarketState from timeframe pattern.
-     * Per Dalton: 1TF = IMBALANCE (trending), 2TF = BALANCE
+     * Derive market phase from timeframe pattern AND extreme delta.
+     *
+     * SSOT CONTRACT: This is the ONLY place where Balance/Imbalance is determined.
+     *
+     * IMBALANCE triggers (OR logic):
+     *   1. 1TF pattern (ONE_TIME_FRAMING_UP or DOWN) - structural
+     *   2. Extreme delta (isExtremeDelta = bar && session) - momentum
+     *
+     * BALANCE triggers:
+     *   - 2TF pattern AND no extreme delta
+     *
+     * Priority: Extreme delta provides "early detection" for single-bar spikes
+     * that haven't yet formed a multi-bar 1TF pattern.
      */
-    void DerivePhaseFromTimeframe() {
+    void DerivePhase() {
+        // Check for extreme delta first (early detection)
+        if (isExtremeDelta) {
+            phase = AMTMarketState::IMBALANCE;
+            return;
+        }
+
+        // Otherwise use 1TF/2TF pattern
         switch (timeframe) {
             case TimeframePattern::ONE_TIME_FRAMING_UP:
             case TimeframePattern::ONE_TIME_FRAMING_DOWN:
@@ -637,6 +1234,9 @@ struct DaltonState {
                 break;
         }
     }
+
+    // Legacy alias for compatibility
+    void DerivePhaseFromTimeframe() { DerivePhase(); }
 
     /**
      * Derive CurrentPhase from Dalton state.
@@ -671,6 +1271,36 @@ struct DaltonState {
         // =====================================================================
         if (excess != ExcessType::NONE) {
             return CurrentPhase::FAILED_AUCTION;
+        }
+
+        // =====================================================================
+        // PRIORITY 2.5: Opening Type (Jan 2025) - Early session conviction
+        // =====================================================================
+        // Open-Drive patterns provide strong early directional conviction.
+        // These override 2TF pattern if classified (first 30 min of RTH).
+        if (openingClassified && !isGlobexSession) {
+            // Open-Drive = strong directional conviction
+            if (openingType == OpeningType::OPEN_DRIVE_UP) {
+                return CurrentPhase::DRIVING_UP;
+            }
+            if (openingType == OpeningType::OPEN_DRIVE_DOWN) {
+                return CurrentPhase::DRIVING_DOWN;
+            }
+            // Open-Test-Drive = directional after false move
+            if (openingType == OpeningType::OPEN_TEST_DRIVE_UP) {
+                return CurrentPhase::DRIVING_UP;
+            }
+            if (openingType == OpeningType::OPEN_TEST_DRIVE_DOWN) {
+                return CurrentPhase::DRIVING_DOWN;
+            }
+            // Open-Rejection-Reverse = failed test, expect reversal
+            if (openingType == OpeningType::OPEN_REJECTION_REVERSE_UP ||
+                openingType == OpeningType::OPEN_REJECTION_REVERSE_DOWN) {
+                // Rejection patterns often become rotation/balance days
+                // Fall through to let 1TF/2TF pattern determine
+            }
+            // Open-Auction = rotational, balance day likely
+            // Fall through to standard balance/imbalance logic
         }
 
         // =====================================================================
@@ -718,8 +1348,9 @@ struct DaltonState {
             if (timeframe == TimeframePattern::ONE_TIME_FRAMING_DOWN) {
                 return CurrentPhase::DRIVING_DOWN;
             }
-            // Fallback (shouldn't happen if state is IMBALANCE)
-            return CurrentPhase::DRIVING_UP;
+            // Fallback: use rotationFactor to determine direction
+            // (shouldn't normally reach here if state is IMBALANCE from 1TF)
+            return (rotationFactor >= 0) ? CurrentPhase::DRIVING_UP : CurrentPhase::DRIVING_DOWN;
         }
 
         return CurrentPhase::UNKNOWN;
@@ -953,6 +1584,11 @@ public:
         InitialBalanceTracker::Config ib;
         ActivityClassifier::Config activity;
 
+        // GLOBEX-specific (Jan 2025)
+        RotationTracker::Config globexRotation;
+        GlobexMiniIBTracker::Config globexMiniIB;
+        OpeningTypeClassifier::Config openingClassifier;
+
         Config() = default;
     };
 
@@ -960,12 +1596,18 @@ public:
         : rotationTracker_()
         , ibTracker_()
         , activityClassifier_()
+        , globexRotationTracker_()
+        , globexMiniIBTracker_()
+        , openingClassifier_()
     {}
 
     explicit DaltonEngine(const Config& cfg)
         : rotationTracker_(cfg.rotation)
         , ibTracker_(cfg.ib)
         , activityClassifier_(cfg.activity)
+        , globexRotationTracker_(cfg.globexRotation)
+        , globexMiniIBTracker_(cfg.globexMiniIB)
+        , openingClassifier_(cfg.openingClassifier)
     {}
 
     /**
@@ -982,6 +1624,9 @@ public:
      * @param tickSize        Tick size
      * @param minutesFromOpen Minutes since session open
      * @param barIndex        Current bar index
+     * @param extremeDeltaBar      Per-bar extreme delta (deltaConsistency > 0.7 or < 0.3)
+     * @param extremeDeltaSession  Session extreme delta (sessionDeltaPctile >= 85)
+     * @param deltaCoherence       Session delta sign matches bar delta direction
      * @return                Complete DaltonState
      */
     DaltonState ProcessBar(
@@ -995,41 +1640,87 @@ public:
         double deltaPct,
         double tickSize,
         int minutesFromOpen,
-        int barIndex
+        int barIndex,
+        bool extremeDeltaBar = false,
+        bool extremeDeltaSession = false,
+        bool deltaCoherence = false,
+        bool isGlobexSession = false  // NEW: Session type flag (Jan 2025)
     ) {
         DaltonState state;
         state.valid = true;
+        state.isGlobexSession = isGlobexSession;
 
         // 1. Update rotation tracking (1TF/2TF detection)
-        auto rotation = rotationTracker_.Update(high, low, barIndex);
+        // Use session-specific tracker based on session type
+        RotationTracker::RotationResult rotation;
+        if (isGlobexSession) {
+            rotation = globexRotationTracker_.Update(high, low, barIndex);
+            // Also update GLOBEX mini-IB
+            globexMiniIBTracker_.Update(high, low, minutesFromOpen);
+        } else {
+            rotation = rotationTracker_.Update(high, low, barIndex);
+        }
         state.timeframe = rotation.pattern;
         state.rotationFactor = rotation.rotationFactor;
         state.consecutiveUp = rotation.consecutiveUp;
         state.consecutiveDown = rotation.consecutiveDown;
 
-        // 2. Derive phase from timeframe pattern
-        state.DerivePhaseFromTimeframe();
+        // 2. Set extreme delta flags (SSOT for persistence-validated extreme delta)
+        state.isExtremeDeltaBar = extremeDeltaBar;
+        state.isExtremeDeltaSession = extremeDeltaSession;
+        state.isExtremeDelta = extremeDeltaBar && extremeDeltaSession;
+        state.directionalCoherence = deltaCoherence;
 
-        // 3. Update Initial Balance tracking
-        auto ib = ibTracker_.Update(high, low, close, minutesFromOpen, barIndex);
-        state.ibHigh = ib.ibHigh;
-        state.ibLow = ib.ibLow;
-        state.ibRange = ib.ibRange;
-        state.ibComplete = ib.ibComplete;
-        state.extension = ib.extension;
-        state.extensionRatio = ib.extensionRatio;
-        state.failedAuctionAbove = ib.failedAuctionAbove;
-        state.failedAuctionBelow = ib.failedAuctionBelow;
+        // 3. Derive phase from timeframe pattern + extreme delta
+        state.DerivePhase();
 
-        // 4. Classify activity
+        // 4. Update Initial Balance tracking (RTH only)
+        // GLOBEX doesn't have IB - use mini-IB instead
+        if (!isGlobexSession) {
+            auto ib = ibTracker_.Update(high, low, close, minutesFromOpen, barIndex);
+            state.ibHigh = ib.ibHigh;
+            state.ibLow = ib.ibLow;
+            state.ibRange = ib.ibRange;
+            state.ibComplete = ib.ibComplete;
+            state.extension = ib.extension;
+            state.extensionRatio = ib.extensionRatio;
+            state.failedAuctionAbove = ib.failedAuctionAbove;
+            state.failedAuctionBelow = ib.failedAuctionBelow;
+        } else {
+            // For GLOBEX, use mini-IB values
+            const auto& miniIB = globexMiniIBTracker_.GetState();
+            state.ibHigh = miniIB.high;
+            state.ibLow = miniIB.low;
+            state.ibRange = miniIB.range;
+            state.ibComplete = miniIB.frozen;
+            state.extension = miniIB.extension;
+            // extensionRatio and failedAuction not tracked for mini-IB
+            state.extensionRatio = 0.0;
+            state.failedAuctionAbove = false;
+            state.failedAuctionBelow = false;
+        }
+
+        // 5. Classify activity
         auto activity = activityClassifier_.Classify(
             close, prevClose, poc, vah, val, deltaPct, tickSize);
         state.activity = activity.activityType;
         state.location = activity.location;
         state.distFromPOCTicks = activity.priceVsPOC;
 
-        // 5. Classify Dalton day type (inline - no separate classifier needed)
-        state.dayType = ClassifyDaltonDayType(ib, rotation, close);
+        // 6. Classify Dalton day type (RTH only)
+        // GLOBEX doesn't have traditional day types - those are RTH concepts
+        if (!isGlobexSession && state.ibComplete) {
+            // Get the current IB state for day type classification
+            const auto& ibState = ibTracker_.GetState();
+            state.dayType = ClassifyDaltonDayType(ibState, rotation, close);
+        } else {
+            state.dayType = DaltonDayType::UNKNOWN;
+        }
+
+        // 7. Copy session bridge to state (for downstream access)
+        state.bridge = bridge_;
+        state.openingType = openingClassifier_.GetOpeningType();
+        state.openingClassified = openingClassifier_.IsClassified();
 
         return state;
     }
@@ -1104,15 +1795,137 @@ public:
 
     /**
      * Reset for new session.
+     * Resets all trackers based on session type.
+     *
+     * @param isGlobexSession True for GLOBEX, false for RTH
      */
-    void ResetSession() {
-        rotationTracker_.Reset();
-        ibTracker_.Reset();
+    void ResetSession(bool isGlobexSession = false) {
+        if (isGlobexSession) {
+            // Reset GLOBEX-specific trackers
+            globexRotationTracker_.Reset();
+            globexMiniIBTracker_.Reset();
+        } else {
+            // Reset RTH trackers
+            rotationTracker_.Reset();
+            ibTracker_.Reset();
+            openingClassifier_.Reset();
+        }
     }
 
-    // Component access
+    /**
+     * Full reset for new trading day.
+     * Resets everything including session bridge.
+     */
+    void ResetForNewDay() {
+        rotationTracker_.Reset();
+        ibTracker_.Reset();
+        globexRotationTracker_.Reset();
+        globexMiniIBTracker_.Reset();
+        openingClassifier_.Reset();
+        bridge_.Reset();
+    }
+
+    // ========================================================================
+    // SESSION BRIDGE METHODS (Jan 2025)
+    // ========================================================================
+
+    /**
+     * Capture overnight session structure at RTH open.
+     * Call this at the GLOBEX→RTH transition.
+     *
+     * @param on OvernightSession with GLOBEX levels
+     */
+    void CaptureOvernightSession(const OvernightSession& on) {
+        bridge_.overnight = on;
+        bridge_.inventory = OvernightInventory::Calculate(on);
+        bridge_.valid = on.valid;
+    }
+
+    /**
+     * Set prior RTH context for gap calculation.
+     * Call this before CaptureOvernightSession.
+     *
+     * @param high  Prior RTH session high
+     * @param low   Prior RTH session low
+     * @param close Prior RTH session close
+     * @param poc   Prior RTH POC
+     * @param vah   Prior RTH VAH
+     * @param val   Prior RTH VAL
+     */
+    void SetPriorRTHContext(double high, double low, double close,
+                            double poc, double vah, double val) {
+        bridge_.priorRTHHigh = high;
+        bridge_.priorRTHLow = low;
+        bridge_.priorRTHClose = close;
+        bridge_.priorRTHPOC = poc;
+        bridge_.priorRTHVAH = vah;
+        bridge_.priorRTHVAL = val;
+    }
+
+    /**
+     * Classify gap at RTH open.
+     * Call this after SetPriorRTHContext and CaptureOvernightSession.
+     *
+     * @param rthOpenPrice RTH opening price
+     * @param tickSize     Tick size
+     * @return             GapContext with classification
+     */
+    GapContext ClassifyGap(double rthOpenPrice, double tickSize) {
+        bridge_.ClassifyGap(rthOpenPrice, tickSize);
+        return bridge_.gap;
+    }
+
+    /**
+     * Update opening type classification.
+     * Call each bar during first 30 minutes of RTH.
+     *
+     * @param high              Bar high
+     * @param low               Bar low
+     * @param close             Bar close
+     * @param rthOpenPrice      RTH opening price
+     * @param minutesFromRTHOpen Minutes since RTH open
+     * @param barIndex          Current bar index
+     * @param tickSize          Tick size
+     */
+    void UpdateOpeningClassification(double high, double low, double close,
+                                     double rthOpenPrice, int minutesFromRTHOpen,
+                                     int barIndex, double tickSize) {
+        openingClassifier_.Update(high, low, close, rthOpenPrice,
+                                  minutesFromRTHOpen, barIndex, tickSize);
+        bridge_.openingType = openingClassifier_.GetOpeningType();
+        bridge_.openingClassified = openingClassifier_.IsClassified();
+        if (bridge_.openingClassified && bridge_.openingClassificationBar < 0) {
+            bridge_.openingClassificationBar = barIndex;
+        }
+    }
+
+    /**
+     * Update gap fill status based on price action.
+     * Call each bar during RTH.
+     */
+    void UpdateGapFill(double high, double low) {
+        bridge_.gap.CheckFill(high, low);
+    }
+
+    // ========================================================================
+    // COMPONENT ACCESS
+    // ========================================================================
+
     const RotationTracker& GetRotationTracker() const { return rotationTracker_; }
     const InitialBalanceTracker& GetIBTracker() const { return ibTracker_; }
+    const SessionBridge& GetSessionBridge() const { return bridge_; }
+    const GlobexMiniIBTracker& GetGlobexMiniIBTracker() const { return globexMiniIBTracker_; }
+    const OpeningTypeClassifier& GetOpeningClassifier() const { return openingClassifier_; }
+
+    // Convenience accessors for session context
+    bool HasOvernight() const { return bridge_.HasOvernight(); }
+    bool HasPriorRTH() const { return bridge_.HasPriorRTH(); }
+    InventoryPosition GetInventoryPosition() const { return bridge_.inventory.position; }
+    double GetInventoryScore() const { return bridge_.inventory.score; }
+    GapType GetGapType() const { return bridge_.gap.type; }
+    bool IsGapFilled() const { return bridge_.gap.gapFilled; }
+    OpeningType GetOpeningType() const { return bridge_.openingType; }
+    bool IsOpeningClassified() const { return bridge_.openingClassified; }
 
     /**
      * Check price proximity to HVN/LVN and update state flags.
@@ -1151,9 +1964,20 @@ public:
     }
 
 private:
+    // RTH trackers
     RotationTracker rotationTracker_;
     InitialBalanceTracker ibTracker_;
     ActivityClassifier activityClassifier_;
+
+    // GLOBEX-specific trackers (Jan 2025)
+    RotationTracker globexRotationTracker_;
+    GlobexMiniIBTracker globexMiniIBTracker_;
+
+    // RTH opening type classifier (Jan 2025)
+    OpeningTypeClassifier openingClassifier_;
+
+    // Session bridge (Jan 2025)
+    SessionBridge bridge_;
 };
 
 } // namespace AMT

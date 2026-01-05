@@ -10,6 +10,8 @@
 //   6. Session boundary handling
 //   7. Validity gating (warmup, errors)
 //   8. History tracking
+//   9. Location context (Jan 2025): zone detection, outcome likelihoods
+//  10. Context gates (Jan 2025): LIQ_VOID/EVENT blocks, COMPRESSION/stress degrades
 //
 // Compile: g++ -std=c++17 -I.. -o test_delta_engine.exe test_delta_engine.cpp
 // Run: ./test_delta_engine.exe
@@ -683,6 +685,932 @@ void TestPhaseAwareBaselines() {
 }
 
 // ============================================================================
+// TEST: Location Context Build
+// ============================================================================
+
+void TestLocationContextBuild() {
+    TEST_SECTION("Location Context Build");
+
+    const double tickSize = 0.25;
+
+    // Test IN_VALUE
+    {
+        auto ctx = DeltaLocationContext::Build(
+            6050.0,   // price at POC
+            6050.0,   // poc
+            6060.0,   // vah
+            6040.0,   // val
+            tickSize,
+            2.0,      // edgeToleranceTicks
+            8.0       // discoveryThresholdTicks
+        );
+        TEST_ASSERT(ctx.isValid, "Context should be valid");
+        TEST_ASSERT(ctx.zone == ValueZoneSimple::IN_VALUE, "Price at POC should be IN_VALUE");
+        TEST_ASSERT(ctx.isInValue, "isInValue flag should be true");
+        TEST_ASSERT(!ctx.isAtEdge, "isAtEdge should be false");
+    }
+
+    // Test AT_VALUE_EDGE (at VAH)
+    {
+        auto ctx = DeltaLocationContext::Build(
+            6060.25,  // price at VAH + 1 tick (within 2 tick tolerance)
+            6050.0,   // poc
+            6060.0,   // vah
+            6040.0,   // val
+            tickSize
+        );
+        TEST_ASSERT(ctx.isValid, "Context should be valid");
+        TEST_ASSERT(ctx.zone == ValueZoneSimple::AT_VALUE_EDGE, "Price near VAH should be AT_VALUE_EDGE");
+        TEST_ASSERT(ctx.isAtEdge, "isAtEdge flag should be true");
+    }
+
+    // Test OUTSIDE_VALUE
+    {
+        auto ctx = DeltaLocationContext::Build(
+            6065.0,   // price 5 ticks above VAH
+            6050.0,   // poc
+            6060.0,   // vah
+            6040.0,   // val
+            tickSize,
+            2.0,      // edgeToleranceTicks
+            8.0       // discoveryThresholdTicks (5 < 8, so OUTSIDE not DISCOVERY)
+        );
+        TEST_ASSERT(ctx.isValid, "Context should be valid");
+        TEST_ASSERT(ctx.zone == ValueZoneSimple::OUTSIDE_VALUE, "Price 5t above VAH should be OUTSIDE_VALUE");
+        TEST_ASSERT(ctx.isOutsideValue, "isOutsideValue flag should be true");
+    }
+
+    // Test IN_DISCOVERY
+    {
+        auto ctx = DeltaLocationContext::Build(
+            6075.0,   // price 15 ticks above VAH
+            6050.0,   // poc
+            6060.0,   // vah
+            6040.0,   // val
+            tickSize,
+            2.0,      // edgeToleranceTicks
+            8.0       // discoveryThresholdTicks (15 > 8, so IN_DISCOVERY)
+        );
+        TEST_ASSERT(ctx.isValid, "Context should be valid");
+        TEST_ASSERT(ctx.zone == ValueZoneSimple::IN_DISCOVERY, "Price 15t above VAH should be IN_DISCOVERY");
+        TEST_ASSERT(ctx.isInDiscovery, "isInDiscovery flag should be true");
+    }
+
+    // Test POC migration detection
+    {
+        auto ctx = DeltaLocationContext::Build(
+            6055.0,   // price above POC
+            6052.0,   // poc (moved up from 6050)
+            6060.0, 6040.0, tickSize,
+            2.0, 8.0,
+            0.0, 0.0, 0.0, 0.0,
+            6050.0    // priorPOC
+        );
+        TEST_ASSERT(ctx.isMigratingTowardPrice, "POC moving toward price should set flag");
+        TEST_ASSERT(!ctx.isMigratingAwayFromPrice, "Should not be migrating away");
+    }
+
+    std::cout << "[OK] Location context build correctly classifies price zones\n";
+}
+
+// ============================================================================
+// TEST: Location-Aware Compute
+// ============================================================================
+
+void TestLocationAwareCompute() {
+    TEST_SECTION("Location-Aware Compute");
+
+    DeltaEngine engine;
+    auto store = CreatePopulatedEffortStore();
+    auto sessBaseline = CreatePopulatedSessionBaseline();
+
+    engine.SetEffortStore(&store);
+    engine.SetSessionDeltaBaseline(&sessBaseline);
+    engine.SetPhase(SessionPhase::MID_SESSION);
+
+    const double tickSize = 0.25;
+
+    // Test compute with location context
+    {
+        // Build location context - price IN_VALUE
+        auto locCtx = DeltaLocationContext::Build(
+            6050.0, 6050.0, 6060.0, 6040.0, tickSize);
+
+        auto result = engine.Compute(
+            300.0, 1000.0, 2.0,
+            300.0, 1000.0, 0,
+            locCtx);
+
+        TEST_ASSERT(result.IsReady(), "Result should be ready");
+        TEST_ASSERT(result.HasLocationContext(), "Result should have location context");
+        TEST_ASSERT(result.location.isValid, "Location should be valid");
+        TEST_ASSERT(result.IsInValue(), "Should be in value");
+    }
+
+    // Test that location context affects outcome likelihoods
+    engine.Reset();
+    {
+        // Build up sustained convergent state
+        for (int i = 0; i < 5; ++i) {
+            auto locCtx = DeltaLocationContext::Build(
+                6065.0 + i, 6050.0, 6060.0, 6040.0, tickSize,
+                2.0, 8.0);
+            engine.Compute(300.0, 1000.0, 1.0,
+                           300.0 * (i + 1), 1000.0 * (i + 1), i, locCtx);
+        }
+
+        // Price outside value, sustained + aligned should favor acceptance
+        auto locCtx = DeltaLocationContext::Build(
+            6065.0, 6050.0, 6060.0, 6040.0, tickSize, 2.0, 8.0);
+        auto result = engine.Compute(350.0, 1000.0, 2.0,
+                                      1850.0, 6000.0, 5, locCtx);
+
+        TEST_ASSERT(result.HasLocationContext(), "Should have location context");
+        TEST_ASSERT(result.IsOutsideValue(), "Should be outside value");
+
+        // Likelihoods should be set
+        double totalLik = result.acceptanceLikelihood + result.rejectionLikelihood + result.rotationLikelihood;
+        TEST_ASSERT(std::abs(totalLik - 1.0) < 0.01, "Likelihoods should sum to ~1.0");
+    }
+
+    std::cout << "[OK] Location-aware compute attaches context and computes outcomes\n";
+}
+
+// ============================================================================
+// TEST: Auction Outcome Likelihoods
+// ============================================================================
+
+void TestAuctionOutcomeLikelihoods() {
+    TEST_SECTION("Auction Outcome Likelihoods");
+
+    DeltaEngine engine;
+    auto store = CreatePopulatedEffortStore();
+    auto sessBaseline = CreatePopulatedSessionBaseline();
+
+    engine.SetEffortStore(&store);
+    engine.SetSessionDeltaBaseline(&sessBaseline);
+    engine.SetPhase(SessionPhase::MID_SESSION);
+
+    const double tickSize = 0.25;
+
+    // Test IN_VALUE -> rotation biased
+    {
+        auto locCtx = DeltaLocationContext::Build(
+            6050.0, 6050.0, 6060.0, 6040.0, tickSize);
+
+        auto result = engine.Compute(200.0, 1000.0, 0.5,
+                                      200.0, 1000.0, 0, locCtx);
+
+        if (result.HasLocationContext()) {
+            // In value should have higher rotation likelihood
+            TEST_ASSERT(result.rotationLikelihood > 0.3,
+                        "IN_VALUE should have elevated rotation likelihood");
+        }
+    }
+
+    engine.Reset();
+
+    // Test AT_VALUE_EDGE with divergence -> rejection biased
+    {
+        // Create divergent condition at VAH: price up, delta negative
+        auto locCtx = DeltaLocationContext::Build(
+            6060.0, 6050.0, 6060.0, 6040.0, tickSize);  // At VAH
+
+        for (int i = 0; i < 3; ++i) {
+            engine.Compute(-300.0, 1000.0, 1.0,  // Negative delta, price up
+                           -300.0 * (i + 1), 1000.0 * (i + 1), i, locCtx);
+        }
+
+        auto result = engine.Compute(-350.0, 1000.0, 2.0,
+                                      -1250.0, 4000.0, 3, locCtx);
+
+        if (result.HasLocationContext() && result.IsDiverging()) {
+            // Divergent at edge should favor rejection
+            TEST_ASSERT(result.rejectionLikelihood >= result.rotationLikelihood,
+                        "Divergent at edge should favor rejection");
+        }
+    }
+
+    std::cout << "[OK] Auction outcome likelihoods vary by location and delta state\n";
+}
+
+// ============================================================================
+// TEST: Location-Sensitive Adjustments
+// ============================================================================
+
+void TestLocationSensitiveAdjustments() {
+    TEST_SECTION("Location-Sensitive Adjustments");
+
+    DeltaEngine engine;
+    auto store = CreatePopulatedEffortStore();
+    auto sessBaseline = CreatePopulatedSessionBaseline();
+
+    engine.SetEffortStore(&store);
+    engine.SetSessionDeltaBaseline(&sessBaseline);
+    engine.SetPhase(SessionPhase::MID_SESSION);
+
+    const double tickSize = 0.25;
+
+    // Test IN_VALUE requires delta alignment
+    {
+        auto locCtx = DeltaLocationContext::Build(
+            6050.0, 6050.0, 6060.0, 6040.0, tickSize);
+
+        auto result = engine.Compute(200.0, 1000.0, 1.0,
+                                      200.0, 1000.0, 0, locCtx);
+
+        if (result.HasLocationContext()) {
+            TEST_ASSERT(result.constraints.requireDeltaAlignment,
+                        "IN_VALUE should require delta alignment");
+        }
+    }
+
+    engine.Reset();
+
+    // Test IN_DISCOVERY without conviction reduces position size
+    {
+        auto locCtx = DeltaLocationContext::Build(
+            6080.0, 6050.0, 6060.0, 6040.0, tickSize,  // Far outside value
+            2.0, 8.0);  // 20 ticks above VAH > 8 threshold
+
+        // Single bar (not sustained)
+        auto result = engine.Compute(200.0, 1000.0, 1.0,
+                                      200.0, 1000.0, 0, locCtx);
+
+        if (result.HasLocationContext() && !result.IsSustained()) {
+            TEST_ASSERT(result.constraints.positionSizeMultiplier < 1.0,
+                        "Discovery without conviction should reduce position size");
+        }
+    }
+
+    std::cout << "[OK] Location-sensitive adjustments applied correctly\n";
+}
+
+// ============================================================================
+// TEST: Outcome Accessors
+// ============================================================================
+
+void TestOutcomeAccessors() {
+    TEST_SECTION("Outcome Accessors");
+
+    DeltaResult result;
+
+    // Test default values
+    TEST_ASSERT(!result.HasLocationContext(), "Default should not have location context");
+    TEST_ASSERT(!result.IsAcceptanceLikely(), "Default should not be acceptance likely");
+    TEST_ASSERT(!result.IsRejectionLikely(), "Default should not be rejection likely");
+    TEST_ASSERT(!result.IsRotationLikely(), "Default should not be rotation likely");
+
+    // Set acceptance outcome
+    result.location.isValid = true;
+    result.location.zone = ValueZoneSimple::OUTSIDE_VALUE;
+    result.likelyOutcome = AuctionOutcome::ACCEPTANCE_LIKELY;
+    result.acceptanceLikelihood = 0.65;
+    result.rejectionLikelihood = 0.20;
+    result.rotationLikelihood = 0.15;
+
+    TEST_ASSERT(result.HasLocationContext(), "Should have location context");
+    TEST_ASSERT(result.IsAcceptanceLikely(), "Should be acceptance likely");
+    TEST_ASSERT(!result.IsRejectionLikely(), "Should not be rejection likely");
+    TEST_ASSERT(result.GetDominantLikelihood() == 0.65, "Dominant likelihood should be 0.65");
+    TEST_ASSERT(result.IsHighConvictionOutcome(), "0.65 > 0.6 threshold");
+
+    std::cout << "[OK] Outcome accessors return correct values\n";
+}
+
+// ============================================================================
+// TEST: High Quality Signal With Context
+// ============================================================================
+
+void TestHighQualitySignalWithContext() {
+    TEST_SECTION("High Quality Signal With Context");
+
+    DeltaEngine engine;
+    auto store = CreatePopulatedEffortStore();
+    auto sessBaseline = CreatePopulatedSessionBaseline();
+
+    engine.SetEffortStore(&store);
+    engine.SetSessionDeltaBaseline(&sessBaseline);
+    engine.SetPhase(SessionPhase::MID_SESSION);
+
+    const double tickSize = 0.25;
+
+    // Build up strong signal with location context
+    for (int i = 0; i < 5; ++i) {
+        auto locCtx = DeltaLocationContext::Build(
+            6065.0, 6050.0, 6060.0, 6040.0, tickSize, 2.0, 8.0);
+        engine.Compute(500.0, 1000.0, 3.0,
+                       500.0 * (i + 1), 1000.0 * (i + 1), i, locCtx);
+    }
+
+    auto locCtx = DeltaLocationContext::Build(
+        6065.0, 6050.0, 6060.0, 6040.0, tickSize, 2.0, 8.0);
+    auto result = engine.Compute(550.0, 1000.0, 4.0,
+                                  3050.0, 6000.0, 5, locCtx);
+
+    // Check the combined quality assessment
+    if (result.IsReady() && result.HasLocationContext()) {
+        bool isHighQuality = result.IsHighQualitySignalWithContext();
+        // This is informational - high quality depends on signal strength + outcome conviction
+        std::cout << "  High quality signal: " << (isHighQuality ? "YES" : "NO") << "\n";
+        std::cout << "  Signal strength: " << result.GetSignalStrength() << "\n";
+        std::cout << "  Dominant likelihood: " << result.GetDominantLikelihood() << "\n";
+    }
+
+    std::cout << "[OK] High quality signal assessment works with context\n";
+}
+
+// ============================================================================
+// TEST: Context Gates (Jan 2025)
+// ============================================================================
+
+void TestContextGates() {
+    TEST_SECTION("Context Gates (Volatility/Liquidity/Dalton)");
+
+    DeltaEngine engine;
+    auto store = CreatePopulatedEffortStore();
+    auto sessBaseline = CreatePopulatedSessionBaseline();
+
+    engine.SetEffortStore(&store);
+    engine.SetSessionDeltaBaseline(&sessBaseline);
+    engine.SetPhase(SessionPhase::MID_SESSION);
+
+    // Enable context gate checking
+    engine.config.requireLiquidityGate = true;
+    engine.config.requireVolatilityGate = true;
+    engine.config.blockOnVoid = true;
+    engine.config.blockOnThin = false;  // Default: thin only degrades
+    engine.config.blockOnEvent = true;
+    engine.config.degradeOnCompression = true;
+    engine.config.highStressThreshold = 0.90;
+    engine.config.useDaltonContext = true;
+
+    const double tickSize = 0.25;
+    auto locCtx = DeltaLocationContext::Build(
+        6050.0, 6050.0, 6060.0, 6040.0, tickSize);
+
+    // Test 1: LIQ_VOID blocks signals
+    {
+        engine.Reset();
+        auto result = engine.Compute(
+            300.0, 1000.0, 2.0, 300.0, 1000.0, 0,
+            locCtx,
+            LiquidityState::LIQ_VOID,      // VOID should block
+            VolatilityRegime::NORMAL,
+            0.5,                            // stress rank
+            AMTMarketState::BALANCE,
+            false                           // is1TF
+        );
+
+        TEST_ASSERT(result.contextGate.contextValid, "Context should be valid");
+        TEST_ASSERT(!result.contextGate.liquidityOK, "LIQ_VOID should fail liquidity gate");
+        TEST_ASSERT(result.contextGate.volatilityOK, "NORMAL regime should pass volatility gate");
+        TEST_ASSERT(!result.contextGate.allGatesPass, "All gates should NOT pass with VOID");
+        TEST_ASSERT(result.contextGate.IsBlocked(), "Should be blocked by VOID");
+        TEST_ASSERT(result.errorReason == DeltaErrorReason::BLOCKED_LIQUIDITY_VOID,
+                    "Error reason should be BLOCKED_LIQUIDITY_VOID");
+        TEST_ASSERT(!result.constraints.allowContinuation, "Continuation blocked on VOID");
+        TEST_ASSERT(!result.constraints.allowBreakout, "Breakout blocked on VOID");
+
+        std::cout << "  LIQ_VOID blocks: OK\n";
+    }
+
+    // Test 2: EVENT regime blocks signals
+    {
+        engine.Reset();
+        auto result = engine.Compute(
+            300.0, 1000.0, 2.0, 300.0, 1000.0, 0,
+            locCtx,
+            LiquidityState::LIQ_NORMAL,
+            VolatilityRegime::EVENT,        // EVENT should block
+            0.5,
+            AMTMarketState::BALANCE,
+            false
+        );
+
+        TEST_ASSERT(result.contextGate.contextValid, "Context should be valid");
+        TEST_ASSERT(result.contextGate.liquidityOK, "NORMAL liq should pass");
+        TEST_ASSERT(!result.contextGate.volatilityOK, "EVENT should fail volatility gate");
+        TEST_ASSERT(!result.contextGate.allGatesPass, "All gates should NOT pass with EVENT");
+        TEST_ASSERT(result.contextGate.IsBlocked(), "Should be blocked by EVENT");
+        TEST_ASSERT(result.errorReason == DeltaErrorReason::BLOCKED_VOLATILITY_EVENT,
+                    "Error reason should be BLOCKED_VOLATILITY_EVENT");
+
+        std::cout << "  EVENT regime blocks: OK\n";
+    }
+
+    // Test 3: COMPRESSION degrades but doesn't block
+    {
+        engine.Reset();
+        auto result = engine.Compute(
+            300.0, 1000.0, 2.0, 300.0, 1000.0, 0,
+            locCtx,
+            LiquidityState::LIQ_NORMAL,
+            VolatilityRegime::COMPRESSION,  // COMPRESSION should degrade only
+            0.5,
+            AMTMarketState::BALANCE,
+            false
+        );
+
+        TEST_ASSERT(result.contextGate.contextValid, "Context should be valid");
+        TEST_ASSERT(result.contextGate.liquidityOK, "NORMAL liq should pass");
+        TEST_ASSERT(result.contextGate.volatilityOK, "COMPRESSION should pass volatility gate");
+        TEST_ASSERT(result.contextGate.compressionDegraded, "Should flag compression degradation");
+        TEST_ASSERT(result.contextGate.allGatesPass, "All gates should pass (degraded but not blocked)");
+        TEST_ASSERT(!result.contextGate.IsBlocked(), "Should NOT be blocked by COMPRESSION");
+        TEST_ASSERT(result.contextGate.IsDegraded(), "Should be degraded by COMPRESSION");
+        // Breakouts should be blocked in compression
+        TEST_ASSERT(!result.constraints.allowBreakout, "Breakouts blocked in COMPRESSION");
+        TEST_ASSERT(result.constraints.allowFade, "Fade should be allowed in COMPRESSION");
+
+        std::cout << "  COMPRESSION degrades: OK\n";
+    }
+
+    // Test 4: High stress degrades confidence
+    {
+        engine.Reset();
+        auto result = engine.Compute(
+            300.0, 1000.0, 2.0, 300.0, 1000.0, 0,
+            locCtx,
+            LiquidityState::LIQ_NORMAL,
+            VolatilityRegime::NORMAL,
+            0.95,                           // High stress (above 0.90 threshold)
+            AMTMarketState::BALANCE,
+            false
+        );
+
+        TEST_ASSERT(result.contextGate.contextValid, "Context should be valid");
+        TEST_ASSERT(result.contextGate.liquidityOK, "NORMAL liq should pass");
+        TEST_ASSERT(result.contextGate.volatilityOK, "NORMAL regime should pass");
+        TEST_ASSERT(result.contextGate.highStress, "Should flag high stress");
+        TEST_ASSERT(result.contextGate.allGatesPass, "All gates should pass (degraded but not blocked)");
+        TEST_ASSERT(result.contextGate.IsDegraded(), "Should be degraded by high stress");
+        TEST_ASSERT(result.constraints.positionSizeMultiplier < 1.0,
+                    "High stress should reduce position size");
+        TEST_ASSERT(result.constraints.requireSustained,
+                    "High stress should require sustained character");
+
+        std::cout << "  High stress degrades: OK\n";
+    }
+
+    // Test 5: Normal conditions pass all gates
+    {
+        engine.Reset();
+        auto result = engine.Compute(
+            300.0, 1000.0, 2.0, 300.0, 1000.0, 0,
+            locCtx,
+            LiquidityState::LIQ_NORMAL,
+            VolatilityRegime::NORMAL,
+            0.5,                            // Normal stress
+            AMTMarketState::BALANCE,
+            false
+        );
+
+        TEST_ASSERT(result.contextGate.contextValid, "Context should be valid");
+        TEST_ASSERT(result.contextGate.liquidityOK, "NORMAL liq should pass");
+        TEST_ASSERT(result.contextGate.volatilityOK, "NORMAL regime should pass");
+        TEST_ASSERT(!result.contextGate.highStress, "Should not flag high stress");
+        TEST_ASSERT(!result.contextGate.compressionDegraded, "Should not be compression degraded");
+        TEST_ASSERT(result.contextGate.allGatesPass, "All gates should pass");
+        TEST_ASSERT(!result.contextGate.IsBlocked(), "Should not be blocked");
+        TEST_ASSERT(!result.contextGate.IsDegraded(), "Should not be degraded");
+
+        std::cout << "  Normal conditions pass: OK\n";
+    }
+
+    // Test 6: LIQ_THIN with blockOnThin=false only degrades
+    {
+        engine.Reset();
+        engine.config.blockOnThin = false;  // Ensure thin only degrades
+        auto result = engine.Compute(
+            300.0, 1000.0, 2.0, 300.0, 1000.0, 0,
+            locCtx,
+            LiquidityState::LIQ_THIN,       // THIN should only degrade
+            VolatilityRegime::NORMAL,
+            0.5,
+            AMTMarketState::BALANCE,
+            false
+        );
+
+        TEST_ASSERT(result.contextGate.liquidityOK, "LIQ_THIN should pass with blockOnThin=false");
+        TEST_ASSERT(result.contextGate.allGatesPass, "All gates should pass");
+        TEST_ASSERT(!result.contextGate.IsBlocked(), "Should NOT be blocked");
+
+        std::cout << "  LIQ_THIN with blockOnThin=false: OK\n";
+    }
+
+    // Test 7: LIQ_THIN with blockOnThin=true blocks
+    {
+        engine.Reset();
+        engine.config.blockOnThin = true;  // Now thin should block
+        auto result = engine.Compute(
+            300.0, 1000.0, 2.0, 300.0, 1000.0, 0,
+            locCtx,
+            LiquidityState::LIQ_THIN,       // THIN should block with flag
+            VolatilityRegime::NORMAL,
+            0.5,
+            AMTMarketState::BALANCE,
+            false
+        );
+
+        TEST_ASSERT(!result.contextGate.liquidityOK, "LIQ_THIN should fail with blockOnThin=true");
+        TEST_ASSERT(!result.contextGate.allGatesPass, "All gates should NOT pass");
+        TEST_ASSERT(result.contextGate.IsBlocked(), "Should be blocked");
+        TEST_ASSERT(result.errorReason == DeltaErrorReason::BLOCKED_LIQUIDITY_THIN,
+                    "Error reason should be BLOCKED_LIQUIDITY_THIN");
+
+        std::cout << "  LIQ_THIN with blockOnThin=true: OK\n";
+    }
+
+    // Test 8: Dalton 1TF context relaxes requirements
+    {
+        engine.Reset();
+        engine.config.blockOnThin = false;
+        auto result = engine.Compute(
+            300.0, 1000.0, 2.0, 300.0, 1000.0, 0,
+            locCtx,
+            LiquidityState::LIQ_NORMAL,
+            VolatilityRegime::NORMAL,
+            0.5,
+            AMTMarketState::IMBALANCE,      // 1TF trending
+            true                             // is1TF
+        );
+
+        TEST_ASSERT(result.contextGate.hasDaltonContext, "Should have Dalton context");
+        TEST_ASSERT(result.contextGate.is1TF, "Should be 1TF");
+        TEST_ASSERT(result.contextGate.daltonState == AMTMarketState::IMBALANCE,
+                    "Dalton state should be IMBALANCE");
+        // 1TF with aligned delta should be more permissive
+        TEST_ASSERT(result.contextGate.allGatesPass, "All gates should pass");
+
+        std::cout << "  Dalton 1TF context: OK\n";
+    }
+
+    // Test 9: Dalton 2TF context tightens requirements
+    {
+        engine.Reset();
+        auto result = engine.Compute(
+            300.0, 1000.0, 2.0, 300.0, 1000.0, 0,
+            locCtx,
+            LiquidityState::LIQ_NORMAL,
+            VolatilityRegime::NORMAL,
+            0.5,
+            AMTMarketState::BALANCE,        // 2TF rotating
+            false                            // is 2TF
+        );
+
+        TEST_ASSERT(result.contextGate.hasDaltonContext, "Should have Dalton context");
+        TEST_ASSERT(!result.contextGate.is1TF, "Should be 2TF (not 1TF)");
+        TEST_ASSERT(result.contextGate.daltonState == AMTMarketState::BALANCE,
+                    "Dalton state should be BALANCE");
+        // 2TF should require more confirmation
+        TEST_ASSERT(result.constraints.requireSustained || result.constraints.requireDeltaAlignment,
+                    "2TF should tighten requirements");
+
+        std::cout << "  Dalton 2TF context: OK\n";
+    }
+
+    // Test 10: Context gate helper functions
+    {
+        TEST_ASSERT(IsDeltaContextBlocked(DeltaErrorReason::BLOCKED_LIQUIDITY_VOID),
+                    "BLOCKED_LIQUIDITY_VOID should be context blocked");
+        TEST_ASSERT(IsDeltaContextBlocked(DeltaErrorReason::BLOCKED_LIQUIDITY_THIN),
+                    "BLOCKED_LIQUIDITY_THIN should be context blocked");
+        TEST_ASSERT(IsDeltaContextBlocked(DeltaErrorReason::BLOCKED_VOLATILITY_EVENT),
+                    "BLOCKED_VOLATILITY_EVENT should be context blocked");
+        TEST_ASSERT(!IsDeltaContextBlocked(DeltaErrorReason::DEGRADED_VOLATILITY_COMPRESSION),
+                    "DEGRADED_VOLATILITY_COMPRESSION should NOT be context blocked");
+        TEST_ASSERT(!IsDeltaContextBlocked(DeltaErrorReason::NONE),
+                    "NONE should NOT be context blocked");
+
+        TEST_ASSERT(IsDeltaContextDegraded(DeltaErrorReason::DEGRADED_VOLATILITY_COMPRESSION),
+                    "DEGRADED_VOLATILITY_COMPRESSION should be context degraded");
+        TEST_ASSERT(IsDeltaContextDegraded(DeltaErrorReason::DEGRADED_HIGH_STRESS),
+                    "DEGRADED_HIGH_STRESS should be context degraded");
+        TEST_ASSERT(!IsDeltaContextDegraded(DeltaErrorReason::BLOCKED_LIQUIDITY_VOID),
+                    "BLOCKED_LIQUIDITY_VOID should NOT be context degraded");
+
+        std::cout << "  Context gate helpers: OK\n";
+    }
+
+    std::cout << "[OK] Context gates correctly block/degrade based on external engine state\n";
+}
+
+// ============================================================================
+// TEST: Context Gate IsContextBlocked/IsContextDegraded Accessors
+// ============================================================================
+
+void TestContextGateAccessors() {
+    TEST_SECTION("Context Gate Result Accessors");
+
+    DeltaEngine engine;
+    auto store = CreatePopulatedEffortStore();
+    auto sessBaseline = CreatePopulatedSessionBaseline();
+
+    engine.SetEffortStore(&store);
+    engine.SetSessionDeltaBaseline(&sessBaseline);
+    engine.SetPhase(SessionPhase::MID_SESSION);
+
+    const double tickSize = 0.25;
+    auto locCtx = DeltaLocationContext::Build(
+        6050.0, 6050.0, 6060.0, 6040.0, tickSize);
+
+    // Test IsContextBlocked accessor
+    {
+        engine.Reset();
+        auto result = engine.Compute(
+            300.0, 1000.0, 2.0, 300.0, 1000.0, 0,
+            locCtx,
+            LiquidityState::LIQ_VOID,
+            VolatilityRegime::NORMAL,
+            0.5, AMTMarketState::BALANCE, false
+        );
+
+        TEST_ASSERT(result.IsContextBlocked(), "IsContextBlocked() should be true for VOID");
+    }
+
+    // Test IsContextDegraded accessor
+    {
+        engine.Reset();
+        auto result = engine.Compute(
+            300.0, 1000.0, 2.0, 300.0, 1000.0, 0,
+            locCtx,
+            LiquidityState::LIQ_NORMAL,
+            VolatilityRegime::COMPRESSION,
+            0.5, AMTMarketState::BALANCE, false
+        );
+
+        TEST_ASSERT(!result.IsContextBlocked(), "IsContextBlocked() should be false for COMPRESSION");
+        TEST_ASSERT(result.IsContextDegraded(), "IsContextDegraded() should be true for COMPRESSION");
+    }
+
+    // Test neither blocked nor degraded
+    {
+        engine.Reset();
+        auto result = engine.Compute(
+            300.0, 1000.0, 2.0, 300.0, 1000.0, 0,
+            locCtx,
+            LiquidityState::LIQ_NORMAL,
+            VolatilityRegime::NORMAL,
+            0.5, AMTMarketState::BALANCE, false
+        );
+
+        TEST_ASSERT(!result.IsContextBlocked(), "IsContextBlocked() should be false");
+        TEST_ASSERT(!result.IsContextDegraded(), "IsContextDegraded() should be false");
+    }
+
+    std::cout << "[OK] Context gate accessors work correctly\n";
+}
+
+// ============================================================================
+// TEST: Asymmetric Hysteresis (Jan 2025)
+// ============================================================================
+
+void TestAsymmetricHysteresis() {
+    TEST_SECTION("Asymmetric Hysteresis");
+
+    DeltaEngine engine;
+    auto store = CreatePopulatedEffortStore();
+    auto sessBaseline = CreatePopulatedSessionBaseline();
+
+    engine.SetEffortStore(&store);
+    engine.SetSessionDeltaBaseline(&sessBaseline);
+    engine.SetPhase(SessionPhase::MID_SESSION);
+
+    // Test config defaults
+    {
+        TEST_ASSERT(engine.config.reversalEntryBars == 1,
+                    "reversalEntryBars should default to 1");
+        TEST_ASSERT(engine.config.buildingEntryBars == 1,
+                    "buildingEntryBars should default to 1");
+        TEST_ASSERT(engine.config.sustainedExitBars == 3,
+                    "sustainedExitBars should default to 3");
+        TEST_ASSERT(engine.config.divergenceEntryBars == 1,
+                    "divergenceEntryBars should default to 1");
+        TEST_ASSERT(engine.config.convergenceExitBars == 3,
+                    "convergenceExitBars should default to 3");
+
+        std::cout << "  Config defaults: OK\n";
+    }
+
+    // Test that result reports required confirmation bars
+    {
+        engine.Reset();
+        auto result = engine.Compute(300.0, 1000.0, 2.0, 300.0, 1000.0, 0);
+        TEST_ASSERT(result.characterConfirmationRequired >= 1,
+                    "Should report character confirmation required");
+        TEST_ASSERT(result.alignmentConfirmationRequired >= 1,
+                    "Should report alignment confirmation required");
+
+        std::cout << "  Confirmation bars reported: OK\n";
+    }
+
+    // Test bars in confirmed state tracking
+    {
+        engine.Reset();
+        for (int i = 0; i < 5; ++i) {
+            auto result = engine.Compute(300.0, 1000.0, 2.0, 300.0, 1000.0, i);
+            if (result.IsReady()) {
+                TEST_ASSERT(result.barsInConfirmedCharacter >= 1,
+                            "barsInConfirmedCharacter should increment");
+            }
+        }
+
+        std::cout << "  Bars in confirmed state tracking: OK\n";
+    }
+
+    std::cout << "[OK] Asymmetric hysteresis configuration and tracking works\n";
+}
+
+// ============================================================================
+// TEST: Thin Tape Classification (Jan 2025)
+// ============================================================================
+
+void TestThinTapeClassification() {
+    TEST_SECTION("Thin Tape Classification");
+
+    // Test ThinTapeType enum and string conversion
+    {
+        TEST_ASSERT(ThinTapeTypeToString(ThinTapeType::NONE) != nullptr,
+                    "ThinTapeTypeToString(NONE) should return valid string");
+        TEST_ASSERT(ThinTapeTypeToString(ThinTapeType::TRUE_THIN) != nullptr,
+                    "ThinTapeTypeToString(TRUE_THIN) should return valid string");
+        TEST_ASSERT(ThinTapeTypeToString(ThinTapeType::HFT_FRAGMENTED) != nullptr,
+                    "ThinTapeTypeToString(HFT_FRAGMENTED) should return valid string");
+        TEST_ASSERT(ThinTapeTypeToString(ThinTapeType::INSTITUTIONAL) != nullptr,
+                    "ThinTapeTypeToString(INSTITUTIONAL) should return valid string");
+
+        std::cout << "  ThinTapeType enum strings: OK\n";
+    }
+
+    // Test classification thresholds in config
+    {
+        DeltaConfig cfg;
+        TEST_ASSERT(cfg.lowTradesPctile == 25.0, "lowTradesPctile default should be 25");
+        TEST_ASSERT(cfg.highTradesPctile == 75.0, "highTradesPctile default should be 75");
+        TEST_ASSERT(cfg.lowVolumePctile == 10.0, "lowVolumePctile default should be 10");
+        TEST_ASSERT(cfg.highVolumePctile == 75.0, "highVolumePctile default should be 75");
+        TEST_ASSERT(cfg.thinTapeConfidencePenalty == 3, "thinTapeConfidencePenalty should be 3");
+        TEST_ASSERT(cfg.hftFragmentedConfidencePenalty == 1, "hftFragmentedConfidencePenalty should be 1");
+        TEST_ASSERT(cfg.institutionalConfidenceBoost == 1, "institutionalConfidenceBoost should be 1");
+
+        std::cout << "  Classification config defaults: OK\n";
+    }
+
+    std::cout << "[OK] Thin tape classification types and config work correctly\n";
+}
+
+// ============================================================================
+// TEST: Range-Adaptive Thresholds (Jan 2025)
+// ============================================================================
+
+void TestRangeAdaptiveThresholds() {
+    TEST_SECTION("Range-Adaptive Thresholds");
+
+    // Test config defaults
+    {
+        DeltaConfig cfg;
+        TEST_ASSERT(cfg.useRangeAdaptiveThresholds == true,
+                    "useRangeAdaptiveThresholds should default true");
+        TEST_ASSERT(cfg.compressionRangePctile == 25.0,
+                    "compressionRangePctile should be 25");
+        TEST_ASSERT(cfg.expansionRangePctile == 75.0,
+                    "expansionRangePctile should be 75");
+        TEST_ASSERT(std::abs(cfg.compressionNoiseMultiplier - 0.7) < 0.01,
+                    "compressionNoiseMultiplier should be 0.7");
+        TEST_ASSERT(std::abs(cfg.expansionNoiseMultiplier - 1.3) < 0.01,
+                    "expansionNoiseMultiplier should be 1.3");
+
+        std::cout << "  Range-adaptive config defaults: OK\n";
+    }
+
+    // Test that DeltaResult has range-adaptive fields
+    {
+        DeltaResult result;
+        result.effectiveNoiseFloor = 17.5;  // Compressed
+        result.effectiveStrongSignal = 52.5;
+        result.rangeAdaptiveApplied = true;
+
+        TEST_ASSERT(result.effectiveNoiseFloor < 25.0,
+                    "Compressed noise floor should be < 25");
+        TEST_ASSERT(result.rangeAdaptiveApplied,
+                    "rangeAdaptiveApplied flag should work");
+
+        std::cout << "  Range-adaptive result fields: OK\n";
+    }
+
+    std::cout << "[OK] Range-adaptive threshold configuration works\n";
+}
+
+// ============================================================================
+// TEST: DeltaInput Struct (Jan 2025)
+// ============================================================================
+
+void TestDeltaInputStruct() {
+    TEST_SECTION("DeltaInput Struct");
+
+    // Test builder pattern
+    {
+        DeltaInput input;
+        input.WithCore(100.0, 500.0, 2.0, 1000.0, 5000.0, 10)
+             .WithExtended(8.0, 50.0, 2.5, 3.0, 4.0);
+
+        TEST_ASSERT(input.barDelta == 100.0, "barDelta should be set");
+        TEST_ASSERT(input.barVolume == 500.0, "barVolume should be set");
+        TEST_ASSERT(input.priceChangeTicks == 2.0, "priceChangeTicks should be set");
+        TEST_ASSERT(input.sessionCumDelta == 1000.0, "sessionCumDelta should be set");
+        TEST_ASSERT(input.sessionVolume == 5000.0, "sessionVolume should be set");
+        TEST_ASSERT(input.currentBar == 10, "currentBar should be set");
+
+        TEST_ASSERT(input.barRangeTicks == 8.0, "barRangeTicks should be set");
+        TEST_ASSERT(input.numTrades == 50.0, "numTrades should be set");
+        TEST_ASSERT(input.tradesPerSec == 2.5, "tradesPerSec should be set");
+        TEST_ASSERT(input.avgBidTradeSize == 3.0, "avgBidTradeSize should be set");
+        TEST_ASSERT(input.avgAskTradeSize == 4.0, "avgAskTradeSize should be set");
+        TEST_ASSERT(input.hasExtendedInputs, "hasExtendedInputs should be true");
+
+        std::cout << "  Builder pattern: OK\n";
+    }
+
+    // Test derived value helpers
+    {
+        DeltaInput input;
+        input.barDelta = 100.0;
+        input.barVolume = 500.0;
+        input.sessionCumDelta = 200.0;
+        input.sessionVolume = 1000.0;
+        input.avgBidTradeSize = 2.0;
+        input.avgAskTradeSize = 4.0;
+
+        TEST_ASSERT(std::abs(input.GetDeltaPct() - 0.2) < 0.01,
+                    "GetDeltaPct should compute correctly");
+        TEST_ASSERT(std::abs(input.GetSessionDeltaPct() - 0.2) < 0.01,
+                    "GetSessionDeltaPct should compute correctly");
+        TEST_ASSERT(std::abs(input.GetAvgTradeSize() - 3.0) < 0.01,
+                    "GetAvgTradeSize should compute correctly");
+
+        std::cout << "  Derived value helpers: OK\n";
+    }
+
+    // Test Compute overload with DeltaInput
+    {
+        DeltaEngine engine;
+        auto store = CreatePopulatedEffortStore();
+        auto sessBaseline = CreatePopulatedSessionBaseline();
+
+        engine.SetEffortStore(&store);
+        engine.SetSessionDeltaBaseline(&sessBaseline);
+        engine.SetPhase(SessionPhase::MID_SESSION);
+
+        DeltaInput input;
+        input.WithCore(300.0, 1000.0, 2.0, 300.0, 1000.0, 0);
+
+        auto result = engine.Compute(input);
+        TEST_ASSERT(result.IsReady() || result.IsWarmup(),
+                    "Compute(DeltaInput) should work");
+        TEST_ASSERT(result.hasExtendedInputs == input.hasExtendedInputs,
+                    "hasExtendedInputs should match input");
+
+        std::cout << "  Compute(DeltaInput) overload: OK\n";
+    }
+
+    std::cout << "[OK] DeltaInput struct and Compute overloads work correctly\n";
+}
+
+// ============================================================================
+// TEST: Extended Metrics Result Fields (Jan 2025)
+// ============================================================================
+
+void TestExtendedMetricsResultFields() {
+    TEST_SECTION("Extended Metrics Result Fields");
+
+    // Test that result has all expected fields with defaults
+    {
+        DeltaResult result;
+
+        // Thin tape fields
+        TEST_ASSERT(result.tradesPctile == 0.0, "tradesPctile default should be 0");
+        TEST_ASSERT(result.tradesBaselineReady == false, "tradesBaselineReady default should be false");
+        TEST_ASSERT(result.thinTapeType == ThinTapeType::NONE, "thinTapeType default should be NONE");
+
+        // Range-adaptive fields
+        TEST_ASSERT(result.rangePctile == 0.0, "rangePctile default should be 0");
+        TEST_ASSERT(result.rangeBaselineReady == false, "rangeBaselineReady default should be false");
+        TEST_ASSERT(result.effectiveNoiseFloor == 25.0, "effectiveNoiseFloor default should be 25");
+        TEST_ASSERT(result.effectiveStrongSignal == 75.0, "effectiveStrongSignal default should be 75");
+
+        // Institutional fields
+        TEST_ASSERT(result.avgTradeSizePctile == 0.0, "avgTradeSizePctile default should be 0");
+        TEST_ASSERT(result.isInstitutionalActivity == false, "isInstitutionalActivity default should be false");
+        TEST_ASSERT(result.isRetailActivity == false, "isRetailActivity default should be false");
+
+        std::cout << "  Extended result field defaults: OK\n";
+    }
+
+    std::cout << "[OK] Extended metrics result fields have correct defaults\n";
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
@@ -706,6 +1634,25 @@ int main() {
     TestDecisionInputHelper();
     TestSignalStrength();
     TestPhaseAwareBaselines();
+
+    // Location Awareness Tests (Jan 2025)
+    TestLocationContextBuild();
+    TestLocationAwareCompute();
+    TestAuctionOutcomeLikelihoods();
+    TestLocationSensitiveAdjustments();
+    TestOutcomeAccessors();
+    TestHighQualitySignalWithContext();
+
+    // Context Gates Tests (Jan 2025)
+    TestContextGates();
+    TestContextGateAccessors();
+
+    // Extended Baseline Metrics Tests (Jan 2025)
+    TestAsymmetricHysteresis();
+    TestThinTapeClassification();
+    TestRangeAdaptiveThresholds();
+    TestDeltaInputStruct();
+    TestExtendedMetricsResultFields();
 
     std::cout << "\n=================================================\n";
     std::cout << "Tests Passed: " << g_testsPassed << "\n";

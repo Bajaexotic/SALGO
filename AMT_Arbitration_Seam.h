@@ -99,6 +99,14 @@ struct ArbitrationInput {
     double sessionDeltaPct = 0.0;        // sessionCumDelta / sessionTotalVolume (SSOT)
     double sessionDeltaPctile = 50.0;    // Percentile rank in rolling distribution [0, 100]
     bool sessionDeltaValid = false;      // True once session has sufficient data
+
+    // ========================================================================
+    // DALTON STATE (SSOT for Balance/Imbalance - Dec 2024)
+    // ========================================================================
+    // When provided, this overrides the legacy rawState computation.
+    // DaltonEngine.phase incorporates both 1TF/2TF AND extreme delta.
+    AMT::AMTMarketState daltonState = AMT::AMTMarketState::UNKNOWN;
+    bool daltonStateValid = false;       // True when DaltonEngine result is available
 };
 
 struct ArbitrationResult {
@@ -111,18 +119,13 @@ struct ArbitrationResult {
     // ========================================================================
     // EXTREME DELTA DECOMPOSITION (Persistence-Validated)
     // ========================================================================
-    bool isExtremeDeltaBar = false;      // Per-bar: deltaConsistency > 0.7
+    bool isExtremeDeltaBar = false;      // Per-bar: deltaConsistency > 0.7 or < 0.3
     bool isExtremeDeltaSession = false;  // Session: sessionDeltaPctile >= 85
     bool isExtremeDelta = false;         // Combined: bar && session (new definition)
 
-    // ========================================================================
-    // AGGRESSION CLASSIFICATION (Directional Coherence Required)
-    // ========================================================================
-    // detectedAggression uses directional coherence:
-    //   - INITIATIVE: isExtremeDelta AND sign(sessionDeltaPct) matches direction
-    //   - RESPONSIVE: otherwise (includes incoherent extreme or non-extreme)
-    AMT::AggressionType detectedAggression = AMT::AggressionType::RESPONSIVE;
-    bool directionalCoherence = false;   // True if session delta sign matches direction
+    // NOTE: Aggression classification (Initiative/Responsive) is NOT computed here.
+    // SSOT for activity type is AMT_Signals.h -> AMTActivityType (location-gated).
+    // This seam only provides delta PRIMITIVES for zone arbitration decisions.
 };
 
 // ============================================================================
@@ -153,31 +156,9 @@ inline ArbitrationResult EvaluateArbitrationLadder(const ArbitrationInput& in) {
     // This is the NEW definition - eliminates false positives from single-bar spikes
     out.isExtremeDelta = out.isExtremeDeltaBar && out.isExtremeDeltaSession;
 
-    // ========================================================================
-    // DIRECTIONAL COHERENCE (for Aggression Classification)
-    // ========================================================================
-    // Coherence: session delta sign must match the directional bias
-    // When isDirectional (trending up), session delta should be positive (net buying)
-    // When isDirectional (trending down), session delta should be negative (net selling)
-    // For now, we use a simplified coherence: session delta sign matches implied direction
-    // from the bar's delta (positive delta = buying pressure = upward bias)
-    //
-    // VALIDITY GATES:
-    //   - If sessionDeltaValid is false, cannot determine session direction
-    //   - If deltaConsistencyValid is false, bar direction is unknown (treated as neutral/false)
-    const bool deltaPositive = (in.sessionDeltaPct > 0.0);
-    const bool barDeltaPositive = in.deltaConsistencyValid && (in.deltaConsistency > 0.5);
-    out.directionalCoherence = in.sessionDeltaValid && in.deltaConsistencyValid &&
-        (deltaPositive == barDeltaPositive);
-
-    // ========================================================================
-    // AGGRESSION CLASSIFICATION (Coherence-Gated)
-    // ========================================================================
-    // INITIATIVE: extreme delta with coherent session direction (attack)
-    // RESPONSIVE: non-extreme OR incoherent direction (defense/absorption)
-    out.detectedAggression = (out.isExtremeDelta && out.directionalCoherence)
-        ? AMT::AggressionType::INITIATIVE
-        : AMT::AggressionType::RESPONSIVE;
+    // NOTE: Aggression classification (Initiative/Responsive) removed from this seam.
+    // SSOT for activity type is AMT_Signals.h -> AMTActivityType (location-gated per Dalton).
+    // This seam provides delta primitives only; consumers get activity type from SSOT.
 
     // ========================================================================
     // ARBITRATION LADDER
@@ -239,10 +220,21 @@ inline ArbitrationResult EvaluateArbitrationLadder(const ArbitrationInput& in) {
     // Derived: pocProx
     out.pocProx = in.pocValid ? static_cast<int>(in.pocProximity) : -1;
 
-    // Derived: rawState (uses persistence-validated isExtremeDelta)
-    out.rawState = (in.isDirectional || out.isExtremeDelta)
-        ? AMT::AMTMarketState::IMBALANCE
-        : AMT::AMTMarketState::BALANCE;
+    // ========================================================================
+    // RAW STATE DERIVATION (SSOT: DaltonEngine.phase)
+    // ========================================================================
+    // SSOT UNIFICATION (Dec 2024): When daltonState is provided, use it directly.
+    // DaltonEngine.phase already incorporates both 1TF/2TF AND extreme delta.
+    // Legacy computation (isDirectional || isExtremeDelta) is only used when
+    // daltonState is unavailable (backward compatibility for existing tests).
+    if (in.daltonStateValid && in.daltonState != AMT::AMTMarketState::UNKNOWN) {
+        out.rawState = in.daltonState;
+    } else {
+        // Legacy fallback for tests that don't provide daltonState
+        out.rawState = (in.isDirectional || out.isExtremeDelta)
+            ? AMT::AMTMarketState::IMBALANCE
+            : AMT::AMTMarketState::BALANCE;
+    }
 
     return out;
 }

@@ -54,6 +54,7 @@
 #include "AMT_Snapshots.h"
 #include "AMT_Volatility.h"  // For VolatilityRegime enum
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <vector>
 #include <deque>
@@ -90,7 +91,12 @@ enum class ImbalanceType : int {
     TRAPPED_SHORTS = 7,     // Sell imbalances in green bar (trapped sellers)
     VALUE_MIGRATION = 8,    // POC/VA shifted significantly
     RANGE_EXTENSION = 9,    // IB broken with conviction
-    EXCESS = 10             // Single-print tail (auction end)
+    EXCESS = 10,            // Single-print tail (auction end)
+    CLIMAX_HIGH = 11,       // Exhaustion at highs (extreme vol + delta + at extreme)
+    CLIMAX_LOW = 12,        // Exhaustion at lows (extreme vol + delta + at extreme)
+    POOR_HIGH = 13,         // Weak high (no excess, no acceptance)
+    POOR_LOW = 14,          // Weak low (no excess, no acceptance)
+    FAILED_AUCTION = 15     // Breakout + rapid return (trap)
 };
 
 inline const char* ImbalanceTypeToString(ImbalanceType t) {
@@ -106,6 +112,11 @@ inline const char* ImbalanceTypeToString(ImbalanceType t) {
         case ImbalanceType::VALUE_MIGRATION:  return "VA_MIGRATE";
         case ImbalanceType::RANGE_EXTENSION:  return "RANGE_EXT";
         case ImbalanceType::EXCESS:           return "EXCESS";
+        case ImbalanceType::CLIMAX_HIGH:      return "CLIMAX_HIGH";
+        case ImbalanceType::CLIMAX_LOW:       return "CLIMAX_LOW";
+        case ImbalanceType::POOR_HIGH:        return "POOR_HIGH";
+        case ImbalanceType::POOR_LOW:         return "POOR_LOW";
+        case ImbalanceType::FAILED_AUCTION:   return "FAIL_AUCT";
     }
     return "UNK";
 }
@@ -301,6 +312,20 @@ struct POCTracker {
     }
 };
 
+struct FailedAuctionTracker {
+    bool active = false;         // Currently tracking a breakout
+    int breakoutBar = 0;         // Bar when breakout started
+    bool brokeAbove = false;     // True if broke above VAH, false if below VAL
+    int barsOutside = 0;         // Bars spent outside value
+
+    void Reset() {
+        active = false;
+        breakoutBar = 0;
+        brokeAbove = false;
+        barsOutside = 0;
+    }
+};
+
 // ============================================================================
 // IMBALANCE RESULT (Per-Bar Output)
 // ============================================================================
@@ -344,12 +369,13 @@ struct ImbalanceResult {
     double divergenceStrength = 0.0;     // [0, 1] how pronounced
 
     // ========================================================================
-    // ABSORPTION
+    // ABSORPTION (AMT: Extreme delta + narrow range = passive side absorbing)
     // ========================================================================
     bool absorptionDetected = false;
-    bool absorptionBidSide = false;      // Passive buying (support)
-    bool absorptionAskSide = false;      // Passive selling (resistance)
-    double absorptionScore = 0.0;        // [0, 1] how strong
+    bool absorptionBidSide = false;      // Passive BIDS absorbing aggressive sells
+    bool absorptionAskSide = false;      // Passive ASKS absorbing aggressive buys
+    double absorptionScore = 0.0;        // [0, 1] how strong (range + delta extremeness)
+    double absorptionDeltaPct = 0.0;     // Delta/Volume ratio (negative = sells, positive = buys)
 
     // ========================================================================
     // TRAPPED TRADERS
@@ -383,6 +409,33 @@ struct ImbalanceResult {
     bool excessLow = false;              // Rejection at low
 
     // ========================================================================
+    // CLIMAX (Exhaustion at Extremes)
+    // ========================================================================
+    bool climaxDetected = false;
+    bool climaxHigh = false;             // Exhaustion at highs
+    bool climaxLow = false;              // Exhaustion at lows
+    double climaxScore = 0.0;            // [0, 1] how extreme
+    double volumePercentile = 0.0;       // Volume intensity (for climax)
+    double deltaPercentile = 0.0;        // Delta intensity (for climax)
+
+    // ========================================================================
+    // POOR HIGH/LOW (Weak Auction Ends)
+    // ========================================================================
+    bool poorHighDetected = false;       // No excess, no strong bid absorption
+    bool poorLowDetected = false;        // No excess, no strong ask absorption
+    double poorHighScore = 0.0;          // [0, 1] weakness at high
+    double poorLowScore = 0.0;           // [0, 1] weakness at low
+
+    // ========================================================================
+    // FAILED AUCTION (Breakout Trap)
+    // ========================================================================
+    bool failedAuctionDetected = false;
+    bool failedBreakoutAbove = false;    // Broke out above, rapid return
+    bool failedBreakoutBelow = false;    // Broke out below, rapid return
+    int barsOutside = 0;                 // Bars spent outside before return
+    double failedAuctionScore = 0.0;     // [0, 1] trap quality
+
+    // ========================================================================
     // STRENGTH & CONFIDENCE
     // ========================================================================
     double strengthScore = 0.0;          // [0, 1] raw signal strength
@@ -393,6 +446,32 @@ struct ImbalanceResult {
     // CONTEXT GATES
     // ========================================================================
     ContextGateResult contextGate;
+
+    // ========================================================================
+    // DOM CONTEXT (From LiquidityEngine)
+    // ========================================================================
+    double consumedBidMass = 0.0;         // Liquidity consumed on bid side
+    double consumedAskMass = 0.0;         // Liquidity consumed on ask side
+    double consumedTotalMass = 0.0;       // Total consumed depth
+    double toxicityProxy = 0.0;           // Asymmetric consumption [0,1]
+    bool hasDOMContext = false;           // True if DOM data was provided
+    bool highConsumedDepth = false;       // Above threshold (confirms absorption)
+
+    // ========================================================================
+    // SPATIAL LIQUIDITY (From LiquidityEngine.spatialGating)
+    // ========================================================================
+    // Walls block price movement, voids accelerate it. POLR = Path of Least Resistance.
+    double nearestBidWallTicks = -1.0;    // Distance to nearest bid wall (support)
+    double nearestAskWallTicks = -1.0;    // Distance to nearest ask wall (resistance)
+    double nearestBidVoidTicks = -1.0;    // Distance to nearest bid void (acceleration down)
+    double nearestAskVoidTicks = -1.0;    // Distance to nearest ask void (acceleration up)
+    int pathOfLeastResistance = 0;        // -1=DOWN, 0=BALANCED, +1=UP
+    bool hasSpatialContext = false;       // True if spatial data was provided
+    bool wallBlocksBullish = false;       // Ask wall very close, blocks bullish signals
+    bool wallBlocksBearish = false;       // Bid wall very close, blocks bearish signals
+    bool voidAcceleratesBullish = false;  // Ask void close, boosts bullish conviction
+    bool voidAcceleratesBearish = false;  // Bid void close, boosts bearish conviction
+    double convictionAdjustment = 0.0;    // Applied adjustment from spatial [-0.3, +0.3]
 
     // ========================================================================
     // HYSTERESIS STATE
@@ -462,6 +541,13 @@ struct ImbalanceResult {
                contextGate.allGatesPass &&
                confidenceScore >= 0.6;
     }
+
+    // Spatial context helpers
+    bool HasSpatialContext() const { return hasSpatialContext; }
+    bool IsWallBlocked() const { return wallBlocksBullish || wallBlocksBearish; }
+    bool IsVoidAccelerated() const { return voidAcceleratesBullish || voidAcceleratesBearish; }
+    bool IsSpatiallyFavorable() const { return convictionAdjustment > 0.0; }
+    bool IsSpatiallyUnfavorable() const { return convictionAdjustment < -0.1; }
 };
 
 // ============================================================================
@@ -473,8 +559,12 @@ struct ImbalanceConfig {
     // STACKED IMBALANCE THRESHOLDS
     // ========================================================================
     int minStackedLevels = 3;            // Minimum consecutive levels for stacked
-    double diagonalRatioThreshold = 3.0; // 300% ratio = imbalance at single level
-    double bigImbalanceThreshold = 10.0; // 1000% ratio = "big" imbalance
+    double diagonalRatioThreshold = 3.0; // 300% ratio = imbalance at single level (fallback)
+    double bigImbalanceThreshold = 10.0; // 1000% ratio = "big" imbalance (fallback)
+    // Percentile-based thresholds (adaptive to market conditions)
+    bool usePercentileBasedRatios = true;// Use adaptive thresholds when baseline ready
+    double diagonalRatioPctileThreshold = 75.0;  // >P75 ratio = imbalance
+    double bigImbalancePctileThreshold = 90.0;   // >P90 ratio = "big" imbalance
 
     // ========================================================================
     // DIVERGENCE DETECTION
@@ -484,11 +574,13 @@ struct ImbalanceConfig {
     int minSwingBars = 2;                // Minimum bars between swings
 
     // ========================================================================
-    // ABSORPTION DETECTION
+    // ABSORPTION DETECTION (AMT Definition)
     // ========================================================================
     double absorptionVolumeThreshold = 75.0;  // Volume percentile (high volume)
     double absorptionRangeThreshold = 25.0;   // Range percentile (narrow range)
-    double absorptionDeltaThreshold = 0.3;    // Max |delta/volume| for absorption
+    double absorptionDeltaThreshold = 0.30;   // MIN |delta/volume| for absorption (extreme delta)
+    double consumedDepthThreshold = 0.6;      // Consumed/Peak ratio for "high" consumption
+    double toxicityThreshold = 0.3;           // Toxicity proxy for asymmetric consumption
 
     // ========================================================================
     // VALUE MIGRATION
@@ -497,6 +589,36 @@ struct ImbalanceConfig {
     int pocStabilityBars = 3;            // Bars to confirm POC position
     double vaOverlapHighThreshold = 0.7; // >70% = overlapping (balance)
     double vaOverlapLowThreshold = 0.3;  // <30% = extension (imbalance)
+
+    // ========================================================================
+    // CLIMAX DETECTION (Exhaustion at Extremes)
+    // ========================================================================
+    double climaxVolumeThreshold = 90.0;  // Volume percentile (>= P90 = extreme)
+    double climaxDeltaThreshold = 85.0;   // Delta percentile (>= P85 = extreme)
+    double extremeProximityTicks = 4.0;   // Within N ticks of session extreme
+
+    // ========================================================================
+    // POOR HIGH/LOW DETECTION
+    // ========================================================================
+    double poorHighLowVolThreshold = 40.0;  // Volume < P40 at extreme = weak
+    double poorHighLowDeltaThreshold = 50.0;// Delta < P50 at extreme = no conviction
+
+    // ========================================================================
+    // FAILED AUCTION DETECTION
+    // ========================================================================
+    int failedAuctionLookback = 5;        // Bars to look back for breakout
+    int failedAuctionMaxBars = 3;         // Max bars outside before return = trap
+    double failedAuctionMinBreak = 2.0;   // Min ticks outside VA for "breakout"
+
+    // ========================================================================
+    // SPATIAL LIQUIDITY (Wall/Void Conviction Adjustment)
+    // ========================================================================
+    bool useSpatialConviction = true;     // Enable spatial liquidity conviction adjustment
+    double wallBlockDistanceTicks = 3.0;  // Wall within N ticks blocks signal in that direction
+    double voidAccelDistanceTicks = 5.0;  // Void within N ticks boosts signal in that direction
+    double maxWallPenalty = 0.30;         // Max conviction reduction from nearby wall
+    double maxVoidBoost = 0.20;           // Max conviction boost from nearby void
+    double polrBoost = 0.10;              // Boost when signal aligns with path of least resistance
 
     // ========================================================================
     // CONTEXT GATES
@@ -519,6 +641,11 @@ struct ImbalanceConfig {
     // ========================================================================
     size_t baselineMinSamples = 10;      // Minimum samples before ready
     int baselineWindow = 300;            // Rolling window size (bars)
+
+    // ========================================================================
+    // ENGINE REFERENCES
+    // ========================================================================
+    bool requireEffortStore = false;     // If true, Compute() fails without effortStore
 
     // ========================================================================
     // STRENGTH/CONFIDENCE WEIGHTS
@@ -585,11 +712,19 @@ public:
     double prevVAL = 0.0;
 
     // ========================================================================
-    // BASELINES
+    // FAILED AUCTION TRACKING
     // ========================================================================
-    RollingDist diagonalNetBaseline;     // |diagonalNet| baseline
-    RollingDist pocShiftBaseline;        // |pocShift| baseline
-    RollingDist absorptionBaseline;      // absorption score baseline
+    FailedAuctionTracker failedAuctionTracking;
+
+    // ========================================================================
+    // BASELINES (Phase-Bucketed)
+    // ========================================================================
+    // Each tradeable phase (GLOBEX, LONDON, PRE_MKT, IB, MID_SESS, CLOSING, POST_CLOSE)
+    // has its own baseline distribution. GLOBEX != RTH characteristics.
+    std::array<RollingDist, EFFORT_BUCKET_COUNT> diagonalNetBaseline;     // |diagonalNet| baseline per phase
+    std::array<RollingDist, EFFORT_BUCKET_COUNT> diagonalRatioBaseline;   // max(buyRatio, sellRatio) baseline per phase
+    std::array<RollingDist, EFFORT_BUCKET_COUNT> pocShiftBaseline;        // |pocShift| baseline per phase
+    std::array<RollingDist, EFFORT_BUCKET_COUNT> absorptionBaseline;      // absorption score baseline per phase
 
     // ========================================================================
     // HYSTERESIS STATE
@@ -614,9 +749,12 @@ public:
     // ========================================================================
 
     ImbalanceEngine() {
-        diagonalNetBaseline.reset(300);
-        pocShiftBaseline.reset(300);
-        absorptionBaseline.reset(300);
+        for (int i = 0; i < EFFORT_BUCKET_COUNT; ++i) {
+            diagonalNetBaseline[i].reset(300);
+            diagonalRatioBaseline[i].reset(300);
+            pocShiftBaseline[i].reset(300);
+            absorptionBaseline[i].reset(300);
+        }
     }
 
     void SetEffortStore(const EffortBaselineStore* store) {
@@ -671,7 +809,14 @@ public:
         // IB/Session context (optional)
         double ibHigh = 0.0, double ibLow = 0.0,
         double sessionHigh = 0.0, double sessionLow = 0.0,
-        int rotationFactor = 0, bool is1TF = false
+        int rotationFactor = 0, bool is1TF = false,
+        // DOM consumed depth (optional, from LiquidityEngine)
+        double consumedBidMass = -1.0, double consumedAskMass = -1.0,
+        double toxicityProxy = -1.0,
+        // DOM spatial liquidity (optional, from LiquidityEngine.spatialGating)
+        double nearestBidWallTicks = -1.0, double nearestAskWallTicks = -1.0,
+        double nearestBidVoidTicks = -1.0, double nearestAskVoidTicks = -1.0,
+        int pathOfLeastResistance = 0  // -1=DOWN, 0=BALANCED, +1=UP
     ) {
         ImbalanceResult result;
         result.phase = currentPhase;
@@ -689,6 +834,15 @@ public:
 
         if (tickSize <= 0.0 || !std::isfinite(tickSize)) {
             result.errorReason = ImbalanceErrorReason::ERR_INVALID_TICK_SIZE;
+            result.errorBar = barIndex;
+            return result;
+        }
+
+        // ====================================================================
+        // EFFORT STORE VALIDATION
+        // ====================================================================
+        if (config.requireEffortStore && effortStore == nullptr) {
+            result.errorReason = ImbalanceErrorReason::ERR_NO_EFFORT_STORE;
             result.errorBar = barIndex;
             return result;
         }
@@ -724,10 +878,11 @@ public:
         }
 
         // ====================================================================
-        // STEP 4: ABSORPTION DETECTION
+        // STEP 4: ABSORPTION DETECTION (with DOM consumed depth)
         // ====================================================================
         if (totalVolume > 0.0 && barDelta > -1e9) {
-            DetectAbsorption(result, high, low, totalVolume, barDelta, tickSize);
+            DetectAbsorption(result, high, low, totalVolume, barDelta, tickSize,
+                             consumedBidMass, consumedAskMass, toxicityProxy);
         }
 
         // ====================================================================
@@ -760,18 +915,41 @@ public:
         DetectExcess(result, high, low, open, close, prevHigh, prevLow, tickSize);
 
         // ====================================================================
-        // STEP 8: DETERMINE PRIMARY TYPE
+        // STEP 8: CLIMAX DETECTION (requires baselines)
+        // ====================================================================
+        if (totalVolume > 0.0 && sessionHigh > 0.0 && sessionLow > 0.0) {
+            DetectClimax(result, high, low, totalVolume, barDelta,
+                         sessionHigh, sessionLow, tickSize);
+        }
+
+        // ====================================================================
+        // STEP 9: POOR HIGH/LOW DETECTION
+        // ====================================================================
+        if (totalVolume > 0.0 && sessionHigh > 0.0 && sessionLow > 0.0) {
+            DetectPoorHighLow(result, high, low, totalVolume, barDelta,
+                              sessionHigh, sessionLow, tickSize);
+        }
+
+        // ====================================================================
+        // STEP 10: FAILED AUCTION DETECTION
+        // ====================================================================
+        if (vah > 0.0 && val > 0.0) {
+            DetectFailedAuction(result, high, low, close, vah, val, tickSize, barIndex);
+        }
+
+        // ====================================================================
+        // STEP 11: DETERMINE PRIMARY TYPE
         // ====================================================================
         ImbalanceType rawType = DetermineType(result);
         result.type = rawType;
 
         // ====================================================================
-        // STEP 9: DETERMINE DIRECTION
+        // STEP 12: DETERMINE DIRECTION
         // ====================================================================
         result.direction = DetermineDirection(result, close, open, barDelta);
 
         // ====================================================================
-        // STEP 10: DETERMINE CONVICTION
+        // STEP 13: DETERMINE CONVICTION
         // ====================================================================
         result.conviction = DetermineConviction(result, liqState, is1TF, barDelta, totalVolume);
 
@@ -782,23 +960,31 @@ public:
         lastConviction = result.conviction;
 
         // ====================================================================
-        // STEP 11: COMPUTE STRENGTH & CONFIDENCE
+        // STEP 13.5: APPLY SPATIAL CONTEXT (Wall/Void Adjustment)
+        // ====================================================================
+        ApplySpatialContext(result,
+                            nearestBidWallTicks, nearestAskWallTicks,
+                            nearestBidVoidTicks, nearestAskVoidTicks,
+                            pathOfLeastResistance);
+
+        // ====================================================================
+        // STEP 14: COMPUTE STRENGTH & CONFIDENCE
         // ====================================================================
         ComputeStrengthAndConfidence(result);
 
         // ====================================================================
-        // STEP 12: APPLY HYSTERESIS
+        // STEP 15: APPLY HYSTERESIS
         // ====================================================================
         UpdateHysteresis(result, rawType);
 
         // ====================================================================
-        // STEP 13: COMPUTE DISPLACEMENT SCORE
+        // STEP 16: COMPUTE DISPLACEMENT SCORE
         // ====================================================================
         result.displacementScore = ComputeDisplacementScore(result, rotationFactor, is1TF);
         result.displacementTicks = std::abs(result.pocShiftTicks);
 
         // ====================================================================
-        // STEP 14: SET VALIDITY
+        // STEP 17: SET VALIDITY
         // ====================================================================
         // If not already blocked by context gates, check warmup
         if (result.errorReason == ImbalanceErrorReason::NONE) {
@@ -836,6 +1022,8 @@ public:
         prevVAH = 0.0;
         prevVAL = 0.0;
 
+        failedAuctionTracking.Reset();
+
         confirmedType = ImbalanceType::NONE;
         candidateType = ImbalanceType::NONE;
         candidateConfirmationBars = 0;
@@ -853,24 +1041,33 @@ public:
 
     void Reset() {
         ResetForSession();
-        diagonalNetBaseline.reset(config.baselineWindow);
-        pocShiftBaseline.reset(config.baselineWindow);
-        absorptionBaseline.reset(config.baselineWindow);
+        for (int i = 0; i < EFFORT_BUCKET_COUNT; ++i) {
+            diagonalNetBaseline[i].reset(config.baselineWindow);
+            diagonalRatioBaseline[i].reset(config.baselineWindow);
+            pocShiftBaseline[i].reset(config.baselineWindow);
+            absorptionBaseline[i].reset(config.baselineWindow);
+        }
     }
 
     // ========================================================================
     // PRE-WARM SUPPORT
     // ========================================================================
 
-    void PreWarmFromBar(double diagonalNet, double pocShift, double absorptionScore) {
+    void PreWarmFromBar(double diagonalNet, double pocShift, double absorptionScore,
+                        SessionPhase phase = SessionPhase::MID_SESSION) {
+        const int phaseIdx = SessionPhaseToBucketIndex(phase);
+        if (phaseIdx < 0 || phaseIdx >= EFFORT_BUCKET_COUNT) {
+            return;  // Invalid phase, skip
+        }
+
         if (std::isfinite(diagonalNet)) {
-            diagonalNetBaseline.push(std::abs(diagonalNet));
+            diagonalNetBaseline[phaseIdx].push(std::abs(diagonalNet));
         }
         if (std::isfinite(pocShift) && pocShift != 0.0) {
-            pocShiftBaseline.push(std::abs(pocShift));
+            pocShiftBaseline[phaseIdx].push(std::abs(pocShift));
         }
         if (std::isfinite(absorptionScore) && absorptionScore > 0.0) {
-            absorptionBaseline.push(absorptionScore);
+            absorptionBaseline[phaseIdx].push(absorptionScore);
         }
     }
 
@@ -889,13 +1086,18 @@ public:
         int sessionBars = 0;
         int stackedBuyCount = 0;
         int stackedSellCount = 0;
+        SessionPhase currentPhase = SessionPhase::UNKNOWN;
     };
 
     DiagnosticState GetDiagnosticState() const {
         DiagnosticState d;
-        d.diagonalBaselineSamples = diagonalNetBaseline.size();
-        d.pocShiftBaselineSamples = pocShiftBaseline.size();
-        d.absorptionBaselineSamples = absorptionBaseline.size();
+        d.currentPhase = currentPhase;
+        const int phaseIdx = SessionPhaseToBucketIndex(currentPhase);
+        if (phaseIdx >= 0 && phaseIdx < EFFORT_BUCKET_COUNT) {
+            d.diagonalBaselineSamples = diagonalNetBaseline[phaseIdx].size();
+            d.pocShiftBaselineSamples = pocShiftBaseline[phaseIdx].size();
+            d.absorptionBaselineSamples = absorptionBaseline[phaseIdx].size();
+        }
         d.swingHighCount = static_cast<int>(swingHighs.size());
         d.swingLowCount = static_cast<int>(swingLows.size());
         d.confirmedType = confirmedType;
@@ -983,30 +1185,74 @@ private:
             result.diagonalRatio = 0.5;
         }
 
-        // Push to baseline
-        diagonalNetBaseline.push(std::abs(result.diagonalNetDelta));
+        // Compute buy/sell ratios
+        // Buy ratio > 1 = more buying aggression (pos delta stronger)
+        // Sell ratio > 1 = more selling aggression (neg delta stronger)
+        const double buyRatio = (negDelta > 0.0) ? (posDelta / negDelta) : 999.0;
+        const double sellRatio = (posDelta > 0.0) ? (negDelta / posDelta) : 999.0;
+        const double maxRatio = (std::max)(buyRatio, sellRatio);
 
-        // Calculate percentile if baseline ready
-        if (diagonalNetBaseline.size() >= config.baselineMinSamples) {
-            auto pctile = diagonalNetBaseline.TryPercentile(std::abs(result.diagonalNetDelta));
-            if (pctile.valid) {
-                result.diagonalPercentile = pctile.value;
+        // Push to phase-aware baselines
+        const int phaseIdx = SessionPhaseToBucketIndex(currentPhase);
+        bool usePercentile = false;
+        double ratioPercentile = 0.0;
+
+        if (phaseIdx >= 0 && phaseIdx < EFFORT_BUCKET_COUNT) {
+            // Push net delta magnitude to baseline
+            diagonalNetBaseline[phaseIdx].push(std::abs(result.diagonalNetDelta));
+
+            // Push the dominant ratio to baseline (for percentile-based detection)
+            if (maxRatio < 900.0) {  // Don't push extreme values (999.0 = one side zero)
+                diagonalRatioBaseline[phaseIdx].push(maxRatio);
+            }
+
+            // Calculate net delta percentile
+            if (diagonalNetBaseline[phaseIdx].size() >= config.baselineMinSamples) {
+                auto pctile = diagonalNetBaseline[phaseIdx].TryPercentile(std::abs(result.diagonalNetDelta));
+                if (pctile.valid) {
+                    result.diagonalPercentile = pctile.value;
+                }
+            }
+
+            // Calculate ratio percentile for adaptive thresholding
+            if (config.usePercentileBasedRatios &&
+                diagonalRatioBaseline[phaseIdx].size() >= config.baselineMinSamples) {
+                auto pctile = diagonalRatioBaseline[phaseIdx].TryPercentile(maxRatio);
+                if (pctile.valid) {
+                    usePercentile = true;
+                    ratioPercentile = pctile.value;
+                }
             }
         }
 
-        // Check for imbalance ratios
-        // Positive ratio > threshold = buy imbalance (buyers aggressive)
-        // Negative ratio > threshold = sell imbalance (sellers aggressive)
-        const double buyRatio = (negDelta > 0.0) ? (posDelta / negDelta) : 999.0;
-        const double sellRatio = (posDelta > 0.0) ? (negDelta / posDelta) : 999.0;
+        // ====================================================================
+        // IMBALANCE DETECTION (adaptive vs fixed thresholds)
+        // ====================================================================
+        bool hasBuyImbalance = false;
+        bool hasSellImbalance = false;
+        bool hasBigImbalance = false;
 
-        // For stacked imbalance, we track consecutive levels
-        // This is simplified - in practice, you'd get level-by-level data
-        // For now, use the net delta magnitude as proxy
-        if (buyRatio >= config.diagonalRatioThreshold) {
+        if (usePercentile) {
+            // PERCENTILE-BASED: Compare ratio to historical distribution
+            // This adapts to the instrument and market conditions
+            hasBuyImbalance = (buyRatio > sellRatio) &&
+                               (ratioPercentile >= config.diagonalRatioPctileThreshold);
+            hasSellImbalance = (sellRatio > buyRatio) &&
+                                (ratioPercentile >= config.diagonalRatioPctileThreshold);
+            hasBigImbalance = (ratioPercentile >= config.bigImbalancePctileThreshold);
+        } else {
+            // FIXED THRESHOLDS: Fallback when baseline not ready
+            hasBuyImbalance = (buyRatio >= config.diagonalRatioThreshold);
+            hasSellImbalance = (sellRatio >= config.diagonalRatioThreshold);
+            hasBigImbalance = (buyRatio >= config.bigImbalanceThreshold ||
+                                sellRatio >= config.bigImbalanceThreshold);
+        }
+
+        // For stacked imbalance, we track consecutive bars with imbalance
+        if (hasBuyImbalance) {
             result.stackedBuyLevels = (std::max)(1, result.stackedBuyLevels + 1);
             result.stackedSellLevels = 0;
-        } else if (sellRatio >= config.diagonalRatioThreshold) {
+        } else if (hasSellImbalance) {
             result.stackedSellLevels = (std::max)(1, result.stackedSellLevels + 1);
             result.stackedBuyLevels = 0;
         } else {
@@ -1016,9 +1262,7 @@ private:
 
         result.hasStackedImbalance = (result.stackedBuyLevels >= config.minStackedLevels ||
                                        result.stackedSellLevels >= config.minStackedLevels);
-
-        result.hasBigImbalance = (buyRatio >= config.bigImbalanceThreshold ||
-                                   sellRatio >= config.bigImbalanceThreshold);
+        result.hasBigImbalance = hasBigImbalance;
 
         // Check for trapped traders
         // Buy imbalances in a red (down) bar = trapped longs
@@ -1127,46 +1371,135 @@ private:
 
     void DetectAbsorption(ImbalanceResult& result,
                            double high, double low, double volume, double delta,
-                           double tickSize) {
-        // Absorption = high volume + narrow range + delta near zero
-        // Indicates passive limit orders absorbing aggressive orders
+                           double tickSize,
+                           double consumedBidMass = -1.0,
+                           double consumedAskMass = -1.0,
+                           double toxicityProxy = -1.0) {
+        // AMT ABSORPTION DEFINITION (Dalton/Steidlmayer):
+        // One side AGGRESSIVELY attacks (extreme delta) while the other side
+        // PASSIVELY absorbs (price doesn't move = narrow range despite high volume).
+        //
+        // This is NOT "delta near zero" - it's delta EXTREME with no price result.
+        // Example: Strong selling (delta -30%) hits passive bids, price barely moves.
+        //          The bid side is ABSORBING the aggressive selling.
+        //
+        // DOM CONFIRMATION (if available):
+        // - High consumed depth = liquidity was absorbed
+        // - Consumed on opposite side to delta direction = confirms absorption
+        // - High toxicity = asymmetric consumption = informed absorption
 
         const double range = (high - low) / tickSize;
-        const double deltaRatio = (volume > 0.0) ? std::abs(delta) / volume : 0.0;
+        const double deltaPct = (volume > 0.0) ? delta / volume : 0.0;
+        const double absDeltaPct = std::abs(deltaPct);
 
-        // Simple absorption score
-        // High volume (relative) + narrow range + small delta = absorption
-        double absorptionScore = 0.0;
+        // Absorption requires EXTREME one-sided delta (>= 30% threshold)
+        const bool hasExtremeDelta = (absDeltaPct >= config.absorptionDeltaThreshold);
 
-        if (range > 0.0 && volume > 0.0) {
-            // Narrow range component (inverse - narrow = high score)
-            const double rangeScore = (std::max)(0.0, 1.0 - (range / 10.0));
+        // Narrow range component (price didn't move despite aggression)
+        // Score 1.0 at 0 ticks, 0.0 at 10+ ticks
+        const double rangeScore = (std::max)(0.0, 1.0 - (range / 10.0));
 
-            // Delta neutralization (small delta relative to volume = high score)
-            const double deltaScore = (std::max)(0.0, 1.0 - (deltaRatio * 2.0));
+        // Delta extremeness score (higher = more one-sided aggression)
+        // Maps 0.30 -> 0.0, 0.70+ -> 1.0
+        const double deltaExtremeScore = (std::max)(0.0, (std::min)(1.0,
+            (absDeltaPct - config.absorptionDeltaThreshold) / 0.40));
 
-            absorptionScore = rangeScore * deltaScore;
+        // ====================================================================
+        // DOM CONSUMED DEPTH CONFIRMATION
+        // ====================================================================
+        // Store DOM context in result
+        const bool hasDOMData = (consumedBidMass >= 0.0 && consumedAskMass >= 0.0);
+        if (hasDOMData) {
+            result.hasDOMContext = true;
+            result.consumedBidMass = consumedBidMass;
+            result.consumedAskMass = consumedAskMass;
+            result.consumedTotalMass = consumedBidMass + consumedAskMass;
+            if (toxicityProxy >= 0.0) {
+                result.toxicityProxy = toxicityProxy;
+            }
         }
 
-        // Push to baseline
-        if (absorptionScore > 0.0) {
-            absorptionBaseline.push(absorptionScore);
+        // DOM confirmation: consumed depth on the absorbing side
+        // - Negative delta = sells hit bids = consumed BID depth
+        // - Positive delta = buys hit asks = consumed ASK depth
+        double domAbsorptionBonus = 0.0;
+        if (hasDOMData && hasExtremeDelta) {
+            const double relevantConsumed = (deltaPct < 0)
+                ? consumedBidMass   // Sells absorbed by bids
+                : consumedAskMass;  // Buys absorbed by asks
+
+            // High consumed depth on the absorbing side confirms absorption
+            // Use relative consumption (consumed / (consumed + remaining))
+            const double totalConsumed = consumedBidMass + consumedAskMass;
+            if (totalConsumed > 0.0) {
+                const double consumedRatio = relevantConsumed / totalConsumed;
+                // Bonus if more consumed on the absorbing side
+                if (consumedRatio > 0.5) {
+                    domAbsorptionBonus = (consumedRatio - 0.5) * 0.4;  // Up to 0.2 bonus
+                    result.highConsumedDepth = true;
+                }
+            }
+
+            // Toxicity confirmation (asymmetric consumption = informed absorption)
+            if (toxicityProxy >= config.toxicityThreshold) {
+                domAbsorptionBonus += 0.1;  // Additional bonus for toxic flow
+            }
+        }
+
+        // Absorption score: narrow range + extreme delta + DOM confirmation
+        // Both components must be present for meaningful absorption
+        double absorptionScore = 0.0;
+        if (hasExtremeDelta && range > 0.0 && volume > 0.0) {
+            // Combine: narrow range (resistance to movement) + delta extremeness (aggression)
+            absorptionScore = rangeScore * 0.5 + deltaExtremeScore * 0.3 + domAbsorptionBonus;
+            // Clamp to [0, 1]
+            absorptionScore = (std::min)(1.0, absorptionScore);
+        }
+
+        // Push to phase-aware baseline
+        const int phaseIdx = SessionPhaseToBucketIndex(currentPhase);
+        if (phaseIdx >= 0 && phaseIdx < EFFORT_BUCKET_COUNT && absorptionScore > 0.0) {
+            absorptionBaseline[phaseIdx].push(absorptionScore);
         }
 
         result.absorptionScore = absorptionScore;
+        result.absorptionDeltaPct = deltaPct;  // Store for diagnostics
 
-        // Detect absorption when score exceeds threshold
-        // Need baseline to determine if this is unusual
-        if (absorptionBaseline.size() >= config.baselineMinSamples) {
-            auto pctile = absorptionBaseline.TryPercentile(absorptionScore);
-            if (pctile.valid && pctile.value >= config.absorptionVolumeThreshold) {
+        // Detect absorption when:
+        // 1. Extreme delta present (one-sided aggression)
+        // 2. Narrow range (price didn't move)
+        // 3. Score exceeds baseline threshold (unusual absorption event)
+        // 4. OR DOM confirms high consumed depth (additional path)
+        const bool domConfirmed = (hasDOMData && result.highConsumedDepth);
+
+        if (hasExtremeDelta && (rangeScore >= 0.5 || domConfirmed)) {
+            if (phaseIdx >= 0 && phaseIdx < EFFORT_BUCKET_COUNT &&
+                absorptionBaseline[phaseIdx].size() >= config.baselineMinSamples) {
+                auto pctile = absorptionBaseline[phaseIdx].TryPercentile(absorptionScore);
+                // Lower threshold if DOM confirms (75 -> 65)
+                const double effectiveThreshold = domConfirmed
+                    ? (config.absorptionVolumeThreshold - 10.0)
+                    : config.absorptionVolumeThreshold;
+                if (pctile.valid && pctile.value >= effectiveThreshold) {
+                    result.absorptionDetected = true;
+
+                    // Determine absorbing side (OPPOSITE to delta direction):
+                    // - Negative delta = aggressive SELLING, absorbed by passive BIDS
+                    // - Positive delta = aggressive BUYING, absorbed by passive ASKS
+                    if (deltaPct < 0) {
+                        result.absorptionBidSide = true;  // Passive BIDS absorbing aggressive sells
+                    } else {
+                        result.absorptionAskSide = true;  // Passive ASKS absorbing aggressive buys
+                    }
+                }
+            } else if (absorptionScore >= 0.7 || (domConfirmed && absorptionScore >= 0.5)) {
+                // Strong absorption signal even without baseline (early session)
+                // Lower threshold if DOM confirms
                 result.absorptionDetected = true;
-
-                // Determine side based on delta direction
-                if (delta < 0) {
-                    result.absorptionBidSide = true;  // Passive buying absorbing sells
-                } else if (delta > 0) {
-                    result.absorptionAskSide = true;  // Passive selling absorbing buys
+                if (deltaPct < 0) {
+                    result.absorptionBidSide = true;
+                } else {
+                    result.absorptionAskSide = true;
                 }
             }
         }
@@ -1200,16 +1533,19 @@ private:
 
             result.pocMigrating = (shiftMagnitude >= config.pocShiftMinTicks);
 
-            // Push to baseline
-            if (shiftMagnitude > 0.0) {
-                pocShiftBaseline.push(shiftMagnitude);
+            // Push to phase-aware baseline
+            const int phaseIdx = SessionPhaseToBucketIndex(currentPhase);
+            if (phaseIdx >= 0 && phaseIdx < EFFORT_BUCKET_COUNT && shiftMagnitude > 0.0) {
+                pocShiftBaseline[phaseIdx].push(shiftMagnitude);
             }
 
-            // Calculate percentile
-            if (pocShiftBaseline.size() >= config.baselineMinSamples) {
-                auto pctile = pocShiftBaseline.TryPercentile(shiftMagnitude);
-                if (pctile.valid) {
-                    result.pocShiftPercentile = pctile.value;
+            // Calculate percentile from phase-aware baseline
+            if (phaseIdx >= 0 && phaseIdx < EFFORT_BUCKET_COUNT) {
+                if (pocShiftBaseline[phaseIdx].size() >= config.baselineMinSamples) {
+                    auto pctile = pocShiftBaseline[phaseIdx].TryPercentile(shiftMagnitude);
+                    if (pctile.valid) {
+                        result.pocShiftPercentile = pctile.value;
+                    }
                 }
             }
         }
@@ -1318,14 +1654,217 @@ private:
     }
 
     // ========================================================================
+    // CLIMAX DETECTION (Exhaustion at Extremes)
+    // ========================================================================
+
+    void DetectClimax(ImbalanceResult& result,
+                       double high, double low, double volume, double delta,
+                       double sessionHigh, double sessionLow, double tickSize) {
+        // CLIMAX = Extreme volume + Extreme delta + At session extreme
+        // Indicates exhaustion/capitulation - often marks turning points
+        //
+        // AMT Definition: The final aggressive push where one side is being
+        // "forced out" (liquidation) or the other side is "climaxing" their
+        // conviction. Price often reverses after climax.
+
+        if (volume <= 0.0 || sessionHigh <= 0.0 || sessionLow <= 0.0) return;
+
+        const int phaseIdx = SessionPhaseToBucketIndex(currentPhase);
+        if (phaseIdx < 0 || phaseIdx >= EFFORT_BUCKET_COUNT) return;
+        if (effortStore == nullptr) return;
+
+        // Get volume and delta percentiles from phase-aware baselines
+        const auto& bucket = effortStore->Get(currentPhase);
+        const auto& volBaseline = bucket.vol_sec;
+        const auto& deltaBaseline = bucket.delta_pct;
+
+        if (volBaseline.size() < config.baselineMinSamples ||
+            deltaBaseline.size() < config.baselineMinSamples) return;
+
+        // Compute percentiles
+        const double volPerSec = volume / 60.0;  // Approximate per-second rate
+        auto volPctile = volBaseline.TryPercentile(volPerSec);
+        if (!volPctile.valid) return;
+
+        const double deltaPct = (volume > 0.0) ? delta / volume : 0.0;
+        auto deltaPctile = deltaBaseline.TryPercentile(std::abs(deltaPct));
+        if (!deltaPctile.valid) return;
+
+        result.volumePercentile = volPctile.value;
+        result.deltaPercentile = deltaPctile.value;
+
+        // Check proximity to session extremes
+        const double distToHigh = (sessionHigh - high) / tickSize;
+        const double distToLow = (low - sessionLow) / tickSize;
+        const bool nearSessionHigh = (distToHigh <= config.extremeProximityTicks);
+        const bool nearSessionLow = (distToLow <= config.extremeProximityTicks);
+
+        // CLIMAX requires: extreme volume + extreme delta + at extreme
+        const bool hasExtremeVol = (volPctile.value >= config.climaxVolumeThreshold);
+        const bool hasExtremeDelta = (deltaPctile.value >= config.climaxDeltaThreshold);
+
+        if (hasExtremeVol && hasExtremeDelta) {
+            // Score based on how extreme (normalize to [0,1])
+            const double volScore = (volPctile.value - config.climaxVolumeThreshold) /
+                                     (100.0 - config.climaxVolumeThreshold);
+            const double deltaScore = (deltaPctile.value - config.climaxDeltaThreshold) /
+                                       (100.0 - config.climaxDeltaThreshold);
+            result.climaxScore = (volScore + deltaScore) / 2.0;
+
+            if (nearSessionHigh && delta > 0) {
+                // Buying climax at highs - exhaustion, expect reversal down
+                result.climaxDetected = true;
+                result.climaxHigh = true;
+            } else if (nearSessionLow && delta < 0) {
+                // Selling climax at lows - capitulation, expect reversal up
+                result.climaxDetected = true;
+                result.climaxLow = true;
+            }
+        }
+    }
+
+    // ========================================================================
+    // POOR HIGH/LOW DETECTION (Weak Auction Ends)
+    // ========================================================================
+
+    void DetectPoorHighLow(ImbalanceResult& result,
+                            double high, double low, double volume, double delta,
+                            double sessionHigh, double sessionLow, double tickSize) {
+        // POOR HIGH/LOW = New extreme but with weak volume and no conviction
+        // These are "unfinished business" levels - price will likely revisit
+        //
+        // Contrast with EXCESS (strong rejection) and CLIMAX (strong exhaustion)
+        // A poor high has neither - it's a tentative probe that didn't find
+        // responsive selling (no excess) or aggressive buying (no climax)
+
+        if (volume <= 0.0 || sessionHigh <= 0.0 || sessionLow <= 0.0) return;
+
+        const int phaseIdx = SessionPhaseToBucketIndex(currentPhase);
+        if (phaseIdx < 0 || phaseIdx >= EFFORT_BUCKET_COUNT) return;
+        if (effortStore == nullptr) return;
+
+        const auto& bucket = effortStore->Get(currentPhase);
+        const auto& volBaseline = bucket.vol_sec;
+        const auto& deltaBaseline = bucket.delta_pct;
+
+        if (volBaseline.size() < config.baselineMinSamples) return;
+
+        // Compute percentiles
+        const double volPerSec = volume / 60.0;
+        auto volPctile = volBaseline.TryPercentile(volPerSec);
+        if (!volPctile.valid) return;
+
+        const double deltaPct = (volume > 0.0) ? std::abs(delta / volume) : 0.0;
+        auto deltaPctile = deltaBaseline.TryPercentile(deltaPct);
+
+        // Check if at new extreme
+        const bool atNewHigh = (std::abs(high - sessionHigh) < tickSize * 2.0);
+        const bool atNewLow = (std::abs(low - sessionLow) < tickSize * 2.0);
+
+        // POOR HIGH/LOW requires: weak volume + weak delta + no excess
+        const bool hasWeakVol = (volPctile.value < config.poorHighLowVolThreshold);
+        const bool hasWeakDelta = !deltaPctile.valid ||
+                                   (deltaPctile.value < config.poorHighLowDeltaThreshold);
+
+        if (hasWeakVol && hasWeakDelta && !result.excessDetected) {
+            // Score based on how weak (invert percentile)
+            const double weaknessScore = 1.0 - (volPctile.value / 100.0);
+
+            if (atNewHigh && !result.climaxHigh) {
+                result.poorHighDetected = true;
+                result.poorHighScore = weaknessScore;
+            }
+            if (atNewLow && !result.climaxLow) {
+                result.poorLowDetected = true;
+                result.poorLowScore = weaknessScore;
+            }
+        }
+    }
+
+    // ========================================================================
+    // FAILED AUCTION DETECTION (Breakout Trap)
+    // ========================================================================
+
+    void DetectFailedAuction(ImbalanceResult& result,
+                              double high, double low, double close,
+                              double vah, double val, double tickSize,
+                              int barIndex) {
+        // FAILED AUCTION = Price breaks out of value, then rapidly returns
+        // This is a classic trap - traders who chased the breakout are now
+        // underwater. The rapid return signals lack of acceptance.
+        //
+        // Detection: Track when price first leaves value, count bars outside,
+        // detect if price returns quickly (within maxBars)
+
+        if (vah <= 0.0 || val <= 0.0) return;
+
+        const bool currentlyAboveVA = (close > vah);
+        const bool currentlyBelowVA = (close < val);
+        const bool currentlyInValue = (!currentlyAboveVA && !currentlyBelowVA);
+
+        // Track breakout state
+        if (!failedAuctionTracking.active) {
+            // Start tracking if price just left value
+            if (currentlyAboveVA || currentlyBelowVA) {
+                failedAuctionTracking.active = true;
+                failedAuctionTracking.breakoutBar = barIndex;
+                failedAuctionTracking.brokeAbove = currentlyAboveVA;
+                failedAuctionTracking.barsOutside = 1;
+            }
+        } else {
+            // Update tracking
+            if (currentlyInValue) {
+                // Returned to value - check if it's a failed auction
+                const int barsOutside = failedAuctionTracking.barsOutside;
+                if (barsOutside > 0 && barsOutside <= config.failedAuctionMaxBars) {
+                    // Rapid return = failed auction
+                    result.failedAuctionDetected = true;
+                    result.failedBreakoutAbove = failedAuctionTracking.brokeAbove;
+                    result.failedBreakoutBelow = !failedAuctionTracking.brokeAbove;
+                    result.barsOutside = barsOutside;
+
+                    // Score based on how quickly it returned (fewer bars = worse trap)
+                    result.failedAuctionScore = 1.0 - (static_cast<double>(barsOutside) /
+                                                        (config.failedAuctionMaxBars + 1));
+                }
+                // Reset tracking
+                failedAuctionTracking.Reset();
+            } else if ((failedAuctionTracking.brokeAbove && currentlyAboveVA) ||
+                       (!failedAuctionTracking.brokeAbove && currentlyBelowVA)) {
+                // Still outside in same direction
+                failedAuctionTracking.barsOutside++;
+
+                // If too many bars, it's acceptance not failure
+                if (failedAuctionTracking.barsOutside > config.failedAuctionLookback) {
+                    failedAuctionTracking.Reset();
+                }
+            } else {
+                // Changed direction outside value - reset
+                failedAuctionTracking.Reset();
+            }
+        }
+    }
+
+    // ========================================================================
     // DETERMINE PRIMARY TYPE
     // ========================================================================
 
     ImbalanceType DetermineType(const ImbalanceResult& result) {
         // Priority order based on signal strength and actionability
-        int signalCount = 0;
 
-        // 1. Excess (highest priority - auction end)
+        // 1. Failed auction (highest priority - active trap in progress)
+        if (result.failedAuctionDetected) {
+            return result.failedBreakoutAbove ? ImbalanceType::FAILED_AUCTION
+                                               : ImbalanceType::FAILED_AUCTION;
+        }
+
+        // 2. Climax (exhaustion at extremes - important reversal signal)
+        if (result.climaxDetected) {
+            return result.climaxHigh ? ImbalanceType::CLIMAX_HIGH
+                                      : ImbalanceType::CLIMAX_LOW;
+        }
+
+        // 3. Excess (strong auction rejection)
         if (result.excessHigh) {
             return ImbalanceType::EXCESS;
         }
@@ -1333,7 +1872,7 @@ private:
             return ImbalanceType::EXCESS;
         }
 
-        // 2. Trapped traders (very actionable)
+        // 4. Trapped traders (very actionable)
         if (result.trappedLongs) {
             return ImbalanceType::TRAPPED_LONGS;
         }
@@ -1341,12 +1880,12 @@ private:
             return ImbalanceType::TRAPPED_SHORTS;
         }
 
-        // 3. Range extension (structural signal)
+        // 5. Range extension (structural signal)
         if (result.rangeExtensionDetected) {
             return ImbalanceType::RANGE_EXTENSION;
         }
 
-        // 4. Stacked imbalance (footprint signal)
+        // 6. Stacked imbalance (footprint signal)
         if (result.hasStackedImbalance) {
             if (result.stackedBuyLevels >= config.minStackedLevels) {
                 return ImbalanceType::STACKED_BUY;
@@ -1356,12 +1895,12 @@ private:
             }
         }
 
-        // 5. Delta divergence (reversal signal)
+        // 7. Delta divergence (reversal signal)
         if (result.hasDeltaDivergence) {
             return ImbalanceType::DELTA_DIVERGENCE;
         }
 
-        // 6. Absorption (support/resistance)
+        // 8. Absorption (support/resistance)
         if (result.absorptionDetected) {
             if (result.absorptionBidSide) {
                 return ImbalanceType::ABSORPTION_BID;
@@ -1371,7 +1910,15 @@ private:
             }
         }
 
-        // 7. Value migration (slower signal)
+        // 9. Poor high/low (weaker signal - unfinished business)
+        if (result.poorHighDetected) {
+            return ImbalanceType::POOR_HIGH;
+        }
+        if (result.poorLowDetected) {
+            return ImbalanceType::POOR_LOW;
+        }
+
+        // 10. Value migration (slowest signal)
         if (result.pocMigrating) {
             return ImbalanceType::VALUE_MIGRATION;
         }
@@ -1389,12 +1936,21 @@ private:
             case ImbalanceType::STACKED_BUY:
             case ImbalanceType::ABSORPTION_BID:
             case ImbalanceType::TRAPPED_SHORTS:
+            case ImbalanceType::CLIMAX_LOW:   // Selling exhausted at lows -> bullish
+            case ImbalanceType::POOR_LOW:     // Weak low -> expect revisit from above
                 return ImbalanceDirection::BULLISH;
 
             case ImbalanceType::STACKED_SELL:
             case ImbalanceType::ABSORPTION_ASK:
             case ImbalanceType::TRAPPED_LONGS:
+            case ImbalanceType::CLIMAX_HIGH:  // Buying exhausted at highs -> bearish
+            case ImbalanceType::POOR_HIGH:    // Weak high -> expect revisit from below
                 return ImbalanceDirection::BEARISH;
+
+            case ImbalanceType::FAILED_AUCTION:
+                // Direction is opposite to the failed breakout
+                return result.failedBreakoutAbove ? ImbalanceDirection::BEARISH
+                                                   : ImbalanceDirection::BULLISH;
 
             case ImbalanceType::EXCESS:
                 return result.excessHigh ? ImbalanceDirection::BEARISH
@@ -1480,6 +2036,101 @@ private:
     }
 
     // ========================================================================
+    // APPLY SPATIAL CONTEXT (Wall/Void Conviction Adjustment)
+    // ========================================================================
+    // Evaluates spatial liquidity from LiquidityEngine to adjust conviction:
+    // - Wall in signal direction = REDUCE conviction (blocked)
+    // - Void in signal direction = INCREASE conviction (acceleration)
+    // - POLR aligned with signal = BOOST conviction
+    //
+    void ApplySpatialContext(ImbalanceResult& result,
+                             double nearestBidWallTicks, double nearestAskWallTicks,
+                             double nearestBidVoidTicks, double nearestAskVoidTicks,
+                             int polr) {
+        // Store raw inputs
+        result.nearestBidWallTicks = nearestBidWallTicks;
+        result.nearestAskWallTicks = nearestAskWallTicks;
+        result.nearestBidVoidTicks = nearestBidVoidTicks;
+        result.nearestAskVoidTicks = nearestAskVoidTicks;
+        result.pathOfLeastResistance = polr;
+
+        // Check if spatial data is valid (positive tick values indicate presence)
+        const bool hasBidWall = (nearestBidWallTicks >= 0.0);
+        const bool hasAskWall = (nearestAskWallTicks >= 0.0);
+        const bool hasBidVoid = (nearestBidVoidTicks >= 0.0);
+        const bool hasAskVoid = (nearestAskVoidTicks >= 0.0);
+
+        result.hasSpatialContext = (hasBidWall || hasAskWall || hasBidVoid || hasAskVoid || polr != 0);
+
+        if (!result.hasSpatialContext || !config.useSpatialConviction) {
+            return;  // No spatial data or feature disabled
+        }
+
+        double adjustment = 0.0;
+
+        // ====================================================================
+        // WALL PENALTY: Wall blocks price in that direction
+        // ====================================================================
+        // Bullish signal blocked by nearby ask wall (resistance)
+        if (result.direction == ImbalanceDirection::BULLISH && hasAskWall) {
+            if (nearestAskWallTicks <= config.wallBlockDistanceTicks) {
+                result.wallBlocksBullish = true;
+                // Penalty inversely proportional to distance
+                const double distanceRatio = nearestAskWallTicks / config.wallBlockDistanceTicks;
+                const double penalty = config.maxWallPenalty * (1.0 - distanceRatio);
+                adjustment -= penalty;
+            }
+        }
+
+        // Bearish signal blocked by nearby bid wall (support)
+        if (result.direction == ImbalanceDirection::BEARISH && hasBidWall) {
+            if (nearestBidWallTicks <= config.wallBlockDistanceTicks) {
+                result.wallBlocksBearish = true;
+                const double distanceRatio = nearestBidWallTicks / config.wallBlockDistanceTicks;
+                const double penalty = config.maxWallPenalty * (1.0 - distanceRatio);
+                adjustment -= penalty;
+            }
+        }
+
+        // ====================================================================
+        // VOID BOOST: Void accelerates price in that direction
+        // ====================================================================
+        // Bullish signal boosted by nearby ask void (less resistance above)
+        if (result.direction == ImbalanceDirection::BULLISH && hasAskVoid) {
+            if (nearestAskVoidTicks <= config.voidAccelDistanceTicks) {
+                result.voidAcceleratesBullish = true;
+                const double distanceRatio = nearestAskVoidTicks / config.voidAccelDistanceTicks;
+                const double boost = config.maxVoidBoost * (1.0 - distanceRatio);
+                adjustment += boost;
+            }
+        }
+
+        // Bearish signal boosted by nearby bid void (less support below)
+        if (result.direction == ImbalanceDirection::BEARISH && hasBidVoid) {
+            if (nearestBidVoidTicks <= config.voidAccelDistanceTicks) {
+                result.voidAcceleratesBearish = true;
+                const double distanceRatio = nearestBidVoidTicks / config.voidAccelDistanceTicks;
+                const double boost = config.maxVoidBoost * (1.0 - distanceRatio);
+                adjustment += boost;
+            }
+        }
+
+        // ====================================================================
+        // POLR BOOST: Path of Least Resistance alignment
+        // ====================================================================
+        // polr: -1=DOWN, 0=BALANCED, +1=UP
+        if (result.direction == ImbalanceDirection::BULLISH && polr > 0) {
+            adjustment += config.polrBoost;
+        }
+        if (result.direction == ImbalanceDirection::BEARISH && polr < 0) {
+            adjustment += config.polrBoost;
+        }
+
+        // Store final adjustment (clamped to reasonable range)
+        result.convictionAdjustment = (std::max)(-0.5, (std::min)(0.5, adjustment));
+    }
+
+    // ========================================================================
     // COMPUTE STRENGTH AND CONFIDENCE
     // ========================================================================
 
@@ -1534,7 +2185,13 @@ private:
         if (!result.contextGate.volatilityOK) contextMultiplier *= 0.5;
         if (!result.contextGate.chopOK) contextMultiplier *= 0.7;
 
-        result.confidenceScore = result.strengthScore * contextMultiplier;
+        // Apply spatial conviction adjustment (from wall/void analysis)
+        // Adjustment is additive: positive for acceleration, negative for blocking
+        double spatialMultiplier = 1.0 + result.convictionAdjustment;
+        spatialMultiplier = (std::max)(0.5, (std::min)(1.5, spatialMultiplier));
+
+        result.confidenceScore = result.strengthScore * contextMultiplier * spatialMultiplier;
+        result.confidenceScore = (std::min)(1.0, (std::max)(0.0, result.confidenceScore));
     }
 
     // ========================================================================
@@ -1628,16 +2285,21 @@ private:
     // ========================================================================
 
     ImbalanceErrorReason CheckWarmupState() {
+        const int phaseIdx = SessionPhaseToBucketIndex(currentPhase);
+        if (phaseIdx < 0 || phaseIdx >= EFFORT_BUCKET_COUNT) {
+            return ImbalanceErrorReason::WARMUP_DIAGONAL;  // Invalid phase = not ready
+        }
+
         int notReady = 0;
 
-        if (diagonalNetBaseline.size() < config.baselineMinSamples) notReady++;
-        if (pocShiftBaseline.size() < config.baselineMinSamples / 2) notReady++;  // POC shifts are rarer
+        if (diagonalNetBaseline[phaseIdx].size() < config.baselineMinSamples) notReady++;
+        if (pocShiftBaseline[phaseIdx].size() < config.baselineMinSamples / 2) notReady++;  // POC shifts are rarer
         if (swingHighs.size() < 2 || swingLows.size() < 2) notReady++;
 
         if (notReady > 1) {
             return ImbalanceErrorReason::WARMUP_MULTIPLE;
         }
-        if (diagonalNetBaseline.size() < config.baselineMinSamples) {
+        if (diagonalNetBaseline[phaseIdx].size() < config.baselineMinSamples) {
             return ImbalanceErrorReason::WARMUP_DIAGONAL;
         }
         if (swingHighs.size() < 2 || swingLows.size() < 2) {

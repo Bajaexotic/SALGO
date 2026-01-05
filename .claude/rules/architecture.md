@@ -1,6 +1,6 @@
 # AMT Framework - Architecture Reference
 
-## File Structure (37 files)
+## File Structure (36 files)
 
 | File | Purpose |
 |------|---------|
@@ -13,17 +13,17 @@
 | `AMT_Bridge.h` | DeriveRoleFromType, DeriveMechanismFromType helpers |
 | `AMT_config.h` | Configuration constants and defaults |
 | `AMT_ContextBuilder.h` | AuctionContext builder (stateless, single authoritative population) |
+| `AMT_Dalton.h` | **DaltonEngine**: 1TF/2TF, IB, day type, session bridge (overnight, gap, opening type) |
 | `AMT_DayType.h` | Day structure classification (BALANCED/IMBALANCED), range extension |
-| `AMT_DeltaPatterns.h` | Balance delta patterns: absorption, divergence, aggressive initiation |
+| `AMT_DeltaEngine.h` | **DeltaEngine**: participation pressure (character, alignment, confidence, constraints) |
 | `AMT_Display.h` | Chart drawing utilities |
 | `AMT_DomEvents.h` | DOM event detection: DOMControlPattern, DOMEvent (no SC deps) |
 | `AMT_DomPatterns.h` | Static DOM patterns: BalanceDOMPattern, ImbalanceDOMPattern |
 | `AMT_Helpers.h` | Pure utility functions: TimeToSeconds, PriceToTicks, IsValidPrice |
 | `AMT_Imbalance.h` | **ImbalanceEngine**: displacement detection, diagonal imbalance, delta divergence, absorption |
-| `AMT_ImbalanceDeltaPatterns.h` | Imbalance delta patterns: convergence, pullback, exhaustion, climax |
 | `AMT_Invariants.h` | Runtime SSOT assertions and validation macros |
 | `AMT_Levels.h` | Versioned profile levels (tick-based SSOT for POC/VAH/VAL) |
-| `AMT_Liquidity.h` | 3-Component Liquidity Model (Dec 2024): DepthMass, Stress, Resilience |
+| `AMT_Liquidity.h` | **LiquidityEngine**: Kyle's 4-component model + DOM time-series patterns (SSOT) |
 | `AMT_Logger.h` | LogManager, LogChannel, throttling |
 | `AMT_LoggingContext.h` | Logging lifecycle contract, SSOT-compliant log value sourcing |
 | `AMT_Modules.h` | AuctionContextModule, MiniVPModule, ZoneStore |
@@ -117,4 +117,22 @@ amt_core.h
 | `VAOverlapState` | AMT_ValueLocation.h (enum: SEPARATED_ABOVE/BELOW, OVERLAPPING, CONTAINED, EXPANDING) |
 | `ReferenceLevelProximity` | AMT_ValueLocation.h (distance to reference levels with proximity flags) |
 | `StrategyGating` | AMT_ValueLocation.h (actionable recommendations: fade/breakout/trend multipliers) |
+| `DaltonEngine` | AMT_Dalton.h (SSOT: 1TF/2TF, IB, day type, session bridge) |
+| `DaltonState` | AMT_Dalton.h (per-bar output: phase, timeframe, IB, extension, opening type) |
+| `SessionBridge` | AMT_Dalton.h (SSOT: overnight context, gap, prior RTH for GLOBEX→RTH transition) |
+| `OvernightSession` | AMT_Dalton.h (GLOBEX extremes, mini-IB, overnight pattern) |
+| `OvernightInventory` | AMT_Dalton.h (net position from overnight: NET_LONG/NET_SHORT/NEUTRAL, score) |
+| `GapContext` | AMT_Dalton.h (gap type, size, fill status at RTH open) |
+| `OpeningType` | AMT_Dalton.h (enum: OPEN_DRIVE, OPEN_TEST_DRIVE, OPEN_REJECTION_REVERSE, OPEN_AUCTION) |
+| `GlobexMiniIBTracker` | AMT_Dalton.h (tracks first 30 min of GLOBEX as mini-IB) |
+| `OpeningTypeClassifier` | AMT_Dalton.h (classifies Dalton's 4 opening types in first 30 min RTH) |
 | `ValueLocationConfig` | AMT_ValueLocation.h (tolerance thresholds, overlap thresholds, hysteresis) |
+| `DeltaEngine` | AMT_DeltaEngine.h (delta participation pressure: character, alignment, confidence; phase-aware) |
+| `DeltaResult` | AMT_DeltaEngine.h (per-bar output: character, alignment, constraints, events, validity) |
+| `DeltaCharacter` | AMT_DeltaEngine.h (enum: UNKNOWN, NEUTRAL, EPISODIC, SUSTAINED, BUILDING, FADING, REVERSAL) |
+| `DeltaAlignment` | AMT_DeltaEngine.h (enum: UNKNOWN, NEUTRAL, CONVERGENT, DIVERGENT, ABSORPTION_BID/ASK) |
+| `DeltaConfidence` | AMT_DeltaEngine.h (enum: UNKNOWN, BLOCKED, LOW, DEGRADED, FULL) |
+| `DeltaTradingConstraints` | AMT_DeltaEngine.h (position sizing, entry restrictions based on delta state) |
+| `DeltaHistoryTracker` | AMT_DeltaEngine.h (rolling window for character/alignment hysteresis) |
+| `DomHistoryBuffer` | AMT_DomEvents.h (session-scoped circular buffer for DOM time-series, owned by LiquidityEngine) |
+| `DomDetectionResult` | AMT_DomEvents.h (DOM patterns detected from time-series: control patterns + events) |

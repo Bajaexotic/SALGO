@@ -254,7 +254,16 @@ enum class DeltaErrorReason : int {
     WARN_GLOBEX_HOURS = 33,          // GLOBEX session (inherently lower confidence)
 
     // Session events
-    SESSION_RESET = 40               // Session just reset, no delta history
+    SESSION_RESET = 40,              // Session just reset, no delta history
+
+    // Context gate blocks (from external engines)
+    BLOCKED_LIQUIDITY_VOID = 50,     // LiquidityState::LIQ_VOID
+    BLOCKED_LIQUIDITY_THIN = 51,     // LiquidityState::LIQ_THIN (configurable)
+    BLOCKED_VOLATILITY_EVENT = 52,   // VolatilityRegime::EVENT
+
+    // Context gate degradation (not blocked, but reduced confidence)
+    DEGRADED_VOLATILITY_COMPRESSION = 53,  // COMPRESSION regime
+    DEGRADED_HIGH_STRESS = 54        // High liquidity stress (stressRank >= 0.90)
 };
 
 inline const char* DeltaErrorToString(DeltaErrorReason r) {
@@ -272,6 +281,11 @@ inline const char* DeltaErrorToString(DeltaErrorReason r) {
         case DeltaErrorReason::WARN_EXHAUSTION:         return "EXHAUSTION";
         case DeltaErrorReason::WARN_GLOBEX_HOURS:       return "GLOBEX";
         case DeltaErrorReason::SESSION_RESET:           return "SESSION_RESET";
+        case DeltaErrorReason::BLOCKED_LIQUIDITY_VOID:  return "BLOCKED_LIQ_VOID";
+        case DeltaErrorReason::BLOCKED_LIQUIDITY_THIN:  return "BLOCKED_LIQ_THIN";
+        case DeltaErrorReason::BLOCKED_VOLATILITY_EVENT: return "BLOCKED_VOL_EVENT";
+        case DeltaErrorReason::DEGRADED_VOLATILITY_COMPRESSION: return "DEGRADE_COMPRESS";
+        case DeltaErrorReason::DEGRADED_HIGH_STRESS:    return "DEGRADE_STRESS";
     }
     return "UNK";
 }
@@ -289,6 +303,261 @@ inline bool IsDeltaWarning(DeltaErrorReason r) {
            r == DeltaErrorReason::WARN_EXHAUSTION ||
            r == DeltaErrorReason::WARN_GLOBEX_HOURS;
 }
+
+inline bool IsDeltaContextBlocked(DeltaErrorReason r) {
+    return r == DeltaErrorReason::BLOCKED_LIQUIDITY_VOID ||
+           r == DeltaErrorReason::BLOCKED_LIQUIDITY_THIN ||
+           r == DeltaErrorReason::BLOCKED_VOLATILITY_EVENT;
+}
+
+inline bool IsDeltaContextDegraded(DeltaErrorReason r) {
+    return r == DeltaErrorReason::DEGRADED_VOLATILITY_COMPRESSION ||
+           r == DeltaErrorReason::DEGRADED_HIGH_STRESS;
+}
+
+// ============================================================================
+// THIN TAPE TYPE - Enhanced Thin Tape Classification
+// ============================================================================
+// Distinguishes different types of low activity conditions:
+//
+// TRUE_THIN: Low volume + low trades = genuine low participation
+//   - No real market interest
+//   - Signals unreliable
+//
+// HFT_FRAGMENTED: Low volume + high trades = many small orders
+//   - HFT activity but no real size
+//   - Price can move on noise
+//
+// INSTITUTIONAL: High volume + low trades = large block orders
+//   - Informed institutional activity
+//   - Signals MORE reliable
+// ============================================================================
+
+enum class ThinTapeType : int {
+    NONE = 0,           // Normal activity
+    TRUE_THIN,          // Low volume + low trades (no participation)
+    HFT_FRAGMENTED,     // Low volume + high trades (HFT noise)
+    INSTITUTIONAL       // High volume + low trades (block trades)
+};
+
+inline const char* ThinTapeTypeToString(ThinTapeType t) {
+    switch (t) {
+        case ThinTapeType::NONE:           return "NONE";
+        case ThinTapeType::TRUE_THIN:      return "TRUE_THIN";
+        case ThinTapeType::HFT_FRAGMENTED: return "HFT_FRAG";
+        case ThinTapeType::INSTITUTIONAL:  return "INSTIT";
+    }
+    return "?";
+}
+
+// ============================================================================
+// DELTA LOCATION CONTEXT (AMT Value-Relative Awareness)
+// ============================================================================
+// The DeltaEngine CONSUMES location context from ValueLocationEngine.
+// It does NOT own or compute value levels - it interprets delta relative to them.
+//
+// KEY AMT INSIGHT: Delta is only meaningful relative to where the auction is.
+//   - At POC: lower delta expected (rotation)
+//   - At VAH/VAL edges: higher delta expected (breakout/rejection attempts)
+//   - Outside value: sustained delta expected (discovery/acceptance)
+// ============================================================================
+
+enum class ValueZoneSimple : int {
+    UNKNOWN = 0,
+    IN_VALUE,           // Between VAH and VAL
+    AT_VALUE_EDGE,      // At or near VAH/VAL (within tolerance)
+    OUTSIDE_VALUE,      // Beyond VAH or VAL
+    IN_DISCOVERY        // Far outside value, sustained move
+};
+
+inline const char* ValueZoneSimpleToString(ValueZoneSimple z) {
+    switch (z) {
+        case ValueZoneSimple::UNKNOWN:        return "UNKNOWN";
+        case ValueZoneSimple::IN_VALUE:       return "IN_VALUE";
+        case ValueZoneSimple::AT_VALUE_EDGE:  return "AT_EDGE";
+        case ValueZoneSimple::OUTSIDE_VALUE:  return "OUTSIDE";
+        case ValueZoneSimple::IN_DISCOVERY:   return "DISCOVERY";
+    }
+    return "?";
+}
+
+struct DeltaLocationContext {
+    // Zone classification (simplified for delta interpretation)
+    ValueZoneSimple zone = ValueZoneSimple::UNKNOWN;
+
+    // Distance from key levels (in ticks, signed: + = above, - = below)
+    double distanceFromPOCTicks = 0.0;
+    double distanceFromVAHTicks = 0.0;
+    double distanceFromVALTicks = 0.0;
+
+    // Convenience flags
+    bool isInValue = false;          // Between VAH and VAL
+    bool isAtEdge = false;           // At VAH or VAL (within tolerance)
+    bool isOutsideValue = false;     // Beyond VAH or below VAL
+    bool isInDiscovery = false;      // Far outside + sustained
+
+    // Migration context (is value moving toward or away from price?)
+    bool isMigratingTowardPrice = false;  // POC moving toward current price
+    bool isMigratingAwayFromPrice = false; // POC moving away (value rejecting)
+
+    // Structure context
+    bool isAboveSessionHigh = false;
+    bool isBelowSessionLow = false;
+    bool isAtIBExtreme = false;      // At IB high or low
+
+    // Validity
+    bool isValid = false;
+
+    // Build from raw values (typically called by orchestrator)
+    static DeltaLocationContext Build(
+        double currentPrice,
+        double poc, double vah, double val,
+        double tickSize,
+        double edgeToleranceTicks = 2.0,
+        double discoveryThresholdTicks = 8.0,
+        double sessionHigh = 0.0, double sessionLow = 0.0,
+        double ibHigh = 0.0, double ibLow = 0.0,
+        double priorPOC = 0.0)
+    {
+        DeltaLocationContext ctx;
+
+        if (tickSize <= 0.0 || vah <= val) {
+            ctx.isValid = false;
+            return ctx;
+        }
+
+        // Calculate distances
+        ctx.distanceFromPOCTicks = (currentPrice - poc) / tickSize;
+        ctx.distanceFromVAHTicks = (currentPrice - vah) / tickSize;
+        ctx.distanceFromVALTicks = (currentPrice - val) / tickSize;
+
+        // Classify zone
+        double distFromVAH = std::abs(ctx.distanceFromVAHTicks);
+        double distFromVAL = std::abs(ctx.distanceFromVALTicks);
+
+        if (distFromVAH <= edgeToleranceTicks) {
+            ctx.zone = ValueZoneSimple::AT_VALUE_EDGE;
+            ctx.isAtEdge = true;
+        } else if (distFromVAL <= edgeToleranceTicks) {
+            ctx.zone = ValueZoneSimple::AT_VALUE_EDGE;
+            ctx.isAtEdge = true;
+        } else if (currentPrice > vah) {
+            if (ctx.distanceFromVAHTicks > discoveryThresholdTicks) {
+                ctx.zone = ValueZoneSimple::IN_DISCOVERY;
+                ctx.isInDiscovery = true;
+            } else {
+                ctx.zone = ValueZoneSimple::OUTSIDE_VALUE;
+            }
+            ctx.isOutsideValue = true;
+        } else if (currentPrice < val) {
+            if (std::abs(ctx.distanceFromVALTicks) > discoveryThresholdTicks) {
+                ctx.zone = ValueZoneSimple::IN_DISCOVERY;
+                ctx.isInDiscovery = true;
+            } else {
+                ctx.zone = ValueZoneSimple::OUTSIDE_VALUE;
+            }
+            ctx.isOutsideValue = true;
+        } else {
+            ctx.zone = ValueZoneSimple::IN_VALUE;
+            ctx.isInValue = true;
+        }
+
+        // Migration context
+        if (priorPOC > 0.0) {
+            double pocShift = poc - priorPOC;
+            double priceFromPOC = currentPrice - poc;
+            // Migrating toward if POC moving in same direction as price relative to POC
+            ctx.isMigratingTowardPrice = (pocShift * priceFromPOC > 0);
+            ctx.isMigratingAwayFromPrice = (pocShift * priceFromPOC < 0);
+        }
+
+        // Structure context
+        if (sessionHigh > 0.0 && sessionLow > 0.0) {
+            ctx.isAboveSessionHigh = currentPrice > sessionHigh;
+            ctx.isBelowSessionLow = currentPrice < sessionLow;
+        }
+        if (ibHigh > 0.0 && ibLow > 0.0) {
+            ctx.isAtIBExtreme = (std::abs(currentPrice - ibHigh) <= edgeToleranceTicks * tickSize) ||
+                               (std::abs(currentPrice - ibLow) <= edgeToleranceTicks * tickSize);
+        }
+
+        ctx.isValid = true;
+        return ctx;
+    }
+};
+
+// ============================================================================
+// DELTA AUCTION PREDICTION (AMT Implication Flags)
+// ============================================================================
+// NOTE: This is DIFFERENT from amt_core.h's AuctionOutcome (PENDING/ACCEPTED/REJECTED)
+// which is used for zone acceptance tracking.
+//
+// DeltaAuctionPrediction describes what delta analysis PREDICTS will happen:
+//   - ACCEPTANCE_LIKELY: sustained + convergent + outside value + holding
+//   - REJECTION_LIKELY: absorption + at edge + exhaustion signatures
+//   - ROTATION_LIKELY: episodic + chop + at/near value center
+// These are state descriptors for downstream engines, NOT trade signals.
+// ============================================================================
+
+enum class DeltaAuctionPrediction : int {
+    UNKNOWN = 0,
+    ACCEPTANCE_LIKELY,    // Market accepting new value (trend continuation)
+    REJECTION_LIKELY,     // Market rejecting price level (reversal setup)
+    ROTATION_LIKELY       // Market rotating in balance (mean reversion)
+};
+
+inline const char* DeltaAuctionPredictionToString(DeltaAuctionPrediction o) {
+    switch (o) {
+        case DeltaAuctionPrediction::UNKNOWN:           return "UNKNOWN";
+        case DeltaAuctionPrediction::ACCEPTANCE_LIKELY: return "ACCEPT";
+        case DeltaAuctionPrediction::REJECTION_LIKELY:  return "REJECT";
+        case DeltaAuctionPrediction::ROTATION_LIKELY:   return "ROTATE";
+    }
+    return "?";
+}
+
+// ============================================================================
+// DELTA CONTEXT GATE (from LiquidityEngine + VolatilityEngine + DaltonEngine)
+// ============================================================================
+// Results from checking external engine gates.
+// Tells us if market context is suitable for trusting delta signals.
+//
+// This follows the pattern established by ContextGateResult in ImbalanceEngine.
+// ============================================================================
+
+struct DeltaContextGateResult {
+    // Individual gate results
+    bool liquidityOK = false;           // Not in VOID (or THIN if configured)
+    bool volatilityOK = false;          // Not in EVENT regime
+    bool compressionDegraded = false;   // In COMPRESSION (not blocked, but distrust breakouts)
+
+    // Combined results
+    bool allGatesPass = false;          // liquidityOK && volatilityOK
+    bool contextValid = false;          // At least one context input was valid
+
+    // Detailed state for diagnostics
+    LiquidityState liqState = LiquidityState::LIQ_NOT_READY;
+    VolatilityRegime volRegime = VolatilityRegime::UNKNOWN;
+    double stressRank = 0.0;            // From LiquidityEngine [0, 1]
+    bool highStress = false;            // stressRank >= threshold
+
+    // Optional: Dalton market state awareness
+    AMTMarketState daltonState = AMTMarketState::UNKNOWN;
+    bool is1TF = false;                 // 1TF = trending (ONE_TIME_FRAMING)
+    bool hasDaltonContext = false;      // Was Dalton state provided?
+
+    // Block reason (if any)
+    DeltaErrorReason blockReason = DeltaErrorReason::NONE;
+
+    // Diagnostic accessors
+    bool IsBlocked() const {
+        return blockReason != DeltaErrorReason::NONE && IsDeltaContextBlocked(blockReason);
+    }
+
+    bool IsDegraded() const {
+        return compressionDegraded || highStress || IsDeltaContextDegraded(blockReason);
+    }
+};
 
 // ============================================================================
 // TRADING CONSTRAINTS (Downstream Decisions)
@@ -375,6 +644,38 @@ struct DeltaResult {
     bool isGlobexSession = false;       // Lower liquidity session
 
     // =========================================================================
+    // ASYMMETRIC HYSTERESIS DIAGNOSTICS (Jan 2025)
+    // =========================================================================
+    int characterConfirmationRequired = 0;   // Bars required for this transition
+    int alignmentConfirmationRequired = 0;   // Bars required for this transition
+    int barsInConfirmedCharacter = 0;        // Bars since last character change
+    int barsInConfirmedAlignment = 0;        // Bars since last alignment change
+
+    // =========================================================================
+    // EXTENDED BASELINE METRICS (Jan 2025)
+    // =========================================================================
+    // From trades_sec baseline (thin tape classification)
+    double tradesPctile = 0.0;               // Trades per second percentile
+    bool tradesBaselineReady = false;        // Is trades baseline ready?
+    ThinTapeType thinTapeType = ThinTapeType::NONE;
+
+    // From bar_range baseline (volatility-adaptive thresholds)
+    double rangePctile = 0.0;                // Bar range percentile
+    bool rangeBaselineReady = false;         // Is range baseline ready?
+    double effectiveNoiseFloor = 25.0;       // Adjusted noise floor percentile
+    double effectiveStrongSignal = 75.0;     // Adjusted strong signal percentile
+    bool rangeAdaptiveApplied = false;       // Was range adjustment applied?
+
+    // From avg_trade_size baseline (institutional detection)
+    double avgTradeSizePctile = 0.0;         // Avg trade size percentile
+    bool avgTradeBaselineReady = false;      // Is avg trade baseline ready?
+    bool isInstitutionalActivity = false;    // Above P80 avg trade size
+    bool isRetailActivity = false;           // Below P20 avg trade size
+
+    // Extended inputs tracking
+    bool hasExtendedInputs = false;          // Were extended inputs provided?
+
+    // =========================================================================
     // TRADING CONSTRAINTS
     // =========================================================================
     DeltaTradingConstraints constraints;
@@ -389,11 +690,45 @@ struct DeltaResult {
     bool convergenceRestored = false;   // Just exited divergence
 
     // =========================================================================
+    // LOCATION CONTEXT (AMT Value-Relative Awareness)
+    // =========================================================================
+    DeltaLocationContext location;      // Where price is relative to value
+
+    // =========================================================================
+    // CONTEXT GATES (from LiquidityEngine + VolatilityEngine + DaltonEngine)
+    // =========================================================================
+    DeltaContextGateResult contextGate;
+
+    // =========================================================================
+    // AUCTION OUTCOME IMPLICATIONS
+    // Delta + location + character -> auction outcome likelihood
+    // These are state descriptors, NOT trade signals
+    // =========================================================================
+    DeltaAuctionPrediction likelyOutcome = DeltaAuctionPrediction::UNKNOWN;
+    double acceptanceLikelihood = 0.0;  // [0-1] Probability of value accepting this price
+    double rejectionLikelihood = 0.0;   // [0-1] Probability of price rejection
+    double rotationLikelihood = 0.0;    // [0-1] Probability of balanced rotation
+
+    // =========================================================================
     // VALIDITY / ERROR
     // =========================================================================
     DeltaErrorReason errorReason = DeltaErrorReason::NONE;
     SessionPhase phase = SessionPhase::UNKNOWN;
     int bar = -1;
+
+    // =========================================================================
+    // EXTREME DELTA CLASSIFICATION (SSOT - Dec 2024)
+    // =========================================================================
+    // Persistence-validated extreme delta detection.
+    // Per contracts.md: isExtremeDelta := isExtremeDeltaBar && isExtremeDeltaSession
+    //
+    // Bar-level: > 70% one-sided (deltaConsistency > 0.7 or < 0.3)
+    // Session-level: top 15% magnitude (sessionDeltaPctile >= 85)
+    // Combined: both must be true to eliminate single-bar false positives
+    bool isExtremeDeltaBar = false;      // Per-bar: extreme one-sided delta
+    bool isExtremeDeltaSession = false;  // Session: extreme magnitude percentile
+    bool isExtremeDelta = false;         // Combined: bar && session
+    bool directionalCoherence = false;   // Session delta sign matches bar direction
 
     // =========================================================================
     // ACCESSORS
@@ -409,6 +744,14 @@ struct DeltaResult {
 
     bool HasWarnings() const {
         return warningFlags != 0;
+    }
+
+    bool IsContextBlocked() const {
+        return IsDeltaContextBlocked(errorReason);
+    }
+
+    bool IsContextDegraded() const {
+        return contextGate.IsDegraded();
     }
 
     // Direction helpers
@@ -465,6 +808,81 @@ struct DeltaResult {
 
         return (std::min)(strength, 1.0);
     }
+
+    // =========================================================================
+    // LOCATION-AWARE ACCESSORS
+    // =========================================================================
+
+    bool HasLocationContext() const {
+        return location.isValid;
+    }
+
+    bool IsInValue() const {
+        return location.isValid && location.zone == ValueZoneSimple::IN_VALUE;
+    }
+
+    bool IsAtValueEdge() const {
+        return location.isValid && location.zone == ValueZoneSimple::AT_VALUE_EDGE;
+    }
+
+    bool IsOutsideValue() const {
+        return location.isValid && location.zone == ValueZoneSimple::OUTSIDE_VALUE;
+    }
+
+    bool IsInDiscovery() const {
+        return location.isValid && location.zone == ValueZoneSimple::IN_DISCOVERY;
+    }
+
+    // =========================================================================
+    // AUCTION OUTCOME ACCESSORS
+    // =========================================================================
+
+    bool IsAcceptanceLikely() const {
+        return likelyOutcome == DeltaAuctionPrediction::ACCEPTANCE_LIKELY;
+    }
+
+    bool IsRejectionLikely() const {
+        return likelyOutcome == DeltaAuctionPrediction::REJECTION_LIKELY;
+    }
+
+    bool IsRotationLikely() const {
+        return likelyOutcome == DeltaAuctionPrediction::ROTATION_LIKELY;
+    }
+
+    // Get the dominant likelihood (highest probability)
+    double GetDominantLikelihood() const {
+        return (std::max)({acceptanceLikelihood, rejectionLikelihood, rotationLikelihood});
+    }
+
+    // Is this a high-conviction outcome (> 0.6)?
+    bool IsHighConvictionOutcome() const {
+        return GetDominantLikelihood() > 0.6;
+    }
+
+    // Combined assessment: strong delta + high conviction outcome
+    bool IsHighQualitySignalWithContext() const {
+        if (!IsReady() || !HasLocationContext()) return false;
+        return GetSignalStrength() > 0.6 && IsHighConvictionOutcome();
+    }
+
+    // =========================================================================
+    // EXTREME DELTA ACCESSORS
+    // =========================================================================
+
+    // Is this an extreme delta bar (persistence-validated)?
+    bool IsExtreme() const {
+        return isExtremeDelta;
+    }
+
+    // Is extreme delta coherent with session direction (for initiative classification)?
+    bool IsExtremeInitiative() const {
+        return isExtremeDelta && directionalCoherence;
+    }
+
+    // Is extreme delta incoherent (absorption/responsive)?
+    bool IsExtremeResponsive() const {
+        return isExtremeDelta && !directionalCoherence;
+    }
 };
 
 // ============================================================================
@@ -517,6 +935,62 @@ struct DeltaConfig {
     bool requireSustainedForContinuation = true;
     double lowConfidencePositionScale = 0.5;
     double degradedConfidencePositionScale = 0.75;
+
+    // =========================================================================
+    // CONTEXT GATES (from external engines)
+    // =========================================================================
+    bool requireLiquidityGate = true;    // Check liquidity state
+    bool requireVolatilityGate = true;   // Check volatility regime
+    bool blockOnVoid = true;             // Block on LIQ_VOID
+    bool blockOnThin = false;            // Optionally block on LIQ_THIN
+    bool blockOnEvent = true;            // Block on EVENT volatility
+    bool degradeOnCompression = true;    // Distrust breakouts in COMPRESSION
+    double highStressThreshold = 0.90;   // stressRank >= this = degrade
+    bool useDaltonContext = false;       // Optional market state awareness
+
+    // =========================================================================
+    // ASYMMETRIC HYSTERESIS (Jan 2025)
+    // =========================================================================
+    // Different confirmation requirements for different transitions.
+    // Danger signals (REVERSAL, BUILDING, DIVERGENT) enter fast (1 bar).
+    // Calm signals (exiting SUSTAINED, exiting CONVERGENT) exit slow (3 bars).
+    //
+    // Character transitions:
+    int reversalEntryBars = 1;              // Any -> REVERSAL: react fast
+    int buildingEntryBars = 1;              // Any -> BUILDING: acceleration is time-sensitive
+    int sustainedExitBars = 3;              // SUSTAINED -> other: confirm trend really ending
+    int otherCharacterTransitionBars = 2;   // Default for other transitions
+
+    // Alignment transitions:
+    int divergenceEntryBars = 1;            // Any -> DIVERGENT/ABSORPTION: react fast
+    int convergenceExitBars = 3;            // CONVERGENT -> other: confirm alignment really lost
+    int otherAlignmentTransitionBars = 2;   // Default for other transitions
+
+    // =========================================================================
+    // EXTENDED BASELINE METRICS (Jan 2025)
+    // =========================================================================
+    // Uses additional metrics from EffortBaselineStore beyond delta_pct and vol_sec.
+
+    // Thin tape classification (trades_sec metric)
+    double lowTradesPctile = 25.0;          // Below P25 = low trades
+    double highTradesPctile = 75.0;         // Above P75 = high trades
+    double lowVolumePctile = 10.0;          // Below P10 = low volume (for thin tape)
+    double highVolumePctile = 75.0;         // Above P75 = high volume (for institutional)
+    int thinTapeConfidencePenalty = 3;      // TRUE_THIN: major concern (-3 confidence)
+    int hftFragmentedConfidencePenalty = 1; // HFT_FRAGMENTED: minor concern (-1)
+    int institutionalConfidenceBoost = 1;   // INSTITUTIONAL: boost (+1)
+
+    // Range-adaptive thresholds (bar_range metric)
+    bool useRangeAdaptiveThresholds = true;
+    double compressionRangePctile = 25.0;   // Below P25 = compression
+    double expansionRangePctile = 75.0;     // Above P75 = expansion
+    double compressionNoiseMultiplier = 0.7;  // In compression: 70% of normal noise floor
+    double expansionNoiseMultiplier = 1.3;    // In expansion: 130% of normal noise floor
+
+    // Average trade size context (avg_trade_size metric)
+    bool useAvgTradeSizeContext = true;
+    double institutionalAvgTradePctile = 80.0;  // Above P80 = institutional size
+    double retailAvgTradePctile = 20.0;         // Below P20 = retail/HFT size
 };
 
 // ============================================================================
@@ -630,6 +1104,81 @@ struct DeltaHistoryTracker {
 };
 
 // ============================================================================
+// DELTA INPUT (Extended Input Structure - Jan 2025)
+// ============================================================================
+// Clean interface for passing extended inputs to DeltaEngine.
+// Maintains backward compatibility - extended fields are optional.
+//
+// Core fields (required): barDelta, barVolume, priceChangeTicks, sessionCumDelta,
+//                         sessionVolume, currentBar
+// Extended fields (optional): barRangeTicks, numTrades, tradesPerSec
+// ============================================================================
+
+struct DeltaInput {
+    // =========================================================================
+    // CORE INPUTS (required for basic operation)
+    // =========================================================================
+    double barDelta = 0.0;              // Bar delta (bidVol - askVol)
+    double barVolume = 0.0;             // Total bar volume
+    double priceChangeTicks = 0.0;      // Bar price change in ticks
+    double sessionCumDelta = 0.0;       // Session cumulative delta
+    double sessionVolume = 0.0;         // Session total volume
+    int currentBar = -1;                // Current bar index
+
+    // =========================================================================
+    // EXTENDED INPUTS (optional, for enhanced metrics - Jan 2025)
+    // =========================================================================
+    double barRangeTicks = 0.0;         // High - Low in ticks (for range-adaptive thresholds)
+    double numTrades = 0.0;             // Number of trades in bar (for thin tape classification)
+    double tradesPerSec = 0.0;          // Trades per second rate
+    double avgBidTradeSize = 0.0;       // Average bid trade size (for institutional detection)
+    double avgAskTradeSize = 0.0;       // Average ask trade size
+
+    // =========================================================================
+    // VALIDITY FLAGS
+    // =========================================================================
+    bool hasExtendedInputs = false;     // True if extended fields are populated
+
+    // =========================================================================
+    // BUILDER PATTERN FOR CONVENIENCE
+    // =========================================================================
+    DeltaInput& WithCore(double delta, double vol, double priceTicks,
+                         double sessDelta, double sessVol, int bar) {
+        barDelta = delta;
+        barVolume = vol;
+        priceChangeTicks = priceTicks;
+        sessionCumDelta = sessDelta;
+        sessionVolume = sessVol;
+        currentBar = bar;
+        return *this;
+    }
+
+    DeltaInput& WithExtended(double rangeTicks, double trades, double tradesSec,
+                             double avgBid = 0.0, double avgAsk = 0.0) {
+        barRangeTicks = rangeTicks;
+        numTrades = trades;
+        tradesPerSec = tradesSec;
+        avgBidTradeSize = avgBid;
+        avgAskTradeSize = avgAsk;
+        hasExtendedInputs = true;
+        return *this;
+    }
+
+    // Convenience: calculate derived values
+    double GetDeltaPct() const {
+        return (barVolume > 0.0) ? (barDelta / barVolume) : 0.0;
+    }
+
+    double GetSessionDeltaPct() const {
+        return (sessionVolume > 0.0) ? (sessionCumDelta / sessionVolume) : 0.0;
+    }
+
+    double GetAvgTradeSize() const {
+        return (avgBidTradeSize + avgAskTradeSize) / 2.0;
+    }
+};
+
+// ============================================================================
 // DELTA ENGINE
 // ============================================================================
 
@@ -652,10 +1201,12 @@ private:
     DeltaCharacter confirmedCharacter_ = DeltaCharacter::UNKNOWN;
     DeltaCharacter candidateCharacter_ = DeltaCharacter::UNKNOWN;
     int characterConfirmBars_ = 0;
+    int barsInConfirmedCharacter_ = 0;  // Jan 2025: tracks time in confirmed state
 
     DeltaAlignment confirmedAlignment_ = DeltaAlignment::UNKNOWN;
     DeltaAlignment candidateAlignment_ = DeltaAlignment::UNKNOWN;
     int alignmentConfirmBars_ = 0;
+    int barsInConfirmedAlignment_ = 0;  // Jan 2025: tracks time in confirmed state
 
     // Divergence tracking
     int divergentStreak_ = 0;
@@ -691,9 +1242,11 @@ public:
         confirmedCharacter_ = DeltaCharacter::UNKNOWN;
         candidateCharacter_ = DeltaCharacter::UNKNOWN;
         characterConfirmBars_ = 0;
+        barsInConfirmedCharacter_ = 0;
         confirmedAlignment_ = DeltaAlignment::UNKNOWN;
         candidateAlignment_ = DeltaAlignment::UNKNOWN;
         alignmentConfirmBars_ = 0;
+        barsInConfirmedAlignment_ = 0;
         divergentStreak_ = 0;
         divergenceAccum_ = 0.0;
         sessionBars_ = 0;
@@ -812,6 +1365,35 @@ public:
         }
 
         // =====================================================================
+        // EXTREME DELTA CLASSIFICATION (SSOT - Dec 2024)
+        // =====================================================================
+        // Per contracts.md: persistence-validated extreme delta detection
+        // Requires BOTH bar-level extremity AND session-level persistence
+        // to eliminate false positives from single-bar delta spikes.
+        {
+            // deltaConsistency = 0.5 + 0.5 * barDeltaPct maps [-1,+1] to [0,1]
+            // where 0.5 = neutral, >0.7 = 70%+ buying, <0.3 = 70%+ selling
+            const double deltaConsistency = 0.5 + 0.5 * result.barDeltaPct;
+
+            // Bar-level extreme: > 70% one-sided (either direction)
+            result.isExtremeDeltaBar = result.barBaselineReady &&
+                (deltaConsistency > 0.7 || deltaConsistency < 0.3);
+
+            // Session-level extreme: top 15% magnitude (>= 85th percentile)
+            result.isExtremeDeltaSession = result.sessionBaselineReady &&
+                (result.sessionDeltaPctile >= 85.0);
+
+            // Combined: both must be true for persistence-validated extreme
+            result.isExtremeDelta = result.isExtremeDeltaBar && result.isExtremeDeltaSession;
+
+            // Directional coherence: session delta sign matches bar delta direction
+            // Bar is bullish if deltaConsistency > 0.5, session positive if cumDelta > 0
+            const bool barBullish = (deltaConsistency > 0.5);
+            const bool sessionPositive = (result.sessionDeltaPct > 0.0);
+            result.directionalCoherence = (barBullish == sessionPositive);
+        }
+
+        // =====================================================================
         // UPDATE HISTORY
         // =====================================================================
 
@@ -831,7 +1413,7 @@ public:
         DeltaCharacter rawCharacter = ClassifyCharacter(result);
         result.rawCharacter = rawCharacter;
 
-        // Apply hysteresis
+        // Apply hysteresis with asymmetric confirmation (Jan 2025)
         if (rawCharacter != candidateCharacter_) {
             candidateCharacter_ = rawCharacter;
             characterConfirmBars_ = 1;
@@ -839,15 +1421,23 @@ public:
             characterConfirmBars_++;
         }
 
-        if (characterConfirmBars_ >= config.characterConfirmBars) {
+        // Asymmetric lookup: danger signals enter fast, calm signals exit slow
+        const int requiredCharBars = GetCharacterConfirmationBars(
+            confirmedCharacter_, candidateCharacter_);
+        result.characterConfirmationRequired = requiredCharBars;
+
+        if (characterConfirmBars_ >= requiredCharBars) {
             if (confirmedCharacter_ != candidateCharacter_) {
                 result.characterChanged = true;
+                barsInConfirmedCharacter_ = 0;  // Reset on transition
             }
             confirmedCharacter_ = candidateCharacter_;
         }
+        barsInConfirmedCharacter_++;
 
         result.character = confirmedCharacter_;
         result.barsInCharacter = characterConfirmBars_;
+        result.barsInConfirmedCharacter = barsInConfirmedCharacter_;
         result.sustainedBars = history_.GetBarsInDirection();
         result.barsSinceReversal = history_.GetBarsSinceReversal(currentBar);
         result.lastReversalBar = history_.lastReversalBar;
@@ -865,7 +1455,7 @@ public:
         DeltaAlignment rawAlignment = ClassifyAlignment(result);
         DeltaAlignment prevAlignment = confirmedAlignment_;
 
-        // Apply hysteresis
+        // Apply hysteresis with asymmetric confirmation (Jan 2025)
         if (rawAlignment != candidateAlignment_) {
             candidateAlignment_ = rawAlignment;
             alignmentConfirmBars_ = 1;
@@ -873,15 +1463,23 @@ public:
             alignmentConfirmBars_++;
         }
 
-        if (alignmentConfirmBars_ >= config.alignmentConfirmBars) {
+        // Asymmetric lookup: divergence enters fast, convergence exits slow
+        const int requiredAlignBars = GetAlignmentConfirmationBars(
+            confirmedAlignment_, candidateAlignment_);
+        result.alignmentConfirmationRequired = requiredAlignBars;
+
+        if (alignmentConfirmBars_ >= requiredAlignBars) {
             if (confirmedAlignment_ != candidateAlignment_) {
                 result.alignmentChanged = true;
+                barsInConfirmedAlignment_ = 0;  // Reset on transition
             }
             confirmedAlignment_ = candidateAlignment_;
         }
+        barsInConfirmedAlignment_++;
 
         result.alignment = confirmedAlignment_;
         result.barsInAlignment = alignmentConfirmBars_;
+        result.barsInConfirmedAlignment = barsInConfirmedAlignment_;
 
         // Track divergence
         if (result.IsDiverging()) {
@@ -931,6 +1529,486 @@ public:
         ApplyConstraints(result);
 
         return result;
+    }
+
+    // =========================================================================
+    // LOCATION-AWARE COMPUTE (AMT Value-Relative)
+    // =========================================================================
+
+    DeltaResult Compute(
+        double barDelta,
+        double barVolume,
+        double priceChangeTicks,
+        double sessionCumDelta,
+        double sessionVolume,
+        int currentBar,
+        const DeltaLocationContext& locationCtx)
+    {
+        // Compute base delta result
+        DeltaResult result = Compute(
+            barDelta, barVolume, priceChangeTicks,
+            sessionCumDelta, sessionVolume, currentBar);
+
+        if (!result.IsReady()) {
+            return result;  // Can't add location analysis if base computation failed
+        }
+
+        // Attach location context
+        result.location = locationCtx;
+
+        // Apply location-sensitive adjustments and compute outcome likelihoods
+        if (locationCtx.isValid) {
+            ApplyLocationAdjustments(result);
+            ComputeOutcomeLikelihoods(result);
+        }
+
+        return result;
+    }
+
+    // =========================================================================
+    // FULL CONTEXT-AWARE COMPUTE (Location + Context Gates)
+    // =========================================================================
+    // This is the recommended entry point when all context is available.
+    // Accepts location context + liquidity/volatility/dalton context.
+
+    DeltaResult Compute(
+        double barDelta,
+        double barVolume,
+        double priceChangeTicks,
+        double sessionCumDelta,
+        double sessionVolume,
+        int currentBar,
+        const DeltaLocationContext& locationCtx,
+        LiquidityState liqState,
+        VolatilityRegime volRegime,
+        double stressRank = 0.0,
+        AMTMarketState daltonState = AMTMarketState::UNKNOWN,
+        bool is1TF = false)
+    {
+        // Compute base delta result with location
+        DeltaResult result = Compute(
+            barDelta, barVolume, priceChangeTicks,
+            sessionCumDelta, sessionVolume, currentBar, locationCtx);
+
+        // Apply context gates (even if base computation had issues, for diagnostics)
+        result.contextGate = ApplyContextGates(liqState, volRegime, stressRank, daltonState, is1TF);
+
+        // Check for blocking conditions
+        if (result.contextGate.blockReason != DeltaErrorReason::NONE) {
+            result.errorReason = result.contextGate.blockReason;
+        }
+
+        // Re-apply constraints with context awareness (overrides base constraints)
+        if (result.barBaselineReady) {
+            ApplyConstraintsWithContext(result);
+        }
+
+        // Adjust confidence based on context degradation
+        if (result.contextGate.IsDegraded() && result.confidence > DeltaConfidence::DEGRADED) {
+            result.confidence = DeltaConfidence::DEGRADED;
+        }
+
+        return result;
+    }
+
+    // Convenience overload without Dalton context
+    DeltaResult Compute(
+        double barDelta,
+        double barVolume,
+        double priceChangeTicks,
+        double sessionCumDelta,
+        double sessionVolume,
+        int currentBar,
+        const DeltaLocationContext& locationCtx,
+        LiquidityState liqState,
+        VolatilityRegime volRegime,
+        double stressRank)
+    {
+        return Compute(barDelta, barVolume, priceChangeTicks,
+                       sessionCumDelta, sessionVolume, currentBar, locationCtx,
+                       liqState, volRegime, stressRank,
+                       AMTMarketState::UNKNOWN, false);
+    }
+
+    // =========================================================================
+    // DELTA INPUT COMPUTE (Jan 2025 - Extended Metrics)
+    // =========================================================================
+    // Uses DeltaInput struct for clean input handling and extended metrics.
+    // When hasExtendedInputs=true, applies thin tape classification and
+    // range-adaptive thresholds.
+
+    DeltaResult Compute(const DeltaInput& input) {
+        // Compute base result
+        DeltaResult result = Compute(
+            input.barDelta, input.barVolume, input.priceChangeTicks,
+            input.sessionCumDelta, input.sessionVolume, input.currentBar);
+
+        if (!result.IsReady()) {
+            return result;
+        }
+
+        // Track extended inputs status
+        result.hasExtendedInputs = input.hasExtendedInputs;
+
+        // Process extended metrics if available
+        if (input.hasExtendedInputs) {
+            ProcessExtendedMetrics(result, input);
+        }
+
+        return result;
+    }
+
+    DeltaResult Compute(const DeltaInput& input, const DeltaLocationContext& locationCtx) {
+        // Compute base with location
+        DeltaResult result = Compute(
+            input.barDelta, input.barVolume, input.priceChangeTicks,
+            input.sessionCumDelta, input.sessionVolume, input.currentBar,
+            locationCtx);
+
+        if (!result.IsReady()) {
+            return result;
+        }
+
+        result.hasExtendedInputs = input.hasExtendedInputs;
+
+        if (input.hasExtendedInputs) {
+            ProcessExtendedMetrics(result, input);
+        }
+
+        return result;
+    }
+
+    DeltaResult Compute(
+        const DeltaInput& input,
+        const DeltaLocationContext& locationCtx,
+        LiquidityState liqState,
+        VolatilityRegime volRegime,
+        double stressRank = 0.0,
+        AMTMarketState daltonState = AMTMarketState::UNKNOWN,
+        bool is1TF = false)
+    {
+        // Compute full context result
+        DeltaResult result = Compute(
+            input.barDelta, input.barVolume, input.priceChangeTicks,
+            input.sessionCumDelta, input.sessionVolume, input.currentBar,
+            locationCtx, liqState, volRegime, stressRank, daltonState, is1TF);
+
+        result.hasExtendedInputs = input.hasExtendedInputs;
+
+        // Process extended metrics (even if base had context blocks, for diagnostics)
+        if (input.hasExtendedInputs) {
+            ProcessExtendedMetrics(result, input);
+        }
+
+        return result;
+    }
+
+private:
+    // =========================================================================
+    // LOCATION-SENSITIVE ADJUSTMENTS
+    // Delta interpretation varies by location relative to value
+    // =========================================================================
+
+    void ApplyLocationAdjustments(DeltaResult& result) {
+        const auto& loc = result.location;
+
+        // Location-based confidence adjustment
+        // At edges: Delta divergence is more significant (potential absorption)
+        // Outside value: Sustained delta is more significant (acceptance/rejection)
+        // In value: Delta signals are less decisive (rotation expected)
+
+        if (loc.zone == ValueZoneSimple::AT_VALUE_EDGE) {
+            // At VAH/VAL: Divergence signals absorption, may indicate reversal
+            if (result.IsDiverging()) {
+                // Boost divergence significance at edges
+                result.divergenceStrength *= 1.3;
+                result.absorptionScore *= 1.3;
+                // Cap at 1.0
+                result.divergenceStrength = (std::min)(result.divergenceStrength, 1.0);
+                result.absorptionScore = (std::min)(result.absorptionScore, 1.0);
+            }
+        }
+        else if (loc.zone == ValueZoneSimple::OUTSIDE_VALUE) {
+            // Outside value: Convergent delta supports acceptance
+            // Sustained + aligned = stronger acceptance signal
+            if (result.IsAligned() && result.IsSustained()) {
+                // Increase constraint permissions for continuation
+                result.constraints.allowContinuation = true;
+            }
+        }
+        else if (loc.zone == ValueZoneSimple::IN_DISCOVERY) {
+            // Discovery zone: High-conviction signals only
+            // Require stronger delta for action
+            if (!result.IsSustained() || !result.IsAligned()) {
+                // Reduce position size in discovery without clear conviction
+                result.constraints.positionSizeMultiplier *= 0.75;
+            }
+        }
+        else if (loc.zone == ValueZoneSimple::IN_VALUE) {
+            // Inside value: Expect rotation, delta less decisive
+            // Breakout signals need extra confirmation
+            result.constraints.requireDeltaAlignment = true;
+        }
+    }
+
+    // =========================================================================
+    // AUCTION OUTCOME LIKELIHOODS
+    // These are state descriptors, NOT trade signals
+    // =========================================================================
+
+    void ComputeOutcomeLikelihoods(DeltaResult& result) {
+        const auto& loc = result.location;
+
+        // Reset likelihoods
+        double acceptance = 0.0;
+        double rejection = 0.0;
+        double rotation = 0.0;
+
+        // Base case: In value area, rotation is default
+        if (loc.zone == ValueZoneSimple::IN_VALUE) {
+            rotation = 0.6;
+            acceptance = 0.2;
+            rejection = 0.2;
+        }
+        else if (loc.zone == ValueZoneSimple::AT_VALUE_EDGE) {
+            // At edge: Outcome depends on delta character and alignment
+
+            if (result.IsDiverging()) {
+                // Delta opposes price -> Absorption -> Rejection likely
+                rejection = 0.4 + (result.divergenceStrength * 0.3);
+                rotation = 0.3;
+                acceptance = 0.3 - (result.divergenceStrength * 0.2);
+            }
+            else if (result.IsAligned()) {
+                // Delta supports price -> Breakout attempt
+                if (result.IsSustained()) {
+                    acceptance = 0.5 + (result.sustainedBars * 0.05);
+                    rejection = 0.2;
+                } else {
+                    // Aligned but not sustained -> testing
+                    acceptance = 0.35;
+                    rejection = 0.35;
+                }
+                rotation = 0.3;
+            }
+            else {
+                // Neutral delta at edge -> rotation or test
+                rotation = 0.5;
+                acceptance = 0.25;
+                rejection = 0.25;
+            }
+        }
+        else if (loc.zone == ValueZoneSimple::OUTSIDE_VALUE) {
+            // Outside value: Acceptance vs rejection decision point
+
+            if (result.IsAligned() && result.IsSustained()) {
+                // Strong convergent sustained delta outside value = acceptance
+                acceptance = 0.55 + (result.sustainedBars * 0.05);
+                rejection = 0.20;
+                rotation = 0.25 - (result.sustainedBars * 0.03);
+            }
+            else if (result.IsDiverging()) {
+                // Divergent delta outside value = rejection warning
+                rejection = 0.50 + (result.divergenceStrength * 0.25);
+                acceptance = 0.20;
+                rotation = 0.30 - (result.divergenceStrength * 0.15);
+            }
+            else {
+                // Ambiguous - could go either way
+                acceptance = 0.35;
+                rejection = 0.35;
+                rotation = 0.30;
+            }
+        }
+        else if (loc.zone == ValueZoneSimple::IN_DISCOVERY) {
+            // Discovery zone: Far outside value
+
+            if (result.IsAligned() && result.IsSustained() && !result.IsFading()) {
+                // Strong directional conviction in discovery = new value forming
+                acceptance = 0.65 + (result.sustainedBars * 0.03);
+                rejection = 0.15;
+                rotation = 0.20 - (result.sustainedBars * 0.02);
+            }
+            else if (result.IsFading() || result.IsDiverging()) {
+                // Fading or diverging in discovery = overextension
+                rejection = 0.55 + (result.divergenceStrength * 0.2);
+                acceptance = 0.20;
+                rotation = 0.25;
+            }
+            else {
+                // Discovery but unclear conviction
+                acceptance = 0.40;
+                rejection = 0.30;
+                rotation = 0.30;
+            }
+        }
+
+        // POC migration adjustment
+        if (loc.isMigratingTowardPrice) {
+            // POC following price = acceptance confirmation
+            acceptance += 0.10;
+            rejection -= 0.05;
+        } else if (loc.isMigratingAwayFromPrice) {
+            // POC retreating = rejection confirmation
+            rejection += 0.10;
+            acceptance -= 0.05;
+        }
+
+        // Session extreme adjustment
+        if (loc.isAboveSessionHigh || loc.isBelowSessionLow) {
+            // At session extreme with delta support = higher acceptance odds
+            if (result.IsAligned()) {
+                acceptance += 0.08;
+            } else {
+                rejection += 0.08;  // Overextended without support
+            }
+        }
+
+        // Normalize to sum to 1.0
+        const double total = acceptance + rejection + rotation;
+        if (total > 0.0) {
+            acceptance /= total;
+            rejection /= total;
+            rotation /= total;
+        }
+
+        // Clamp values
+        result.acceptanceLikelihood = (std::min)((std::max)(acceptance, 0.0), 1.0);
+        result.rejectionLikelihood = (std::min)((std::max)(rejection, 0.0), 1.0);
+        result.rotationLikelihood = (std::min)((std::max)(rotation, 0.0), 1.0);
+
+        // Determine likely outcome
+        if (result.acceptanceLikelihood >= result.rejectionLikelihood &&
+            result.acceptanceLikelihood >= result.rotationLikelihood) {
+            result.likelyOutcome = DeltaAuctionPrediction::ACCEPTANCE_LIKELY;
+        }
+        else if (result.rejectionLikelihood >= result.acceptanceLikelihood &&
+                 result.rejectionLikelihood >= result.rotationLikelihood) {
+            result.likelyOutcome = DeltaAuctionPrediction::REJECTION_LIKELY;
+        }
+        else {
+            result.likelyOutcome = DeltaAuctionPrediction::ROTATION_LIKELY;
+        }
+    }
+
+    // =========================================================================
+    // CONTEXT GATE APPLICATION
+    // =========================================================================
+
+    DeltaContextGateResult ApplyContextGates(
+        LiquidityState liqState,
+        VolatilityRegime volRegime,
+        double stressRank,
+        AMTMarketState daltonState,
+        bool is1TF
+    ) const {
+        DeltaContextGateResult gate;
+        gate.liqState = liqState;
+        gate.volRegime = volRegime;
+        gate.stressRank = stressRank;
+        gate.daltonState = daltonState;
+        gate.is1TF = is1TF;
+        gate.hasDaltonContext = (daltonState != AMTMarketState::UNKNOWN);
+
+        // Track if we have valid context
+        bool hasLiqContext = (liqState != LiquidityState::LIQ_NOT_READY);
+        bool hasVolContext = (volRegime != VolatilityRegime::UNKNOWN);
+        gate.contextValid = hasLiqContext || hasVolContext;
+
+        // Liquidity gate
+        if (config.requireLiquidityGate && hasLiqContext) {
+            if (liqState == LiquidityState::LIQ_VOID && config.blockOnVoid) {
+                gate.liquidityOK = false;
+                gate.blockReason = DeltaErrorReason::BLOCKED_LIQUIDITY_VOID;
+            } else if (liqState == LiquidityState::LIQ_THIN && config.blockOnThin) {
+                gate.liquidityOK = false;
+                gate.blockReason = DeltaErrorReason::BLOCKED_LIQUIDITY_THIN;
+            } else {
+                gate.liquidityOK = true;
+            }
+
+            // High stress degradation (not block)
+            if (stressRank >= config.highStressThreshold) {
+                gate.highStress = true;
+            }
+        } else {
+            gate.liquidityOK = true;  // Pass if not required or not available
+        }
+
+        // Volatility gate
+        if (config.requireVolatilityGate && hasVolContext) {
+            if (volRegime == VolatilityRegime::EVENT && config.blockOnEvent) {
+                gate.volatilityOK = false;
+                if (gate.blockReason == DeltaErrorReason::NONE) {
+                    gate.blockReason = DeltaErrorReason::BLOCKED_VOLATILITY_EVENT;
+                }
+            } else {
+                gate.volatilityOK = true;
+            }
+
+            // Compression degradation (not block)
+            if (volRegime == VolatilityRegime::COMPRESSION && config.degradeOnCompression) {
+                gate.compressionDegraded = true;
+            }
+        } else {
+            gate.volatilityOK = true;  // Pass if not required or not available
+        }
+
+        gate.allGatesPass = gate.liquidityOK && gate.volatilityOK;
+        return gate;
+    }
+
+    // =========================================================================
+    // CONTEXT-AWARE CONSTRAINTS
+    // =========================================================================
+
+    void ApplyConstraintsWithContext(DeltaResult& result) const {
+        // Apply base constraints first
+        ApplyConstraints(result);
+
+        auto& c = result.constraints;
+        const auto& gate = result.contextGate;
+
+        // Context gate modifications
+        if (!gate.allGatesPass) {
+            // Full block - zero out all trading permissions
+            c.allowContinuation = false;
+            c.allowBreakout = false;
+            c.positionSizeMultiplier = 0.0;
+            c.confidenceWeight = 0.0;
+            return;
+        }
+
+        // Compression regime: distrust breakouts, prefer fade
+        if (gate.compressionDegraded) {
+            c.allowBreakout = false;
+            c.allowFade = true;
+            c.positionSizeMultiplier *= 0.75;
+            c.confidenceWeight *= 0.75;
+        }
+
+        // High stress: tighten requirements
+        if (gate.highStress) {
+            c.requireDeltaAlignment = true;
+            c.requireSustained = true;
+            c.positionSizeMultiplier *= 0.75;
+        }
+
+        // Optional: Dalton context awareness
+        if (gate.hasDaltonContext && config.useDaltonContext) {
+            if (gate.daltonState == AMTMarketState::BALANCE) {
+                // Balance (2TF): Expect rotation, tighten continuation requirements
+                c.requireDeltaAlignment = true;
+                c.allowFade = true;
+            } else if (gate.daltonState == AMTMarketState::IMBALANCE && gate.is1TF) {
+                // Strong trend: relax requirements for continuation
+                c.requireSustained = false;
+                // Boost for aligned signals in trend
+                if (result.IsAligned()) {
+                    c.positionSizeMultiplier = (std::min)(1.0, c.positionSizeMultiplier * 1.15);
+                }
+            }
+        }
     }
 
 private:
@@ -1005,6 +2083,211 @@ private:
         }
 
         return DeltaAlignment::NEUTRAL;
+    }
+
+    // =========================================================================
+    // ASYMMETRIC HYSTERESIS LOOKUP (Jan 2025)
+    // =========================================================================
+    // Returns the number of confirmation bars required for a given transition.
+    // Danger signals (REVERSAL, BUILDING, DIVERGENT) enter fast (1 bar).
+    // Calm signals (exiting SUSTAINED, exiting CONVERGENT) exit slow (3 bars).
+
+    int GetCharacterConfirmationBars(DeltaCharacter from, DeltaCharacter to) const {
+        // Fast entry for danger signals
+        if (to == DeltaCharacter::REVERSAL) {
+            return config.reversalEntryBars;  // Default: 1
+        }
+        if (to == DeltaCharacter::BUILDING) {
+            return config.buildingEntryBars;  // Default: 1
+        }
+
+        // Slow exit from stable states
+        if (from == DeltaCharacter::SUSTAINED &&
+            to != DeltaCharacter::SUSTAINED &&
+            to != DeltaCharacter::BUILDING) {
+            // Exiting sustained to neutral/episodic/fading requires more confirmation
+            return config.sustainedExitBars;  // Default: 3
+        }
+
+        // Default transition confirmation
+        return config.otherCharacterTransitionBars;  // Default: 2
+    }
+
+    int GetAlignmentConfirmationBars(DeltaAlignment from, DeltaAlignment to) const {
+        // Fast entry for danger signals (divergence/absorption)
+        if (to == DeltaAlignment::DIVERGENT ||
+            to == DeltaAlignment::ABSORPTION_BID ||
+            to == DeltaAlignment::ABSORPTION_ASK) {
+            return config.divergenceEntryBars;  // Default: 1
+        }
+
+        // Slow exit from stable convergent state
+        if (from == DeltaAlignment::CONVERGENT &&
+            to != DeltaAlignment::CONVERGENT) {
+            // Exiting convergent requires more confirmation
+            return config.convergenceExitBars;  // Default: 3
+        }
+
+        // Default transition confirmation
+        return config.otherAlignmentTransitionBars;  // Default: 2
+    }
+
+    // =========================================================================
+    // THIN TAPE CLASSIFICATION (Jan 2025)
+    // =========================================================================
+    // Distinguishes different types of low activity:
+    //   TRUE_THIN: Low vol + low trades (no participation)
+    //   HFT_FRAGMENTED: Low vol + high trades (HFT noise)
+    //   INSTITUTIONAL: High vol + low trades (block trades)
+
+    ThinTapeType ClassifyThinTapeType(double volumePctile, double tradesPctile) const {
+        const bool lowVolume = volumePctile < config.lowVolumePctile;      // Default: P10
+        const bool highVolume = volumePctile > config.highVolumePctile;    // Default: P75
+        const bool lowTrades = tradesPctile < config.lowTradesPctile;      // Default: P25
+        const bool highTrades = tradesPctile > config.highTradesPctile;    // Default: P75
+
+        // TRUE_THIN: Low volume + low trades = genuine low participation
+        if (lowVolume && lowTrades) {
+            return ThinTapeType::TRUE_THIN;
+        }
+
+        // HFT_FRAGMENTED: Low volume + high trades = many small orders (HFT noise)
+        if (lowVolume && highTrades) {
+            return ThinTapeType::HFT_FRAGMENTED;
+        }
+
+        // INSTITUTIONAL: High volume + low trades = large block orders
+        if (highVolume && lowTrades) {
+            return ThinTapeType::INSTITUTIONAL;
+        }
+
+        return ThinTapeType::NONE;
+    }
+
+    // Get confidence impact from thin tape classification
+    int GetThinTapeConfidenceImpact(ThinTapeType type) const {
+        switch (type) {
+            case ThinTapeType::TRUE_THIN:
+                return -config.thinTapeConfidencePenalty;      // Default: -3
+            case ThinTapeType::HFT_FRAGMENTED:
+                return -config.hftFragmentedConfidencePenalty; // Default: -1
+            case ThinTapeType::INSTITUTIONAL:
+                return config.institutionalConfidenceBoost;    // Default: +1
+            default:
+                return 0;
+        }
+    }
+
+    // =========================================================================
+    // RANGE-ADAPTIVE THRESHOLDS (Jan 2025)
+    // =========================================================================
+    // In compression, smaller delta is meaningful (lower noise floor).
+    // In expansion, require larger delta (higher noise floor).
+
+    void ApplyRangeAdaptiveThresholds(double rangePctile, DeltaResult& result) const {
+        if (!config.useRangeAdaptiveThresholds || !result.rangeBaselineReady) {
+            // Use default thresholds
+            result.effectiveNoiseFloor = config.noiseFloorPctile;
+            result.effectiveStrongSignal = config.strongSignalPctile;
+            result.rangeAdaptiveApplied = false;
+            return;
+        }
+
+        double multiplier = 1.0;
+
+        if (rangePctile < config.compressionRangePctile) {
+            // Compression: smaller delta is meaningful
+            multiplier = config.compressionNoiseMultiplier;  // Default: 0.7
+        } else if (rangePctile > config.expansionRangePctile) {
+            // Expansion: require larger delta
+            multiplier = config.expansionNoiseMultiplier;    // Default: 1.3
+        }
+
+        result.effectiveNoiseFloor = config.noiseFloorPctile * multiplier;
+        result.effectiveStrongSignal = config.strongSignalPctile * multiplier;
+        result.rangeAdaptiveApplied = (multiplier != 1.0);
+    }
+
+    // =========================================================================
+    // EXTENDED METRICS PROCESSING (Jan 2025)
+    // =========================================================================
+    // Called from DeltaInput-based Compute() overloads to process trades_sec,
+    // bar_range, and avg_trade_size baselines.
+
+    void ProcessExtendedMetrics(DeltaResult& result, const DeltaInput& input) {
+        if (!effortStore_) return;
+
+        // Get phase bucket for lookups
+        const auto& bucket = effortStore_->Get(currentPhase_);
+
+        // -----------------------------------------------------------------
+        // A. Trades per second (thin tape classification)
+        // -----------------------------------------------------------------
+        if (bucket.trades_sec.size() >= 10 && input.tradesPerSec > 0.0) {
+            result.tradesPctile = bucket.trades_sec.percentile(input.tradesPerSec);
+            result.tradesBaselineReady = true;
+
+            // Classify thin tape type using volume + trades percentiles
+            result.thinTapeType = ClassifyThinTapeType(
+                result.volumePctile, result.tradesPctile);
+
+            // Adjust thin tape flag based on new classification
+            if (result.thinTapeType == ThinTapeType::TRUE_THIN) {
+                result.isThinTape = true;  // Confirm thin tape
+            } else if (result.thinTapeType == ThinTapeType::INSTITUTIONAL) {
+                result.isThinTape = false;  // Override - institutional is good
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // B. Bar range (volatility-adaptive thresholds)
+        // -----------------------------------------------------------------
+        if (bucket.bar_range.size() >= 10 && input.barRangeTicks > 0.0) {
+            result.rangePctile = bucket.bar_range.percentile(input.barRangeTicks);
+            result.rangeBaselineReady = true;
+
+            // Apply range-adaptive noise floor
+            ApplyRangeAdaptiveThresholds(result.rangePctile, result);
+        }
+
+        // -----------------------------------------------------------------
+        // C. Average trade size (institutional detection)
+        // -----------------------------------------------------------------
+        if (bucket.avg_trade_size.size() >= 10 && input.GetAvgTradeSize() > 0.0) {
+            result.avgTradeSizePctile = bucket.avg_trade_size.percentile(input.GetAvgTradeSize());
+            result.avgTradeBaselineReady = true;
+
+            // Classify activity type
+            result.isInstitutionalActivity =
+                (result.avgTradeSizePctile >= config.institutionalAvgTradePctile);
+            result.isRetailActivity =
+                (result.avgTradeSizePctile <= config.retailAvgTradePctile);
+        }
+
+        // -----------------------------------------------------------------
+        // D. Confidence adjustment from extended metrics
+        // -----------------------------------------------------------------
+        if (result.tradesBaselineReady) {
+            // Apply thin tape impact to confidence
+            int impact = GetThinTapeConfidenceImpact(result.thinTapeType);
+            if (impact != 0) {
+                // Negative impact -> degrade confidence
+                // Positive impact -> preserve/upgrade confidence (no upgrade beyond FULL)
+                if (impact < 0 && result.confidence == DeltaConfidence::FULL) {
+                    if (impact <= -2) {
+                        result.confidence = DeltaConfidence::DEGRADED;
+                    } else {
+                        result.confidence = DeltaConfidence::LOW;
+                    }
+                } else if (impact < 0 && result.confidence == DeltaConfidence::LOW) {
+                    if (impact <= -2) {
+                        result.confidence = DeltaConfidence::BLOCKED;
+                    } else {
+                        result.confidence = DeltaConfidence::DEGRADED;
+                    }
+                }
+            }
+        }
     }
 
     // =========================================================================

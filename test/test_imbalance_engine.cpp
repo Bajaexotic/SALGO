@@ -954,18 +954,19 @@ void TestFullReset() {
     ImbalanceEngine engine = CreatePopulatedEngine();
     engine.SetPhase(SessionPhase::MID_SESSION);
 
-    // Verify baselines exist
-    TEST_ASSERT(engine.diagonalNetBaseline.size() > 0, "Should have diagonal baseline");
-    TEST_ASSERT(engine.pocShiftBaseline.size() > 0, "Should have POC baseline");
+    // Verify baselines exist (check MID_SESSION bucket since that's the phase we're using)
+    const int phaseIdx = SessionPhaseToBucketIndex(SessionPhase::MID_SESSION);
+    TEST_ASSERT(engine.diagonalNetBaseline[phaseIdx].size() > 0, "Should have diagonal baseline");
+    TEST_ASSERT(engine.pocShiftBaseline[phaseIdx].size() > 0, "Should have POC baseline");
 
     // Full reset
     engine.Reset();
 
-    // Verify everything cleared including baselines
+    // Verify everything cleared including baselines (all phase buckets should be cleared)
     TEST_ASSERT(engine.sessionBars == 0, "Session bars should reset");
-    TEST_ASSERT(engine.diagonalNetBaseline.size() == 0, "Diagonal baseline should be cleared");
-    TEST_ASSERT(engine.pocShiftBaseline.size() == 0, "POC baseline should be cleared");
-    TEST_ASSERT(engine.absorptionBaseline.size() == 0, "Absorption baseline should be cleared");
+    TEST_ASSERT(engine.diagonalNetBaseline[phaseIdx].size() == 0, "Diagonal baseline should be cleared");
+    TEST_ASSERT(engine.pocShiftBaseline[phaseIdx].size() == 0, "POC baseline should be cleared");
+    TEST_ASSERT(engine.absorptionBaseline[phaseIdx].size() == 0, "Absorption baseline should be cleared");
 
     std::cout << "[OK] Full reset clears all state including baselines\n";
 }

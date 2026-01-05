@@ -733,9 +733,9 @@ inline const char* to_string(ImbalanceDeltaPattern p)
     switch (p)
     {
     case ImbalanceDeltaPattern::STRONG_CONVERGENCE: return "STRONG_CONV";
-    case ImbalanceDeltaPattern::WEAK_PULLBACK:      return "WEAK_PULLBACK";
+    case ImbalanceDeltaPattern::WEAK_PULLBACK:      return "WEAK_PB";
     case ImbalanceDeltaPattern::EFFORT_NO_RESULT:   return "EFFORT_NO_RES";
-    case ImbalanceDeltaPattern::CLIMAX_EXHAUSTION:  return "CLIMAX_EXHAUST";
+    case ImbalanceDeltaPattern::CLIMAX_EXHAUSTION:  return "CLIMAX_EXH";
     }
     return "UNK";
 }

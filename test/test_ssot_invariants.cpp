@@ -741,6 +741,106 @@ void test_re_consolidation_bars_count() {
 }
 
 // ============================================================================
+// ACTIVITY CLASSIFICATION SSOT (Jan 2025)
+// ============================================================================
+
+/**
+ * Test 13: Activity Classification SSOT Unification
+ *
+ * Initiative vs Responsive classification is LOCATION-GATED per Dalton:
+ *   - INITIATIVE: Away from value + Aggressive participation (OTF conviction)
+ *   - RESPONSIVE: Toward value OR Absorptive (reversion, defensive)
+ *   - NEUTRAL: At value with balanced participation
+ *
+ * SSOT is AMTActivityType from AMT_Signals.h, mapped to AggressionType.
+ * ContextBuilder MUST consume this SSOT - NOT compute its own delta-only version.
+ *
+ * Previous bug: ContextBuilder computed delta-only classification:
+ *   aggression = (isExtremeDelta && directionalCoherence) ? INITIATIVE : RESPONSIVE
+ * This ignored the LOCATION of price relative to value area.
+ *
+ * Fix: ContextBuilder now consumes ssotAggression from input.
+ */
+void test_activity_classification_ssot() {
+    std::cout << "\n--- Test: Activity Classification SSOT Unification ---\n";
+
+    // Test the mapping function correctness
+    // AMTActivityType -> AggressionType mapping (from amt_core.h)
+
+    // INITIATIVE maps to INITIATIVE
+    CHECK(AMT::MapAMTActivityToLegacy(AMT::AMTActivityType::INITIATIVE) == AMT::AggressionType::INITIATIVE,
+          "AMTActivityType::INITIATIVE -> AggressionType::INITIATIVE");
+
+    // RESPONSIVE maps to RESPONSIVE
+    CHECK(AMT::MapAMTActivityToLegacy(AMT::AMTActivityType::RESPONSIVE) == AMT::AggressionType::RESPONSIVE,
+          "AMTActivityType::RESPONSIVE -> AggressionType::RESPONSIVE");
+
+    // NEUTRAL maps to NEUTRAL
+    CHECK(AMT::MapAMTActivityToLegacy(AMT::AMTActivityType::NEUTRAL) == AMT::AggressionType::NEUTRAL,
+          "AMTActivityType::NEUTRAL -> AggressionType::NEUTRAL");
+
+    // UNKNOWN maps to NEUTRAL (conservative default)
+    CHECK(AMT::MapAMTActivityToLegacy(AMT::AMTActivityType::UNKNOWN) == AMT::AggressionType::NEUTRAL,
+          "AMTActivityType::UNKNOWN -> AggressionType::NEUTRAL");
+
+    std::cout << "  INVARIANT: Activity classification is SSOT from AMT_Signals.h\n";
+    std::cout << "  INVARIANT: ContextBuilder consumes SSOT, does NOT compute delta-only\n";
+    std::cout << "  INVARIANT: Classification is LOCATION-GATED per Dalton's Market Profile\n";
+}
+
+/**
+ * Test 14: ArbitrationResult no longer contains activity classification
+ *
+ * The ArbitrationSeam's job is:
+ *   - Delta primitives (isExtremeDeltaBar, isExtremeDeltaSession, isExtremeDelta)
+ *   - Zone arbitration decisions (arbReason, useZones, engagedZoneId)
+ *   - Market state derivation (rawState)
+ *
+ * Activity classification (Initiative/Responsive) is NOT in scope.
+ * SSOT for that is AMT_Signals.h -> AMTActivityType.
+ */
+void test_arbitration_seam_scope() {
+    std::cout << "\n--- Test: ArbitrationSeam Scope (Delta Primitives Only) ---\n";
+
+    // Create valid input
+    ArbitrationInput in;
+    in.pocId = 1;
+    in.vahId = 2;
+    in.valId = 3;
+    in.pocValid = true;
+    in.vahValid = true;
+    in.valValid = true;
+    in.zonesInitialized = true;
+    in.vbpPoc = 5000.0;
+    in.vbpVah = 5010.0;
+    in.vbpVal = 4990.0;
+    in.barsSinceLastCompute = 0;
+    in.deltaConsistency = 0.8;  // Extreme buying
+    in.deltaConsistencyValid = true;
+    in.sessionDeltaValid = true;
+    in.sessionDeltaPctile = 90.0;  // Extreme session
+
+    ArbitrationResult out = EvaluateArbitrationLadder(in);
+
+    // Verify delta primitives are computed
+    CHECK(out.isExtremeDeltaBar == true, "isExtremeDeltaBar computed");
+    CHECK(out.isExtremeDeltaSession == true, "isExtremeDeltaSession computed");
+    CHECK(out.isExtremeDelta == true, "isExtremeDelta (combined) computed");
+
+    // Verify zone arbitration is computed
+    CHECK(out.arbReason != 0, "arbReason computed");
+    CHECK(out.rawState == AMT::AMTMarketState::IMBALANCE, "rawState derived from extreme delta");
+
+    // NOTE: ArbitrationResult no longer has detectedAggression or directionalCoherence
+    // Those fields were removed as part of SSOT unification (Jan 2025)
+    // Activity classification is now SSOT from AMT_Signals.h
+
+    std::cout << "  INVARIANT: ArbitrationSeam provides delta PRIMITIVES only\n";
+    std::cout << "  INVARIANT: Activity classification removed from ArbitrationResult\n";
+    std::cout << "  INVARIANT: SSOT for activity is AMT_Signals.h\n";
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
@@ -767,6 +867,10 @@ int main() {
     std::cout << "\n--- Bug Fix Validation Tests ---\n";
     test_re_consolidation_bars_count();
 
+    std::cout << "\n--- Activity Classification SSOT Tests (Jan 2025) ---\n";
+    test_activity_classification_ssot();
+    test_arbitration_seam_scope();
+
     std::cout << "\n========================================\n";
     std::cout << "  Results: " << testsPassed << " passed, " << testsFailed << " failed\n";
     std::cout << "========================================\n";
@@ -785,6 +889,8 @@ int main() {
     std::cout << "  8. Family constraint is Stage B (post-computation)\n";
     std::cout << "  9. Shape semantics: per-bar vs session-level SSOT\n";
     std::cout << "  10. RE acceptance counts CLOSE-based bars (not just extension bars)\n";
+    std::cout << "  11. Activity classification SSOT (AMT_Signals.h, location-gated)\n";
+    std::cout << "  12. ArbitrationSeam provides delta PRIMITIVES only (not activity)\n";
 
     return testsFailed > 0 ? 1 : 0;
 }

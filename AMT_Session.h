@@ -275,6 +275,16 @@ private:
     int sessionStartBar_ = -1;
     double tickSizeCache_ = 0.0;
 
+    // --- Prior RTH Levels (Jan 2025) - For gap calculation at RTH open ---
+    // These are captured at RTH→GLOBEX transition and used at GLOBEX→RTH transition.
+    double priorRTHHigh_ = 0.0;
+    double priorRTHLow_ = 0.0;
+    double priorRTHClose_ = 0.0;
+    double priorRTHPOC_ = 0.0;
+    double priorRTHVAH_ = 0.0;
+    double priorRTHVAL_ = 0.0;
+    bool hasPriorRTH_ = false;
+
 public:
 
     // Update session identity (call every bar)
@@ -351,6 +361,33 @@ public:
     bool IsRTH() const { return currentSession.IsRTH(); }
     bool IsGlobex() const { return currentSession.IsGlobex(); }
 
+    // --- Prior RTH Level Accessors (Jan 2025) ---
+    double GetPriorRTHHigh() const { return priorRTHHigh_; }
+    double GetPriorRTHLow() const { return priorRTHLow_; }
+    double GetPriorRTHClose() const { return priorRTHClose_; }
+    double GetPriorRTHPOC() const { return priorRTHPOC_; }
+    double GetPriorRTHVAH() const { return priorRTHVAH_; }
+    double GetPriorRTHVAL() const { return priorRTHVAL_; }
+    bool HasPriorRTH() const { return hasPriorRTH_; }
+
+    /**
+     * Capture current RTH levels as prior RTH for next session.
+     * Call this at RTH→GLOBEX transition (RTH session ending).
+     *
+     * @param high  RTH session high (from StructureTracker)
+     * @param low   RTH session low (from StructureTracker)
+     * @param close Last RTH close price
+     */
+    void CapturePriorRTH(double high, double low, double close) {
+        priorRTHHigh_ = high;
+        priorRTHLow_ = low;
+        priorRTHClose_ = close;
+        priorRTHPOC_ = sessionPOC_;
+        priorRTHVAH_ = sessionVAH_;
+        priorRTHVAL_ = sessionVAL_;
+        hasPriorRTH_ = (high > 0.0 && low > 0.0);
+    }
+
     void reset()
     {
         ctx_rth.reset();
@@ -366,6 +403,11 @@ public:
         tickSizeCache_ = 0.0;
         // NOTE: sessionHigh/sessionLow removed - now in StructureTracker
         sessionStartBar_ = -1;  // SSOT: Will be set at session transition
+
+        // Prior RTH levels (Jan 2025)
+        priorRTHHigh_ = priorRTHLow_ = priorRTHClose_ = 0.0;
+        priorRTHPOC_ = priorRTHVAH_ = priorRTHVAL_ = 0.0;
+        hasPriorRTH_ = false;
     }
 
     // Reset levels only (for session transition without full reset)

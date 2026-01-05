@@ -37,6 +37,7 @@
 
 #include "amt_core.h"
 #include "AMT_Snapshots.h"
+#include "AMT_DomEvents.h"  // DOM time-series patterns (SSOT via composition)
 #include <algorithm>
 #include <cmath>
 #include <deque>
@@ -638,6 +639,38 @@ struct Liq3Result {
     bool HasSpatialWalls() const { return nearestBidWallTicks >= 0 || nearestAskWallTicks >= 0; }
     bool HasSpatialVoids() const { return nearestBidVoidTicks >= 0 || nearestAskVoidTicks >= 0; }
     bool IsSpatialBlocked() const { return hasSpatialProfile && spatialGating.AnyBlocked(); }
+
+    // ========================================================================
+    // DOM TIME-SERIES PATTERN DETECTION (SSOT via LiquidityEngine)
+    // ========================================================================
+    // Detected from DomHistoryBuffer time-series analysis.
+    // Patterns detected: DOMControlPattern (5 types) + DOMEvent (4 types)
+    // See AMT_DomEvents.h for pattern definitions and detection logic.
+    // ========================================================================
+    std::vector<DOMControlPattern> domControlPatterns;  // Active control patterns
+    std::vector<DOMEvent> domEvents;                     // Active events
+    int domPatternWindowMs = 0;                          // Detection window used
+    bool domPatternsEligible = false;                    // True if enough samples
+    const char* domPatternsIneligibleReason = nullptr;   // Why not eligible
+
+    // DOM pattern helpers
+    bool HasDomPatterns() const { return !domControlPatterns.empty() || !domEvents.empty(); }
+    bool HasDomControlPattern(DOMControlPattern p) const {
+        for (auto& cp : domControlPatterns) if (cp == p) return true;
+        return false;
+    }
+    bool HasDomEvent(DOMEvent e) const {
+        for (auto& de : domEvents) if (de == e) return true;
+        return false;
+    }
+    // Specific pattern queries
+    bool HasLiquidityPulling() const { return HasDomControlPattern(DOMControlPattern::LIQUIDITY_PULLING); }
+    bool HasLiquidityStacking() const { return HasDomControlPattern(DOMControlPattern::LIQUIDITY_STACKING); }
+    bool HasBuyersLifting() const { return HasDomControlPattern(DOMControlPattern::BUYERS_LIFTING_ASKS); }
+    bool HasSellersHitting() const { return HasDomControlPattern(DOMControlPattern::SELLERS_HITTING_BIDS); }
+    bool HasExhaustionDivergence() const { return HasDomControlPattern(DOMControlPattern::EXHAUSTION_DIVERGENCE); }
+    bool HasSweepLiquidation() const { return HasDomEvent(DOMEvent::SWEEP_LIQUIDATION); }
+    bool HasOrderFlowReversal() const { return HasDomEvent(DOMEvent::ORDER_FLOW_REVERSAL); }
 
     // Helper: Check if this is a warmup state (not a true error)
     bool IsWarmup() const {
@@ -2071,6 +2104,140 @@ public:
         snap.nearestBidVoidTicks = spatial.nearestBidVoidTicks;
         snap.nearestAskVoidTicks = spatial.nearestAskVoidTicks;
         snap.hasSpatialProfile = true;
+    }
+
+    // ========================================================================
+    // DOM TIME-SERIES PATTERN DETECTION (SSOT via Composition)
+    // ========================================================================
+    // LiquidityEngine OWNS the DOM history buffer and pattern detection.
+    // This consolidates all DOM microstructure analysis into one SSOT.
+    //
+    // Usage:
+    //   1. Call PushDomSample() each bar/tick with current DOM state
+    //   2. Call DetectDomPatterns() to run detection on buffer
+    //   3. Call CopyDomPatterns() to populate Liq3Result fields
+    //
+    // Patterns detected (from AMT_DomEvents.h):
+    //   DOMControlPattern: BUYERS_LIFTING_ASKS, SELLERS_HITTING_BIDS,
+    //                      LIQUIDITY_PULLING, LIQUIDITY_STACKING, EXHAUSTION_DIVERGENCE
+    //   DOMEvent: LIQUIDITY_DISAPPEARANCE, ORDER_FLOW_REVERSAL,
+    //             SWEEP_LIQUIDATION, LARGE_LOT_EXECUTION
+    // ========================================================================
+
+private:
+    DomHistoryBuffer domHistory_;        // SSOT for DOM time-series
+    DomEventLogState domLogState_;       // Throttled logging state
+
+public:
+    // ========================================================================
+    // Push DOM observation sample to history buffer
+    // ========================================================================
+    // Call each bar/tick with current DOM snapshot data.
+    // Populates DomObservationSample from primitives and pushes to buffer.
+    //
+    // Parameters:
+    //   timestampMs: Current time in milliseconds (epoch or session-relative)
+    //   barIndex: Current bar index
+    //   bestBidTick/bestAskTick: Best bid/ask in tick units
+    //   domBidSize/domAskSize: Total DOM depth on bid/ask side
+    //   bidStackPull/askStackPull: Stack/Pull values from SC API
+    //   haloDepthImbalance: Imbalance from ComputeDepthMass (-1 to +1)
+    //   askVolSec/bidVolSec/deltaSec/tradesSec: Effort metrics per second
+    // ========================================================================
+    void PushDomSample(
+        int64_t timestampMs,
+        int barIndex,
+        int bestBidTick,
+        int bestAskTick,
+        double domBidSize,
+        double domAskSize,
+        double bidStackPull,
+        double askStackPull,
+        double haloDepthImbalance,
+        bool haloDepthValid,
+        double askVolSec,
+        double bidVolSec,
+        double deltaSec,
+        double tradesSec)
+    {
+        DomObservationSample sample;
+        sample.timestampMs = timestampMs;
+        sample.barIndex = barIndex;
+        sample.bestBidTick = bestBidTick;
+        sample.bestAskTick = bestAskTick;
+        sample.domBidSize = domBidSize;
+        sample.domAskSize = domAskSize;
+        sample.bidStackPull = bidStackPull;
+        sample.askStackPull = askStackPull;
+        sample.haloDepthImbalance = haloDepthImbalance;
+        sample.haloDepthValid = haloDepthValid;
+        sample.askVolSec = askVolSec;
+        sample.bidVolSec = bidVolSec;
+        sample.deltaSec = deltaSec;
+        sample.tradesSec = tradesSec;
+
+        domHistory_.Push(sample);
+    }
+
+    // ========================================================================
+    // Detect DOM patterns from history buffer
+    // ========================================================================
+    // Runs pattern detection on the DOM history buffer.
+    // Returns DomDetectionResult with all detected patterns.
+    //
+    // Parameters:
+    //   windowMs: Detection window in milliseconds (default 5000)
+    // ========================================================================
+    DomDetectionResult DetectDomPatterns(int windowMs = DomEventConfig::DEFAULT_WINDOW_MS) const
+    {
+        return DetectDomEventsAndControl(domHistory_, windowMs);
+    }
+
+    // ========================================================================
+    // Copy DOM pattern results to Liq3Result
+    // ========================================================================
+    void CopyDomPatterns(Liq3Result& snap, const DomDetectionResult& detected) const
+    {
+        snap.domControlPatterns = detected.controlPatterns;
+        snap.domEvents = detected.events;
+        snap.domPatternWindowMs = detected.windowMs;
+        snap.domPatternsEligible = detected.wasEligible;
+        snap.domPatternsIneligibleReason = detected.ineligibleReason;
+    }
+
+    // ========================================================================
+    // Full DOM pattern detection + copy in one call
+    // ========================================================================
+    DomDetectionResult DetectAndCopyDomPatterns(
+        Liq3Result& snap,
+        int windowMs = DomEventConfig::DEFAULT_WINDOW_MS)
+    {
+        DomDetectionResult detected = DetectDomPatterns(windowMs);
+        CopyDomPatterns(snap, detected);
+        return detected;
+    }
+
+    // ========================================================================
+    // Check if DOM pattern detection should log (throttled)
+    // ========================================================================
+    bool ShouldLogDomPatterns(const DomDetectionResult& result, int currentBar)
+    {
+        return domLogState_.ShouldLog(result, currentBar);
+    }
+
+    // ========================================================================
+    // Get DOM history buffer status
+    // ========================================================================
+    size_t GetDomHistorySize() const { return domHistory_.Size(); }
+    bool HasDomHistoryMinSamples() const { return domHistory_.HasMinSamples(); }
+
+    // ========================================================================
+    // Reset DOM history (call at session boundary)
+    // ========================================================================
+    void ResetDomHistory()
+    {
+        domHistory_.Reset();
+        domLogState_.Reset();
     }
 };
 

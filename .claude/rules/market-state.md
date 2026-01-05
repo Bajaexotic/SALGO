@@ -111,3 +111,109 @@ Legacy `BuildPhaseSnapshot` overloads without daltonPhase have been REMOVED.
 **Logging format:** `PHASE: DALTON=%s CONF=%s` (was `RAW=`)
 
 **Common violation:** Calling `BuildPhaseSnapshot` without providing daltonPhase.
+
+---
+
+## Session Bridge (SSOT - DaltonEngine, Jan 2025)
+
+| SSOT Owner | Location |
+|------------|----------|
+| **`DaltonEngine.bridge_`** | `AMT_Dalton.h` (SessionBridge struct) |
+
+**DaltonEngine owns ALL session bridge information:**
+- **Overnight Session** - GLOBEX extremes (ON_HI, ON_LO, ON_POC), mini-IB, 1TF/2TF pattern
+- **Overnight Inventory** - Net position (NET_LONG/NET_SHORT/NEUTRAL), score [-1,+1]
+- **Gap Context** - Gap type (TRUE_GAP/VALUE_GAP/NO_GAP), size, fill status
+- **Opening Type** - Dalton's 4 types (Open-Drive, Open-Test-Drive, Open-Rejection-Reverse, Open-Auction)
+- **Prior RTH Context** - Prior session's High/Low/Close/POC/VAH/VAL (for gap calculation)
+
+### Data Flow
+
+```cpp
+// RTH → GLOBEX transition: Capture prior RTH
+st->sessionMgr.CapturePriorRTH(rthHigh, rthLow, rthClose);  // Staging
+st->daltonEngine.SetPriorRTHContext(...);                    // SSOT write
+
+// GLOBEX → RTH transition: Capture overnight, classify gap
+st->daltonEngine.CaptureOvernightSession(on);
+st->daltonEngine.ClassifyGap(rthOpenPrice, tickSize);
+
+// During RTH first 30 min: Classify opening type
+st->daltonEngine.UpdateOpeningClassification(...);
+
+// Read SSOT
+const SessionBridge& bridge = st->daltonEngine.GetSessionBridge();
+const OpeningType openType = st->lastDaltonState.openingType;
+```
+
+### SessionManager Role (Staging Only)
+
+`SessionManager.CapturePriorRTH()` stages prior RTH levels at transition time.
+These are immediately passed to `DaltonEngine.SetPriorRTHContext()` which becomes SSOT.
+**Always read from `DaltonEngine.GetSessionBridge()`, not SessionManager.**
+
+### Opening Type Classification Window
+
+Opening type is classified in first 30 minutes of RTH:
+- `OPEN_DRIVE_UP/DOWN` - Strong directional, no return to open
+- `OPEN_TEST_DRIVE_UP/DOWN` - Test one side, reverse, then drive
+- `OPEN_REJECTION_REVERSE_UP/DOWN` - Test extreme, reject, reverse
+- `OPEN_AUCTION` - Rotational, probing both sides
+
+**Common violation:** Reading prior RTH from SessionManager instead of DaltonEngine bridge.
+
+---
+
+## Activity Classification (SSOT - AMT_Signals.h, Jan 2025)
+
+| SSOT Owner | Location |
+|------------|----------|
+| **`AMTActivityType`** | `AMT_Signals.h` -> `StateEvidence.activity.activityType` |
+
+**Initiative vs Responsive is LOCATION-GATED per Dalton's Market Profile:**
+- **INITIATIVE** = Away from value + Aggressive participation (OTF conviction)
+- **RESPONSIVE** = Toward value OR Absorptive (reversion, defensive)
+- **NEUTRAL** = At value with balanced participation
+
+### Data Flow
+
+```cpp
+// STEP 1: AMTSignalEngine computes activity type (SSOT)
+// This is LOCATION-GATED: intent (toward/away from value) + participation
+evidence = st->amtSignalEngine.ProcessBar(...);
+// evidence.activity.activityType = location-gated classification
+
+// STEP 2: Map to legacy AggressionType for downstream consumers
+AggressionType aggression = MapAMTActivityToLegacy(
+    evidence.activity.activityType);
+ctxInput.ssotAggression = aggression;
+ctxInput.ssotAggressionValid = evidence.activity.valid;
+
+// STEP 3: ContextBuilder CONSUMES SSOT (does NOT compute its own)
+ctx.aggression = in.ssotAggression;
+ctx.aggressionValid = in.ssotAggressionValid;
+```
+
+### REMOVED: Delta-Only Classification (Jan 2025)
+
+| Removed | Replacement |
+|---------|-------------|
+| `ArbitrationResult.detectedAggression` | SSOT from `AMT_Signals.h` |
+| `ArbitrationResult.directionalCoherence` | Removed (only used for dead aggression code) |
+| ContextBuilder delta-only computation | Consumes SSOT from input |
+
+The delta-only classification (`isExtremeDelta && directionalCoherence`) was WRONG because
+it ignored WHERE price was relative to value area - only Dalton's location-gated definition
+correctly distinguishes Initiative from Responsive activity.
+
+### ArbitrationSeam Scope (Clarified)
+
+The ArbitrationSeam provides **delta primitives** for zone arbitration:
+- `isExtremeDeltaBar` - Per-bar extreme one-sided delta
+- `isExtremeDeltaSession` - Session extreme magnitude percentile
+- `isExtremeDelta` - Combined (bar && session)
+- `rawState` - Balance/Imbalance (from Dalton or legacy fallback)
+
+Activity classification (Initiative/Responsive) is **NOT** in scope for ArbitrationSeam.
+
+**Common violation:** Computing activity type from delta alone without considering price location.

@@ -288,7 +288,8 @@ TEST(ThinBar_NoExtreme) {
     ArbitrationResult out = EvaluateArbitrationLadder(in);
     assert(out.isExtremeDeltaBar == false);  // Cannot detect extreme from invalid data
     assert(out.isExtremeDelta == false);
-    assert(out.directionalCoherence == false);  // Cannot determine direction from invalid
+    // NOTE: directionalCoherence removed from ArbitrationResult (Jan 2025)
+    // Activity classification (Initiative/Responsive) is now SSOT from AMT_Signals.h
 }
 
 // ============================================================================

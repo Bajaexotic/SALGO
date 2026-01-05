@@ -76,6 +76,27 @@ struct ContextBuilderInput {
     double sessionDeltaPctile = 50.0;  // Percentile if baseline ready
 
     // =========================================================================
+    // EXTREME DELTA (SSOT: DeltaEngine - Dec 2024)
+    // =========================================================================
+    // These are pre-computed by DeltaEngine and passed through.
+    // ContextBuilder should NOT compute these - just copy to ctx.
+    bool isExtremeDeltaBar = false;      // Per-bar: extreme one-sided delta
+    bool isExtremeDeltaSession = false;  // Session: extreme magnitude percentile
+    bool isExtremeDelta = false;         // Combined: bar && session
+    bool directionalCoherence = false;   // Session delta sign matches bar direction
+
+    // =========================================================================
+    // ACTIVITY CLASSIFICATION (SSOT: AMT_Signals.h - Jan 2025)
+    // =========================================================================
+    // Initiative vs Responsive classification is LOCATION-GATED per Dalton:
+    //   - Initiative = away from value (OTF conviction)
+    //   - Responsive = toward value or defensive (reversion)
+    // SSOT is AMTActivityType from AMT_Signals.h, mapped to AggressionType.
+    // ContextBuilder MUST consume this - not compute its own delta-only version.
+    AggressionType ssotAggression = AggressionType::RESPONSIVE;
+    bool ssotAggressionValid = false;
+
+    // =========================================================================
     // ENVIRONMENT INPUTS (Range and Depth)
     // =========================================================================
 
@@ -360,29 +381,19 @@ struct AuctionContextBuilder {
         ctx.sessionDeltaPctile = in.sessionDeltaPctile;
         ctx.sessionDeltaValid = in.sessionDeltaBaselineReady;
 
-        // Extreme delta detection (persistence-validated)
-        // BUG FIX: Check BOTH directions - extreme buying (>0.7) AND extreme selling (<0.3)
-        ctx.isExtremeDeltaBar = in.deltaConsistencyValid &&
-            (in.deltaConsistency > AMT_Arb::EXTREME_DELTA_HIGH_THRESHOLD ||
-             in.deltaConsistency < AMT_Arb::EXTREME_DELTA_LOW_THRESHOLD);
+        // Extreme delta detection (SSOT: DeltaEngine - Dec 2024)
+        // Pre-computed by DeltaEngine, passed through input. No inline computation.
+        ctx.isExtremeDeltaBar = in.isExtremeDeltaBar;
+        ctx.isExtremeDeltaSession = in.isExtremeDeltaSession;
+        ctx.isExtremeDelta = in.isExtremeDelta;
+        ctx.directionalCoherence = in.directionalCoherence;
 
-        ctx.isExtremeDeltaSession = in.sessionDeltaBaselineReady &&
-            (in.sessionDeltaPctile >= AMT_Arb::SESSION_EXTREME_PCTILE_THRESHOLD);
-
-        ctx.isExtremeDelta = ctx.isExtremeDeltaBar && ctx.isExtremeDeltaSession;
-
-        // Directional coherence
-        const bool deltaPositive = (sessionDeltaPct > 0.0);
-        const bool barDeltaPositive = in.deltaConsistencyValid &&
-            (in.deltaConsistency > 0.5);
-        ctx.directionalCoherence = in.sessionDeltaBaselineReady &&
-            (deltaPositive == barDeltaPositive);
-
-        // Aggression classification (coherence-gated)
-        if (in.deltaConsistencyValid) {
-            ctx.aggression = (ctx.isExtremeDelta && ctx.directionalCoherence)
-                ? AggressionType::INITIATIVE
-                : AggressionType::RESPONSIVE;
+        // Aggression classification (SSOT: AMT_Signals.h - Jan 2025)
+        // SSOT UNIFICATION: Activity type is LOCATION-GATED per Dalton's Market Profile.
+        // Initiative = away from value (OTF conviction), Responsive = toward value.
+        // We CONSUME the SSOT - do NOT compute delta-only classification here.
+        if (in.ssotAggressionValid) {
+            ctx.aggression = in.ssotAggression;
             ctx.aggressionValid = true;
         } else {
             ctx.aggression = AggressionType::NEUTRAL;

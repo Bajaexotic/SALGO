@@ -572,6 +572,20 @@ struct StudyState
     double displayVAL = 0.0;
     bool   displayLevelsValid = false;  // true once we have valid non-zero VBP data
 
+    // === DIAGNOSTIC RATE-LIMITING (per-instance, not static) ===
+    // Per ACSIL guide: static locals are shared across all study instances in DLL.
+    // These must be per-instance to avoid cross-chart interference.
+    int diagLastValidationBar = -1;        // Input validation rate-limiting
+    int diagLastBaselineLogBar = -1;       // Baseline log rate-limiting
+    int diagLastViolationBar = -1;         // Invariant violation rate-limiting
+    int diagLastDepthDiagBar = -1;         // Depth diagnostic rate-limiting
+    int diagLastExtractionDiagBar = -1;    // Depth extraction rate-limiting
+    int diagLastLevelsDiagBar = -1;        // Levels diagnostic rate-limiting
+    int diagLastFricDiagBar = -1;          // Friction diagnostic rate-limiting
+    int diagLastVolBaselineLogBar = -100;  // Volume baseline rate-limiting
+    int diagLastSyntheticLogBar = -100;    // Synthetic baseline rate-limiting
+    int diagLastShapeFailLogBar = -100;    // Shape fail rate-limiting
+
 #if PERF_TIMING_ENABLED
     // === PERFORMANCE TIMING (compile-time gated) ===
     RecalcTimingStats perfStats;
@@ -1164,12 +1178,11 @@ static void CollectObservableSnapshot(
 
         // DEBUG validation: Check if Ask/Bid arrays are valid (sampled, low overhead)
         // If sc.MaintainAdditionalChartDataArrays was not set, arrays may be all zeros
-        static int lastValidationBar = -1;
         const int validationInterval = 100;  // Check every N bars
         const int localDiagLevel = sc.Input[80].GetInt();  // Read diagLevel from Input
-        if (localDiagLevel >= 2 && idx > 10 && (idx - lastValidationBar) >= validationInterval)
+        if (localDiagLevel >= 2 && idx > 10 && (idx - st->diagLastValidationBar) >= validationInterval)
         {
-            lastValidationBar = idx;
+            st->diagLastValidationBar = idx;
             const double sumCheck = barAskVol + barBidVol;
             const double volDiff = snap.effort.totalVolume - sumCheck;
             const double volDiffPct = (snap.effort.totalVolume > 0.0)
@@ -1667,8 +1680,8 @@ static void UpdateSessionBaselines(
         {
             const double netStack = snap.liquidity.bidStackPull + snap.liquidity.askStackPull;
             const double netDepth = snap.liquidity.domBidSize + snap.liquidity.domAskSize;
-            const double netPull = -std::min(snap.liquidity.bidStackPull, 0.0)
-                - std::min(snap.liquidity.askStackPull, 0.0);
+            const double netPull = -(std::min)(snap.liquidity.bidStackPull, 0.0)
+                - (std::min)(snap.liquidity.askStackPull, 0.0);
 
             // DOM baseline: Continuously accumulate on ALL bars (phase-bucketed)
             // Numbers Bars data is available historically, so no isLiveBar gate needed
@@ -2044,6 +2057,12 @@ static void PopulateEffortBaselines(
     double synthDurationSec[AMT::EFFORT_BUCKET_COUNT] = {0.0};
     int synthSamplesPushed = 0;
 
+    // Efficiency ratio tracking per bucket (Kaufman ER = |net| / path)
+    double synthFirstClose[AMT::EFFORT_BUCKET_COUNT] = {0.0};   // First close in synthetic window
+    bool synthFirstCloseValid[AMT::EFFORT_BUCKET_COUNT] = {false};
+    double synthPathLength[AMT::EFFORT_BUCKET_COUNT] = {0.0};   // Sum of |close[i] - close[i-1]|
+    double synthPrevBarClose[AMT::EFFORT_BUCKET_COUNT] = {0.0}; // Previous bar close for path calc
+
     // Initialize running high/low
     for (int i = 0; i < AMT::EFFORT_BUCKET_COUNT; ++i) {
         synthRunningHigh[i] = -1e9;
@@ -2142,6 +2161,16 @@ static void PopulateEffortBaselines(
             synthBarCount[bucketIdx]++;
             synthDurationSec[bucketIdx] += barIntervalSec;
 
+            // Efficiency ratio tracking: first close and path length
+            if (!synthFirstCloseValid[bucketIdx]) {
+                synthFirstClose[bucketIdx] = barClose;
+                synthFirstCloseValid[bucketIdx] = true;
+            }
+            if (synthPrevBarClose[bucketIdx] > 0.0) {
+                synthPathLength[bucketIdx] += std::abs(barClose - synthPrevBarClose[bucketIdx]);
+            }
+            synthPrevBarClose[bucketIdx] = barClose;
+
             // When we have enough bars, push TRUE RANGE synthetic metrics and reset
             if (synthBarCount[bucketIdx] >= SYNTHETIC_AGGREGATION_BARS) {
                 // Compute TRUE RANGE using DRY helper (AMT_Volatility.h)
@@ -2163,6 +2192,14 @@ static void PopulateEffortBaselines(
                     synthSamplesPushed++;
                 }
 
+                // Compute and push Kaufman Efficiency Ratio: |net| / path
+                // ER ranges from 0.0 (pure chop) to 1.0 (perfect trend)
+                if (synthFirstCloseValid[bucketIdx] && synthPathLength[bucketIdx] > 1e-10) {
+                    const double netChange = std::abs(synthLastClose[bucketIdx] - synthFirstClose[bucketIdx]);
+                    const double er = netChange / synthPathLength[bucketIdx];
+                    dist.synthetic_efficiency.push((std::min)(1.0, er));  // Clamp to [0,1]
+                }
+
                 // Save current close as previous for next synthetic bar
                 synthPrevClose[bucketIdx] = synthLastClose[bucketIdx];
                 synthPrevCloseValid[bucketIdx] = true;
@@ -2172,6 +2209,8 @@ static void PopulateEffortBaselines(
                 synthRunningLow[bucketIdx] = 1e9;
                 synthBarCount[bucketIdx] = 0;
                 synthDurationSec[bucketIdx] = 0.0;
+                synthFirstCloseValid[bucketIdx] = false;
+                synthPathLength[bucketIdx] = 0.0;
             }
 
             // avg_trade_size: only push when numTrades > 0 (no fallback, no contamination)
@@ -2539,6 +2578,17 @@ static void PreWarmLiquidityBaselines(
         const double askVol = sc.AskVolume[bar];
         const double bidVol = sc.BidVolume[bar];
 
+        // Compute historical spread from best bid/ask levels
+        // bidLevels are sorted descending (highest bid first), askLevels ascending (lowest ask first)
+        double spreadTicks = -1.0;
+        if (!bidLevels.empty() && !askLevels.empty()) {
+            const double bestBid = bidLevels[0].first;   // Highest bid
+            const double bestAsk = askLevels[0].first;   // Lowest ask
+            if (bestAsk > bestBid) {
+                spreadTicks = (bestAsk - bestBid) / tickSize;
+            }
+        }
+
         // Determine phase for this historical bar (for phase-aware baselines)
         SCDateTime barDT = sc.BaseDateTimeIn[bar];
         int barHour, barMinute, barSecond;
@@ -2553,7 +2603,8 @@ static void PreWarmLiquidityBaselines(
             bidVol,
             prevDepthMass,
             barDurationSec,
-            barPhase  // Phase for phase-aware baseline bucketing
+            barPhase,
+            spreadTicks  // Historical spread for Kyle's Tightness component
         );
 
         prevDepthMass = depth.totalMass;
@@ -2562,13 +2613,13 @@ static void PreWarmLiquidityBaselines(
     // Log pre-warm results
     if (diagLevel >= 1) {
         const auto status = st->liquidityEngine.GetPreWarmStatus();
-        char buf[256];
+        char buf[320];
         snprintf(buf, sizeof(buf),
             "[LIQ-PREWARM] Scanned %d bars (range [%d..%d]), %d with depth | "
-            "Baselines: depth=%zu stress=%zu res=%zu | Ready=%s",
+            "Baselines: depth=%zu stress=%zu res=%zu spread=%zu | Ready=%s",
             barsProcessed, startBar, currentBar - 1, barsWithDepth,
             status.depthSamples, status.stressSamples, status.resilienceSamples,
-            status.allReady ? "YES" : "NO");
+            status.spreadSamples, status.allReady ? "YES" : "NO");
         sc.AddMessageToLog(buf, 0);
     }
 }
@@ -2875,6 +2926,13 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
         return;
     }
 
+    // Skip processing during historical data download (per ACSIL Programming Concepts)
+    // Heavy processing can cause performance issues while SC is downloading data
+    if (sc.DownloadingHistoricalData)
+    {
+        return;
+    }
+
     const int baselineWindow = sc.Input[3].GetInt();   // Baseline Window
     const int warmUpBars = sc.Input[2].GetInt();       // Warm-up Bars
 
@@ -2939,9 +2997,9 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
         st->resetAll(baselineWindow, warmUpBars);
 
         // PRE-WARM: Seed liquidity baselines from historical depth data
-        // This eliminates the 10-bar cold-start delay at session open
-        // Uses the last 50 bars of historical depth to pre-populate baselines
-        const int liqPreWarmBars = 50;  // Lookback for historical depth pre-warm
+        // Uses sufficient history to populate ALL phase-aware baselines (no warmup period)
+        // 7 phases × 10 min samples = 70 minimum, but phases are uneven so use 500+
+        const int liqPreWarmBars = 500;  // Enough to cover all phases with 10+ samples each
         const int preWarmDiagLevel = sc.Input[110].GetInt();  // Get diagLevel early for pre-warm
         PreWarmLiquidityBaselines(sc, st, liqPreWarmBars, preWarmDiagLevel);
 
@@ -3644,9 +3702,8 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
         if (st->baselineSessionMgr.IsActiveSessionBar(st->sessionMgr.currentSession) == false &&
             inLogWindow && diagLevel >= 2)
         {
-            // Rate-limited log for baseline bars
-            static int lastLoggedBaselineBar = -1;
-            if (curBarIdx != lastLoggedBaselineBar && (curBarIdx % 100 == 0))
+            // Rate-limited log for baseline bars (per-instance via StudyState, not static)
+            if (curBarIdx != st->diagLastBaselineLogBar && (curBarIdx % 100 == 0))
             {
                 const AMT::SessionType sessType = st->sessionMgr.currentSession.sessionType;
                 const int barCount = st->baselineSessionMgr.GetBaselineBarCount(sessType);
@@ -3658,7 +3715,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                     AMT::BaselinePhaseToString(st->baselineSessionMgr.currentPhase),
                     typeStr, barCount, sessCount);
                 st->logManager.LogDebug(curBarIdx, exitMsg.GetChars(), LogCategory::BASELINE);
-                lastLoggedBaselineBar = curBarIdx;
+                st->diagLastBaselineLogBar = curBarIdx;
             }
         }
         return;  // Skip all live strategy logic
@@ -3751,9 +3808,8 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
         const bool deltaPctInRange = (absClosedDeltaPct <= 1.0001);  // Small epsilon for float
 
         if (!deltaPctInRange) {
-            // Log invariant violation (rate-limited)
-            static int lastViolationBar = -1;
-            if (curBarIdx - lastViolationBar > 100) {  // Log at most every 100 bars
+            // Log invariant violation (rate-limited, per-instance via StudyState)
+            if (curBarIdx - st->diagLastViolationBar > 100) {  // Log at most every 100 bars
                 // Get bar time for diagnostics
                 SCDateTime barTime = sc.BaseDateTimeIn[closedBarIdx];
                 int hour, minute, second;
@@ -3766,7 +3822,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                     absClosedDeltaPct, closedBarAskVol, closedBarBidVol,
                     closedBarVol, closedBarVolAskBid);
                 sc.AddMessageToLog(msg, 1);
-                lastViolationBar = curBarIdx;
+                st->diagLastViolationBar = curBarIdx;
             }
             // Treat as invalid (same as thin bar)
             st->amtContext.confidence.deltaConsistency = 0.5f;
@@ -3816,7 +3872,6 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
     //           in Global Settings >> Sierra Chart Server Settings
     // =========================================================================
     {
-        const bool isLiveBar = (curBarIdx == sc.ArraySize - 1);
         const double tickSize = sc.TickSize;
         const int maxLevels = sc.Input[14].GetInt();  // Max Depth Levels input
         const double barDurationSec = (sc.SecondsPerBar > 0) ? static_cast<double>(sc.SecondsPerBar) : 60.0;
@@ -3857,10 +3912,9 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
         std::vector<std::pair<double, double>> histMaxAskLevels;   // Peak during bar
         bool histDepthAvailable = false;
 
-        // Diagnostic: Log depth API availability (rate-limited)
+        // Diagnostic: Log depth API availability (rate-limited, per-instance via StudyState)
         if (isLiveBar && diagLevel >= 2) {
-            static int lastDepthDiagBar = -1;
-            if (curBarIdx - lastDepthDiagBar > 100) {
+            if (curBarIdx - st->diagLastDepthDiagBar > 100) {
                 const bool ptrOk = (p_DepthBars != nullptr);
                 const bool dataExists = ptrOk && p_DepthBars->DepthDataExistsAt(closedBarIdx);
                 const int numDepthBars = ptrOk ? p_DepthBars->NumBars() : 0;
@@ -3870,7 +3924,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                     ptrOk ? "OK" : "NULL", numDepthBars,
                     dataExists ? "YES" : "NO");
                 sc.AddMessageToLog(diagMsg, 0);
-                lastDepthDiagBar = curBarIdx;
+                st->diagLastDepthDiagBar = curBarIdx;
             }
         }
 
@@ -3922,15 +3976,14 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                 // BSE_UNDEFINED: equal quantities on both sides - skip to avoid ambiguity
             } while (p_DepthBars->GetNextHigherPriceTickIndex(closedBarIdx, priceTickIdx));
 
-            // Diagnostic: Log extraction results (one-time on issue)
+            // Diagnostic: Log extraction results (one-time on issue, per-instance via StudyState)
             if (isLiveBar && diagLevel >= 1 && histBidLevels.empty() && histAskLevels.empty()) {
-                static int lastExtractionDiagBar = -1;
-                if (curBarIdx - lastExtractionDiagBar > 100) {
+                if (curBarIdx - st->diagLastExtractionDiagBar > 100) {
                     SCString extractMsg;
                     extractMsg.Format("[DEPTH-EXTRACT] Bar %d closedBar=%d | levels=%d | nonZeroBids=%d nonZeroAsks=%d | ALL ZERO",
                         curBarIdx, closedBarIdx, levelsIterated, nonZeroBids, nonZeroAsks);
                     sc.AddMessageToLog(extractMsg, 0);
-                    lastExtractionDiagBar = curBarIdx;
+                    st->diagLastExtractionDiagBar = curBarIdx;
                 }
             }
 
@@ -3958,10 +4011,9 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                     st->lastLiqSnap.histBidAskValid = true;
                 }
 
-                // Diagnostic: Log collected levels (rate-limited)
+                // Diagnostic: Log collected levels (rate-limited, per-instance via StudyState)
                 if (isLiveBar && diagLevel >= 2) {
-                    static int lastLevelsDiagBar = -1;
-                    if (curBarIdx - lastLevelsDiagBar > 50) {
+                    if (curBarIdx - st->diagLastLevelsDiagBar > 50) {
                         SCString lvlMsg;
                         lvlMsg.Format("[LIQ-DIAG] Bar %d | HistDepth: bids=%zu asks=%zu | BestBid=%.2f BestAsk=%.2f spread=%.1f",
                             curBarIdx,
@@ -3969,7 +4021,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                             st->lastLiqSnap.histBestBid, st->lastLiqSnap.histBestAsk,
                             st->lastLiqSnap.histSpreadTicks);
                         sc.AddMessageToLog(lvlMsg, 0);
-                        lastLevelsDiagBar = curBarIdx;
+                        st->diagLastLevelsDiagBar = curBarIdx;
                     }
                 }
 
@@ -4309,10 +4361,13 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
             auto& dist = st->effortBaselines.Get(closedBarPhase);
             dist.synthetic_bar_range.push(st->lastVolResult.syntheticRangeTicks);
             dist.synthetic_range_velocity.push(st->lastVolResult.syntheticRangeVelocity);
+            // Push efficiency ratio (Kaufman ER: 0=chop, 1=trend)
+            if (st->lastVolResult.efficiencyValid) {
+                dist.synthetic_efficiency.push(st->lastVolResult.efficiencyRatio);
+            }
         }
 
         // Log-on-change for regime or pace transitions (rate-limited to changes)
-        const bool isLiveBar = (curBarIdx == sc.ArraySize - 1);
         if (isLiveBar && st->lastVolResult.IsReady()) {
             const AMT::VolatilityRegime curRegime = st->lastVolResult.regime;
             const AMT::AuctionPace curPace = st->lastVolResult.pace;
@@ -4386,35 +4441,106 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
             const double sessionCumDelta = st->sessionAccum.sessionCumDelta;
             const double sessionVolume = st->sessionAccum.sessionTotalVolume;
 
+            // ----------------------------------------------------------------
+            // CONTEXT EXTRACTION (from other engines)
+            // ----------------------------------------------------------------
+            // Liquidity context
+            const AMT::LiquidityState liqState = st->lastLiqSnap.liqValid
+                ? st->lastLiqSnap.liqState : AMT::LiquidityState::LIQ_NOT_READY;
+            const double stressRank = st->lastLiqSnap.stressRankValid
+                ? (st->lastLiqSnap.stressRank / 100.0) : 0.0;
+
+            // Volatility context
+            const AMT::VolatilityRegime volRegime = st->lastVolResult.IsReady()
+                ? st->lastVolResult.regime : AMT::VolatilityRegime::UNKNOWN;
+
+            // Dalton context (optional)
+            const AMT::AMTMarketState daltonState = st->lastDaltonState.phase;
+            const bool is1TF = (st->lastDaltonState.timeframe == AMT::TimeframePattern::ONE_TIME_FRAMING_UP ||
+                               st->lastDaltonState.timeframe == AMT::TimeframePattern::ONE_TIME_FRAMING_DOWN);
+
+            // ----------------------------------------------------------------
+            // LOCATION CONTEXT (value-relative)
+            // ----------------------------------------------------------------
+            const double poc = st->sessionVolumeProfile.session_poc;
+            const double vah = st->sessionVolumeProfile.session_vah;
+            const double val = st->sessionVolumeProfile.session_val;
+            const double priorPOC = st->amtZoneManager.sessionCtx.prior_poc;
+            const AMT::StructureTracker& structure = st->amtZoneManager.structure;
+            const double sessionHigh = structure.GetSessionHigh();
+            const double sessionLow = structure.GetSessionLow();
+            const double ibHigh = structure.GetIBHigh();
+            const double ibLow = structure.GetIBLow();
+
+            AMT::DeltaLocationContext locCtx = AMT::DeltaLocationContext::Build(
+                sc.Close[closedBarIdx], poc, vah, val, tickSize,
+                2.0,   // edgeToleranceTicks
+                8.0,   // discoveryThresholdTicks
+                sessionHigh, sessionLow, ibHigh, ibLow, priorPOC);
+
             // Set phase BEFORE Compute() for phase-aware baseline queries
             st->deltaEngine.SetPhase(closedBarPhase);
 
-            // Compute delta character and alignment
+            // Build DeltaInput with extended metrics (Jan 2025)
+            AMT::DeltaInput deltaInput;
+            deltaInput.WithCore(barDelta, barVolume, priceChangeTicks,
+                               sessionCumDelta, sessionVolume, closedBarIdx);
+
+            // Add extended inputs from current snapshot if available
+            const auto& effort = st->currentSnapshot.effort;
+            const double barRangeTicks = (sc.High[closedBarIdx] - sc.Low[closedBarIdx]) / tickSize;
+            const double tradesPerSec = effort.tradesSec;
+            const double avgBid = effort.avgBidTradeSize;
+            const double avgAsk = effort.avgAskTradeSize;
+
+            if (tradesPerSec > 0.0 || barRangeTicks > 0.0 || avgBid > 0.0 || avgAsk > 0.0) {
+                deltaInput.WithExtended(barRangeTicks, 0.0, tradesPerSec, avgBid, avgAsk);
+            }
+
+            // Compute delta with full context (location + context gates + extended metrics)
             st->lastDeltaResult = st->deltaEngine.Compute(
-                barDelta, barVolume, priceChangeTicks,
-                sessionCumDelta, sessionVolume, closedBarIdx);
+                deltaInput, locCtx,
+                liqState, volRegime, stressRank,
+                daltonState, is1TF);
 
             // Log-on-change for character transitions (rate-limited)
-            const bool isLiveBar = (curBarIdx == sc.ArraySize - 1);
             if (isLiveBar && st->lastDeltaResult.IsReady()) {
                 const AMT::DeltaCharacter curChar = st->lastDeltaResult.character;
+                const auto& dr = st->lastDeltaResult;
                 if (curChar != st->lastLoggedDeltaCharacter ||
-                    st->lastDeltaResult.reversalDetected ||
-                    st->lastDeltaResult.divergenceStarted) {
+                    dr.reversalDetected || dr.divergenceStarted) {
+
+                    // Build tape type suffix
+                    const char* tapeSuffix = "";
+                    if (dr.thinTapeType == AMT::ThinTapeType::TRUE_THIN) tapeSuffix = " THIN";
+                    else if (dr.thinTapeType == AMT::ThinTapeType::HFT_FRAGMENTED) tapeSuffix = " HFT";
+                    else if (dr.thinTapeType == AMT::ThinTapeType::INSTITUTIONAL) tapeSuffix = " INST";
+
                     SCString deltaMsg;
-                    deltaMsg.Format("[DELTA] Bar %d | CHAR=%s ALIGN=%s | bar=%.0f sess=%.0f vol=%.0f | "
-                        "conf=%s%s%s%s",
+                    deltaMsg.Format("[DELTA] Bar %d | CHAR=%s ALIGN=%s CONF=%s | "
+                        "bar=%.0f sess=%.0f vol=%.0f%s%s%s%s",
                         curBarIdx,
                         AMT::DeltaCharacterToString(curChar),
-                        AMT::DeltaAlignmentToString(st->lastDeltaResult.alignment),
-                        st->lastDeltaResult.barDeltaPctile,
-                        st->lastDeltaResult.sessionDeltaPctile,
-                        st->lastDeltaResult.volumePctile,
-                        AMT::DeltaConfidenceToString(st->lastDeltaResult.confidence),
-                        st->lastDeltaResult.reversalDetected ? " !REV" : "",
-                        st->lastDeltaResult.divergenceStarted ? " !DIV" : "",
-                        st->lastDeltaResult.isThinTape ? " (thin)" : "");
+                        AMT::DeltaAlignmentToString(dr.alignment),
+                        AMT::DeltaConfidenceToString(dr.confidence),
+                        dr.barDeltaPctile, dr.sessionDeltaPctile, dr.volumePctile,
+                        dr.reversalDetected ? " !REV" : "",
+                        dr.divergenceStarted ? " !DIV" : "",
+                        tapeSuffix,
+                        dr.rangeAdaptiveApplied ? " (range-adj)" : "");
                     sc.AddMessageToLog(deltaMsg, 0);
+
+                    // Extended metrics line (when baselines ready)
+                    if (dr.hasExtendedInputs && (dr.tradesBaselineReady || dr.rangeBaselineReady)) {
+                        SCString extMsg;
+                        extMsg.Format("[DELTA-EXT] trades_P=%.0f range_P=%.0f avg_P=%.0f | "
+                            "noise=%.1f strong=%.1f | hyst: char_req=%d align_req=%d",
+                            dr.tradesPctile, dr.rangePctile, dr.avgTradeSizePctile,
+                            dr.effectiveNoiseFloor, dr.effectiveStrongSignal,
+                            dr.characterConfirmationRequired, dr.alignmentConfirmationRequired);
+                        sc.AddMessageToLog(extMsg, 0);
+                    }
+
                     st->lastLoggedDeltaCharacter = curChar;
                 }
             }
@@ -4528,7 +4654,6 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
             );
 
             // Log-on-change for imbalance type transitions (rate-limited)
-            const bool isLiveBar = (curBarIdx == sc.ArraySize - 1);
             if (isLiveBar && st->lastImbalanceResult.IsReady()) {
                 const AMT::ImbalanceType curType = st->lastImbalanceResult.confirmedType;
                 const bool typeChanged = (curType != st->lastLoggedImbalanceType);
@@ -4625,7 +4750,6 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
             );
 
             // Log-on-change for acceptance state transitions (rate-limited)
-            const bool isLiveBar = (curBarIdx == sc.ArraySize - 1);
             if (isLiveBar && st->lastVolumeResult.IsReady()) {
                 const AMT::AcceptanceState curState = st->lastVolumeResult.confirmedState;
                 const bool stateChanged = (curState != st->lastLoggedAcceptanceState);
@@ -4721,7 +4845,6 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
             );
 
             // Log-on-change for zone transitions (rate-limited)
-            const bool isLiveBar = (curBarIdx == sc.ArraySize - 1);
             if (isLiveBar && st->lastValueLocationResult.IsReady()) {
                 const AMT::ValueZone curZone = st->lastValueLocationResult.confirmedZone;
                 const bool zoneChanged = (curZone != st->lastLoggedValueZone);
@@ -4767,17 +4890,14 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
     // Uses spread at CLOSED BAR, matching all other liquidity components
     // NOTE: closedBarIdx, closedBarPhase computed above (DRY consolidation)
     {
-        const bool isLiveBar = (curBarIdx == sc.ArraySize - 1);
-
         // IMPORTANT: histBidAskValid is set fresh each bar in the liquidity block above.
         // If depth data wasn't available for the closed bar, it will be false.
         const double histSpreadTicks = st->lastLiqSnap.histSpreadTicks;
         const bool histValid = st->lastLiqSnap.histBidAskValid;
 
-        // Diagnostic: Log friction state (rate-limited)
+        // Diagnostic: Log friction state (rate-limited, per-instance via StudyState)
         if (isLiveBar && diagLevel >= 2 && !histValid) {
-            static int lastFricDiagBar = -1;
-            if (curBarIdx - lastFricDiagBar > 100) {
+            if (curBarIdx - st->diagLastFricDiagBar > 100) {
                 const bool spreadReady = st->domWarmup.IsSpreadReady(closedBarPhase);
                 SCString fricDiag;
                 fricDiag.Format("[FRIC-DIAG] Bar %d | histValid=%d | histBid=%.2f histAsk=%.2f spread=%.1f | phase=%s spreadReady=%d",
@@ -4786,7 +4906,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                     AMT::SessionPhaseToString(closedBarPhase),
                     spreadReady ? 1 : 0);
                 sc.AddMessageToLog(fricDiag, 0);
-                lastFricDiagBar = curBarIdx;
+                st->diagLastFricDiagBar = curBarIdx;
             }
         }
 
@@ -4873,8 +4993,8 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
             // Reason code: PROFILE_VOLUME_BASELINE_NOT_READY (distinct from "profile thin")
             if (!clarityResult.maturity.volumeSufficiencyValid)
             {
-                static int lastVolBaselineLogBar = -100;
-                if (curBarIdx - lastVolBaselineLogBar >= 50)  // Rate limit: every 50 bars
+                // Rate limit: every 50 bars (per-instance via StudyState, not static)
+                if (curBarIdx - st->diagLastVolBaselineLogBar >= 50)
                 {
                     const AMT::HistoricalProfileBaseline* baseline = isCurrentRTH ? &st->rthProfileBaseline : &st->gbxProfileBaseline;
                     const int bucketIdx = static_cast<int>(clarityResult.currentBucket);
@@ -4893,7 +5013,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                         clarityResult.maturity.hasMinBars ? "PASS" : "FAIL",
                         clarityResult.maturity.hasMinMinutes ? "PASS" : "FAIL");
                     st->logManager.LogInfo(curBarIdx, volBaselineMsg.GetChars(), LogCategory::AMT);
-                    lastVolBaselineLogBar = curBarIdx;
+                    st->diagLastVolBaselineLogBar = curBarIdx;
                 }
             }
 
@@ -4919,11 +5039,10 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
         {
             st->amtContext.confidence.volumeProfileClarityValid = false;
 
-            // Log maturity gate failure reason (rate-limited)
+            // Log maturity gate failure reason (rate-limited, per-instance via StudyState)
             if (!clarityResult.profileMature && clarityResult.maturity.gateFailedReason != nullptr)
             {
-                static int lastLoggedBar = -100;
-                if (curBarIdx - lastLoggedBar >= 20)  // Rate limit to every 20 bars
+                if (curBarIdx - st->diagLastSyntheticLogBar >= 20)  // Rate limit to every 20 bars
                 {
                     SCString maturityMsg;
                     maturityMsg.Format("VPC immature: %s (levels=%d vol=%.0f bars=%d mins=%d)",
@@ -4933,7 +5052,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                         clarityResult.maturity.sessionBars,
                         clarityResult.maturity.sessionMinutes);
                     st->logManager.LogInfo(curBarIdx, maturityMsg.GetChars(), LogCategory::AMT);
-                    lastLoggedBar = curBarIdx;
+                    st->diagLastSyntheticLogBar = curBarIdx;
                 }
             }
         }
@@ -5576,8 +5695,86 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
         st->singlePrintZones.clear();
         st->lastStateEvidence.Reset();
 
-        // Reset Dalton framework for new session
-        st->daltonEngine.ResetSession();
+        // =====================================================================
+        // DALTON SESSION BRIDGE (Jan 2025)
+        // =====================================================================
+        // Handle prior RTH capture and overnight session setup at session boundaries.
+        // This enables gap calculation and opening type classification.
+        // =====================================================================
+        const bool wasRTH = st->sessionMgr.previousSession.IsRTH();
+        const bool isNowRTH = st->sessionMgr.currentSession.IsRTH();
+        const bool isNowGlobex = st->sessionMgr.currentSession.IsGlobex();
+
+        // RTH → GLOBEX: Capture prior RTH levels for gap calculation
+        if (wasRTH && isNowGlobex) {
+            const double rthHigh = st->amtZoneManager.GetSessionHigh();
+            const double rthLow = st->amtZoneManager.GetSessionLow();
+            const double rthClose = (curBarIdx > 0) ? sc.Close[curBarIdx - 1] : sc.Close[curBarIdx];
+            st->sessionMgr.CapturePriorRTH(rthHigh, rthLow, rthClose);
+
+            if (diagLevel >= 1) {
+                SCString bridgeMsg;
+                bridgeMsg.Format("Bar %d | PRIOR RTH CAPTURED: H=%.2f L=%.2f C=%.2f POC=%.2f VAH=%.2f VAL=%.2f",
+                    curBarIdx, rthHigh, rthLow, rthClose,
+                    st->sessionMgr.GetPriorRTHPOC(),
+                    st->sessionMgr.GetPriorRTHVAH(),
+                    st->sessionMgr.GetPriorRTHVAL());
+                st->logManager.LogInfo(curBarIdx, bridgeMsg.GetChars(), LogCategory::SESSION);
+            }
+        }
+
+        // GLOBEX → RTH: Capture overnight and set up session bridge
+        if (!wasRTH && isNowRTH) {
+            // Capture overnight session structure
+            AMT::OvernightSession on;
+            on.onHigh = st->amtZoneManager.GetSessionHigh();
+            on.onLow = st->amtZoneManager.GetSessionLow();
+            on.onClose = (curBarIdx > 0) ? sc.Close[curBarIdx - 1] : sc.Close[curBarIdx];
+            on.onMidpoint = (on.onHigh + on.onLow) / 2.0;
+            on.onPOC = st->sessionMgr.GetPOC();
+            on.onVAH = st->sessionMgr.GetVAH();
+            on.onVAL = st->sessionMgr.GetVAL();
+            on.overnightPattern = st->lastDaltonState.timeframe;
+            on.overnightRotation = st->lastDaltonState.rotationFactor;
+            // Get mini-IB from GLOBEX tracker if available
+            const auto& miniIB = st->daltonEngine.GetGlobexMiniIBTracker().GetState();
+            on.miniIBHigh = miniIB.high;
+            on.miniIBLow = miniIB.low;
+            on.miniIBFrozen = miniIB.frozen;
+            on.valid = (on.onHigh > 0.0 && on.onLow > 0.0);
+            on.barCount = curBarIdx - st->sessionMgr.GetSessionStartBar();
+
+            // Set prior RTH context from SessionManager
+            st->daltonEngine.SetPriorRTHContext(
+                st->sessionMgr.GetPriorRTHHigh(),
+                st->sessionMgr.GetPriorRTHLow(),
+                st->sessionMgr.GetPriorRTHClose(),
+                st->sessionMgr.GetPriorRTHPOC(),
+                st->sessionMgr.GetPriorRTHVAH(),
+                st->sessionMgr.GetPriorRTHVAL());
+
+            // Capture overnight session
+            st->daltonEngine.CaptureOvernightSession(on);
+
+            // Classify gap at RTH open
+            const double rthOpenPrice = probeOpen;
+            st->daltonEngine.ClassifyGap(rthOpenPrice, sc.TickSize);
+
+            if (diagLevel >= 1) {
+                const auto& bridge = st->daltonEngine.GetSessionBridge();
+                SCString bridgeMsg;
+                bridgeMsg.Format("Bar %d | OVERNIGHT CAPTURED: H=%.2f L=%.2f C=%.2f | INV=%s SCORE=%.2f | GAP=%s SIZE=%.0ft",
+                    curBarIdx, on.onHigh, on.onLow, on.onClose,
+                    AMT::InventoryPositionToString(bridge.inventory.position),
+                    bridge.inventory.score,
+                    AMT::GapTypeToString(bridge.gap.type),
+                    bridge.gap.gapSize);
+                st->logManager.LogInfo(curBarIdx, bridgeMsg.GetChars(), LogCategory::SESSION);
+            }
+        }
+
+        // Reset Dalton framework for new session (with session type)
+        st->daltonEngine.ResetSession(isNowGlobex);
         st->lastDaltonState = AMT::DaltonState();  // Clear last state
 
         // --- ACCUMULATE SESSION CHANGE (after reset so it's not lost) ---
@@ -6680,6 +6877,18 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                         const int minutesFromOpen = (tSec >= rthStartSec) ?
                             (tSec - rthStartSec) / 60 : 0;
 
+                        // ============================================================
+                        // EXTREME DELTA FROM DELTA ENGINE (SSOT - Dec 2024)
+                        // DeltaEngine computes extreme delta; we just read it here.
+                        // DeltaEngine.Compute() runs at line ~4488, before this point.
+                        // ============================================================
+                        const bool extremeDeltaBar = st->lastDeltaResult.isExtremeDeltaBar;
+                        const bool extremeDeltaSession = st->lastDeltaResult.isExtremeDeltaSession;
+                        const bool deltaCoherence = st->lastDeltaResult.directionalCoherence;
+
+                        // Determine session type for Dalton processing
+                        const bool isGlobexSession = st->sessionMgr.IsGlobex();
+
                         // Process bar through Dalton engine FIRST
                         st->lastDaltonState = st->daltonEngine.ProcessBar(
                             probeHigh,      // Bar high
@@ -6692,8 +6901,27 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                             deltaPct,       // Bar delta as fraction of volume
                             sc.TickSize,    // Tick size
                             minutesFromOpen,// Minutes since RTH open
-                            currentBar      // Bar index
+                            currentBar,     // Bar index
+                            extremeDeltaBar,     // SSOT: Per-bar extreme
+                            extremeDeltaSession, // SSOT: Session extreme
+                            deltaCoherence,      // SSOT: Directional coherence
+                            isGlobexSession      // NEW: Session type flag (Jan 2025)
                         );
+
+                        // ============================================================
+                        // OPENING TYPE CLASSIFICATION (Jan 2025)
+                        // Classify Dalton's 4 opening types in first 30 min of RTH.
+                        // ============================================================
+                        if (!isGlobexSession && minutesFromOpen <= 30) {
+                            st->daltonEngine.UpdateOpeningClassification(
+                                probeHigh, probeLow, probeClose, probeOpen,
+                                minutesFromOpen, currentBar, sc.TickSize);
+                        }
+
+                        // Update gap fill status during RTH
+                        if (!isGlobexSession) {
+                            st->daltonEngine.UpdateGapFill(probeHigh, probeLow);
+                        }
 
                         // Check HVN/LVN proximity (updates atHVN/atLVN in state)
                         AMT::DaltonEngine::CheckVolumeNodeProximity(
@@ -7716,7 +7944,8 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
 
                         // Efficiency Ratio + chop (if valid)
                         if (vol.efficiencyValid) {
-                            msg.Format(" | ER=%.2f chop=%.2f", vol.efficiencyRatio, vol.chopSeverity);
+                            msg.Format(" | ER=%.2f(p%.0f) chop=%.2f",
+                                vol.efficiencyRatio, vol.efficiencyPercentile, vol.chopSeverity);
                             volLine += msg;
                         }
 
@@ -8082,6 +8311,59 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                         structure.IsIBFrozen() ? "FROZEN" : "OPEN",
                         structure.GetSessionRangeTicks());
                     st->logManager.LogToSC(LogCategory::AMT, msg, false);
+                }
+
+                // Dalton Session Bridge (overnight inventory, gap, opening type)
+                // Only logged during RTH when session bridge is populated
+                {
+                    const AMT::SessionBridge& bridge = st->daltonEngine.GetSessionBridge();
+                    if (bridge.valid) {
+                        // Opening type line
+                        msg.Format("DALTON: OPEN=%s (%s) | GAP=%s sz=%.0ft fill=%s",
+                            AMT::OpeningTypeToString(st->lastDaltonState.openingType),
+                            st->lastDaltonState.openingClassified ? "CLASSIFIED" : "pending",
+                            AMT::GapTypeToString(bridge.gap.type),
+                            bridge.gap.gapSize,
+                            bridge.gap.gapFilled ? "YES" : "NO");
+                        st->logManager.LogToSC(LogCategory::AMT, msg, false);
+
+                        // Overnight inventory line
+                        msg.Format("DALTON: INV=%s score=%.2f | ON: HI=%.2f LO=%.2f MID=%.2f CL=%.2f",
+                            AMT::InventoryPositionToString(bridge.inventory.position),
+                            bridge.inventory.score,
+                            bridge.overnight.onHigh,
+                            bridge.overnight.onLow,
+                            bridge.overnight.onMidpoint,
+                            bridge.overnight.onClose);
+                        st->logManager.LogToSC(LogCategory::AMT, msg, false);
+
+                        // Prior RTH context (for gap calculation reference)
+                        if (diagLevel >= 2) {
+                            msg.Format("DALTON: PRIOR_RTH: HI=%.2f LO=%.2f CL=%.2f | POC=%.2f VAH=%.2f VAL=%.2f",
+                                bridge.priorRTHHigh,
+                                bridge.priorRTHLow,
+                                bridge.priorRTHClose,
+                                bridge.priorRTHPOC,
+                                bridge.priorRTHVAH,
+                                bridge.priorRTHVAL);
+                            st->logManager.LogToSC(LogCategory::AMT, msg, false);
+                        }
+                    } else if (!st->lastDaltonState.isGlobexSession) {
+                        // RTH but bridge not yet populated (early in session)
+                        msg.Format("DALTON: OPEN=%s (%s) | Bridge: pending",
+                            AMT::OpeningTypeToString(st->lastDaltonState.openingType),
+                            st->lastDaltonState.openingClassified ? "CLASSIFIED" : "pending");
+                        st->logManager.LogToSC(LogCategory::AMT, msg, false);
+                    } else {
+                        // GLOBEX session - show mini-IB tracking
+                        msg.Format("DALTON: GLOBEX | mini-IB: %.2f-%.2f (%s) | TF=%s rot=%d",
+                            bridge.overnight.miniIBLow,
+                            bridge.overnight.miniIBHigh,
+                            bridge.overnight.miniIBFrozen ? "FROZEN" : "OPEN",
+                            AMT::TimeframePatternToString(st->lastDaltonState.timeframe),
+                            st->lastDaltonState.rotationFactor);
+                        st->logManager.LogToSC(LogCategory::AMT, msg, false);
+                    }
                 }
 
                 // VA summary (uses decoupled display levels as SSOT)
@@ -8545,6 +8827,19 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
         ctxInput.sessionDeltaBaselineReady = sessionDeltaValid;
         ctxInput.sessionDeltaPctile = sessionDeltaPctile;
 
+        // --- Extreme delta (SSOT: DeltaEngine - Dec 2024) ---
+        ctxInput.isExtremeDeltaBar = st->lastDeltaResult.isExtremeDeltaBar;
+        ctxInput.isExtremeDeltaSession = st->lastDeltaResult.isExtremeDeltaSession;
+        ctxInput.isExtremeDelta = st->lastDeltaResult.isExtremeDelta;
+        ctxInput.directionalCoherence = st->lastDeltaResult.directionalCoherence;
+
+        // --- Activity classification (SSOT: AMT_Signals.h - Jan 2025) ---
+        // Initiative vs Responsive is LOCATION-GATED per Dalton's Market Profile.
+        // SSOT: AMTActivityType from AMTSignalEngine.ProcessBar(), mapped to AggressionType.
+        ctxInput.ssotAggression = AMT::MapAMTActivityToLegacy(
+            st->lastStateEvidence.activity.activityType);
+        ctxInput.ssotAggressionValid = st->lastStateEvidence.activity.valid;
+
         // --- Environment inputs ---
         ctxInput.barRangeTicks = curBarRangeTicks;  // Use pre-computed value (DRY)
 
@@ -8759,16 +9054,15 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
             // Copy shape fields from ProfileStructureResult to context
             newCtx.rawShape = structResult.rawShape;
 
-            // Log shape classification failure (rate-limited)
+            // Log shape classification failure (rate-limited, per-instance via StudyState)
             if (!structResult.rawShapeValid && structResult.thresholdsComputed && diagLevel >= 2) {
-                static int lastShapeFailLogBar = -100;
-                if (curBarIdx - lastShapeFailLogBar >= 100) {
+                if (curBarIdx - st->diagLastShapeFailLogBar >= 100) {
                     SCString failMsg;
                     failMsg.Format("ProfileShape: RAW=UNDEFINED (error=%s resolution=%s)",
                         AMT::ShapeErrorToString(structResult.shapeError),
                         structResult.shapeResolution);
                     st->logManager.LogDebug(curBarIdx, failMsg.GetChars(), LogCategory::AMT);
-                    lastShapeFailLogBar = curBarIdx;
+                    st->diagLastShapeFailLogBar = curBarIdx;
                 }
             }
         }
@@ -9087,19 +9381,15 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
     }
 
     // ========================================================================
-    // RAW STATE FROM CONTEXT (SSOT)
+    // RAW STATE FROM DALTON ENGINE (SSOT)
     // ========================================================================
-    // rawState is computed from phase directional + extreme delta
-    // P0 FIX: Two-stage classification with hysteresis
-    //   rawState: instantaneous (single-bar) detection with session validation
-    //   confirmedState: 5-bar confirmed state (drives scenario matching)
-    // NOTE: Use amtSnapshot.IsDirectional() directly - it checks phase without
-    // requiring phaseValid flag. amtContext.IsDirectional() was always false
-    // because phaseValid wasn't being set, causing 99%+ BALANCE bias.
-    const bool isTrending = amtSnapshot.IsDirectional();
-    AMT::AMTMarketState rawState = (isTrending || isExtremeDelta)
-        ? AMT::AMTMarketState::IMBALANCE
-        : AMT::AMTMarketState::BALANCE;
+    // SSOT UNIFICATION (Dec 2024): DaltonEngine.phase is the SINGLE authoritative
+    // source for Balance/Imbalance. It incorporates:
+    //   - 1TF/2TF pattern detection (rotation tracker)
+    //   - Extreme delta persistence validation (bar + session)
+    // The legacy rawState computation (isTrending || isExtremeDelta) is removed.
+    // confirmedState uses 5-bar hysteresis via MarketStateBucket (unchanged).
+    const AMT::AMTMarketState rawState = st->lastDaltonState.phase;
 
     // M0: Log-on-change arbitration decision (only in log window)
     // Enhanced with persistence-validated extreme delta decomposition

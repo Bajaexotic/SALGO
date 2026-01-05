@@ -1711,6 +1711,15 @@ public:
             result.pathLengthTicks = syntheticAggregator.GetPathLengthTicks(tickSize);
             result.netChangeTicks = syntheticAggregator.GetNetChangeTicks(tickSize);
 
+            // Query efficiency percentile from phase-aware baseline
+            if (result.efficiencyValid && effortStore != nullptr) {
+                const auto& bucket = effortStore->Get(currentPhase);
+                auto erPctile = bucket.synthetic_efficiency.TryPercentile(result.efficiencyRatio);
+                if (erPctile.valid) {
+                    result.efficiencyPercentile = erPctile.value;
+                }
+            }
+
             // chopSeverity = 1 - ER (when valid, else 0.5 = neutral)
             if (result.efficiencyValid) {
                 result.chopSeverity = 1.0 - result.efficiencyRatio;
