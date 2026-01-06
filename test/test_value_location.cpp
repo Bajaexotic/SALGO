@@ -106,7 +106,8 @@ void TestZoneClassification() {
                                      AMTMarketState::BALANCE);
         TEST_ASSERT(result.IsReady(), "AT_POC: Result should be ready");
         TEST_ASSERT(result.zone == ValueZone::AT_POC, "AT_POC: Should detect AT_POC zone");
-        TEST_ASSERT(result.location == ValueLocation::AT_POC, "AT_POC: Location should match");
+        TEST_ASSERT(result.IsAtPOC(), "AT_POC: IsAtPOC() should be true");
+        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::AT_POC, "AT_POC: Coarse location should match");
     }
 
     engine.ResetForSession();
@@ -119,7 +120,8 @@ void TestZoneClassification() {
                                      AMTMarketState::BALANCE);
         TEST_ASSERT(result.IsReady(), "AT_VAH: Result should be ready");
         TEST_ASSERT(result.zone == ValueZone::AT_VAH, "AT_VAH: Should detect AT_VAH zone");
-        TEST_ASSERT(result.location == ValueLocation::AT_VAH, "AT_VAH: Location should match");
+        TEST_ASSERT(result.IsAtVAH(), "AT_VAH: IsAtVAH() should be true");
+        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::AT_VAH, "AT_VAH: Coarse location should match");
     }
 
     engine.ResetForSession();
@@ -132,7 +134,8 @@ void TestZoneClassification() {
                                      AMTMarketState::BALANCE);
         TEST_ASSERT(result.IsReady(), "AT_VAL: Result should be ready");
         TEST_ASSERT(result.zone == ValueZone::AT_VAL, "AT_VAL: Should detect AT_VAL zone");
-        TEST_ASSERT(result.location == ValueLocation::AT_VAL, "AT_VAL: Location should match");
+        TEST_ASSERT(result.IsAtVAL(), "AT_VAL: IsAtVAL() should be true");
+        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::AT_VAL, "AT_VAL: Coarse location should match");
     }
 
     engine.ResetForSession();
@@ -145,7 +148,8 @@ void TestZoneClassification() {
                                      AMTMarketState::BALANCE);
         TEST_ASSERT(result.IsReady(), "UPPER_VALUE: Result should be ready");
         TEST_ASSERT(result.zone == ValueZone::UPPER_VALUE, "UPPER_VALUE: Should detect UPPER_VALUE zone");
-        TEST_ASSERT(result.location == ValueLocation::INSIDE_VALUE, "UPPER_VALUE: Location should be INSIDE_VALUE");
+        TEST_ASSERT(result.IsInsideValue(), "UPPER_VALUE: IsInsideValue() should be true");
+        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::INSIDE_VALUE, "UPPER_VALUE: Coarse location should be INSIDE_VALUE");
     }
 
     engine.ResetForSession();
@@ -158,7 +162,8 @@ void TestZoneClassification() {
                                      AMTMarketState::BALANCE);
         TEST_ASSERT(result.IsReady(), "LOWER_VALUE: Result should be ready");
         TEST_ASSERT(result.zone == ValueZone::LOWER_VALUE, "LOWER_VALUE: Should detect LOWER_VALUE zone");
-        TEST_ASSERT(result.location == ValueLocation::INSIDE_VALUE, "LOWER_VALUE: Location should be INSIDE_VALUE");
+        TEST_ASSERT(result.IsInsideValue(), "LOWER_VALUE: IsInsideValue() should be true");
+        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::INSIDE_VALUE, "LOWER_VALUE: Coarse location should be INSIDE_VALUE");
     }
 
     engine.ResetForSession();
@@ -171,7 +176,8 @@ void TestZoneClassification() {
                                      AMTMarketState::BALANCE);
         TEST_ASSERT(result.IsReady(), "NEAR_ABOVE: Result should be ready");
         TEST_ASSERT(result.zone == ValueZone::NEAR_ABOVE_VALUE, "NEAR_ABOVE: Should detect NEAR_ABOVE_VALUE zone");
-        TEST_ASSERT(result.location == ValueLocation::ABOVE_VALUE, "NEAR_ABOVE: Location should be ABOVE_VALUE");
+        TEST_ASSERT(result.IsAboveValue(), "NEAR_ABOVE: IsAboveValue() should be true");
+        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::ABOVE_VALUE, "NEAR_ABOVE: Coarse location should be ABOVE_VALUE");
     }
 
     engine.ResetForSession();
@@ -184,7 +190,9 @@ void TestZoneClassification() {
                                      AMTMarketState::BALANCE);
         TEST_ASSERT(result.IsReady(), "FAR_ABOVE: Result should be ready");
         TEST_ASSERT(result.zone == ValueZone::FAR_ABOVE_VALUE, "FAR_ABOVE: Should detect FAR_ABOVE_VALUE zone");
-        TEST_ASSERT(result.location == ValueLocation::ABOVE_VALUE, "FAR_ABOVE: Location should be ABOVE_VALUE");
+        TEST_ASSERT(result.IsAboveValue(), "FAR_ABOVE: IsAboveValue() should be true");
+        TEST_ASSERT(result.IsFarOutside(), "FAR_ABOVE: IsFarOutside() should be true");
+        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::ABOVE_VALUE, "FAR_ABOVE: Coarse location should be ABOVE_VALUE");
     }
 
     engine.ResetForSession();
@@ -197,7 +205,9 @@ void TestZoneClassification() {
                                      AMTMarketState::BALANCE);
         TEST_ASSERT(result.IsReady(), "FAR_BELOW: Result should be ready");
         TEST_ASSERT(result.zone == ValueZone::FAR_BELOW_VALUE, "FAR_BELOW: Should detect FAR_BELOW_VALUE zone");
-        TEST_ASSERT(result.location == ValueLocation::BELOW_VALUE, "FAR_BELOW: Location should be BELOW_VALUE");
+        TEST_ASSERT(result.IsBelowValue(), "FAR_BELOW: IsBelowValue() should be true");
+        TEST_ASSERT(result.IsFarOutside(), "FAR_BELOW: IsFarOutside() should be true");
+        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::BELOW_VALUE, "FAR_BELOW: Coarse location should be BELOW_VALUE");
     }
 
     std::cout << "Zone classification tests complete\n";

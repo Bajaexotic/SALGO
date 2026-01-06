@@ -365,74 +365,22 @@ inline const char* ThinTapeTypeToString(ThinTapeType t) {
 //   - Outside value: sustained delta expected (discovery/acceptance)
 // ============================================================================
 
-enum class ValueZoneSimple : int {
-    UNKNOWN = 0,
-    IN_VALUE,           // Between VAH and VAL
-    AT_VALUE_EDGE,      // At or near VAH/VAL (within tolerance)
-    OUTSIDE_VALUE,      // Beyond VAH or VAL
-    IN_DISCOVERY        // Far outside value, sustained move
-};
-
-inline const char* ValueZoneSimpleToString(ValueZoneSimple z) {
-    switch (z) {
-        case ValueZoneSimple::UNKNOWN:        return "UNKNOWN";
-        case ValueZoneSimple::IN_VALUE:       return "IN_VALUE";
-        case ValueZoneSimple::AT_VALUE_EDGE:  return "AT_EDGE";
-        case ValueZoneSimple::OUTSIDE_VALUE:  return "OUTSIDE";
-        case ValueZoneSimple::IN_DISCOVERY:   return "DISCOVERY";
-    }
-    return "?";
-}
-
 // ============================================================================
-// SSOT MAPPING: ValueZone (SSOT) -> ValueZoneSimple (simplified for delta)
+// VALUE ZONE (9-state from SSOT)
 // ============================================================================
-// ValueZone is the SSOT from ValueLocationEngine (9 states).
-// ValueZoneSimple is a simplified 5-state representation for delta interpretation.
-// This mapping ensures DeltaEngine consumes from SSOT rather than computing its own.
-
-inline ValueZoneSimple MapValueZoneToSimple(ValueZone zone) {
-    switch (zone) {
-        // POC and value interior -> IN_VALUE
-        case ValueZone::AT_POC:
-        case ValueZone::UPPER_VALUE:
-        case ValueZone::LOWER_VALUE:
-            return ValueZoneSimple::IN_VALUE;
-
-        // Value edges -> AT_VALUE_EDGE
-        case ValueZone::AT_VAH:
-        case ValueZone::AT_VAL:
-            return ValueZoneSimple::AT_VALUE_EDGE;
-
-        // Near outside -> OUTSIDE_VALUE
-        case ValueZone::NEAR_ABOVE_VALUE:
-        case ValueZone::NEAR_BELOW_VALUE:
-            return ValueZoneSimple::OUTSIDE_VALUE;
-
-        // Far outside -> IN_DISCOVERY
-        case ValueZone::FAR_ABOVE_VALUE:
-        case ValueZone::FAR_BELOW_VALUE:
-            return ValueZoneSimple::IN_DISCOVERY;
-
-        default:
-            return ValueZoneSimple::UNKNOWN;
-    }
-}
+// ValueZone is the SSOT from ValueLocationEngine (defined in AMT_ValueLocation.h).
+// DeltaEngine uses the full 9-state for direction-aware interpretation.
+// The 5-state ValueZoneSimple has been removed - directional information matters.
+// ============================================================================
 
 struct DeltaLocationContext {
-    // Zone classification (simplified for delta interpretation)
-    ValueZoneSimple zone = ValueZoneSimple::UNKNOWN;
+    // Zone classification - full 9-state for direction-aware interpretation
+    ValueZone zone = ValueZone::UNKNOWN;
 
     // Distance from key levels (in ticks, signed: + = above, - = below)
     double distanceFromPOCTicks = 0.0;
     double distanceFromVAHTicks = 0.0;
     double distanceFromVALTicks = 0.0;
-
-    // Convenience flags
-    bool isInValue = false;          // Between VAH and VAL
-    bool isAtEdge = false;           // At VAH or VAL (within tolerance)
-    bool isOutsideValue = false;     // Beyond VAH or below VAL
-    bool isInDiscovery = false;      // Far outside + sustained
 
     // Migration context (is value moving toward or away from price?)
     bool isMigratingTowardPrice = false;  // POC moving toward current price
@@ -445,6 +393,47 @@ struct DeltaLocationContext {
 
     // Validity
     bool isValid = false;
+
+    // =========================================================================
+    // ZONE HELPER METHODS (replace stored bools - derived from zone)
+    // =========================================================================
+
+    bool IsInValue() const {
+        return zone == ValueZone::AT_POC ||
+               zone == ValueZone::UPPER_VALUE ||
+               zone == ValueZone::LOWER_VALUE;
+    }
+
+    bool IsAtEdge() const {
+        return zone == ValueZone::AT_VAH || zone == ValueZone::AT_VAL;
+    }
+
+    bool IsOutsideValue() const {
+        return zone == ValueZone::NEAR_ABOVE_VALUE ||
+               zone == ValueZone::NEAR_BELOW_VALUE;
+    }
+
+    bool IsInDiscovery() const {
+        return zone == ValueZone::FAR_ABOVE_VALUE ||
+               zone == ValueZone::FAR_BELOW_VALUE;
+    }
+
+    // Direction-aware helpers (new capability with 9-state)
+    bool IsAboveValue() const {
+        return zone == ValueZone::AT_VAH ||
+               zone == ValueZone::NEAR_ABOVE_VALUE ||
+               zone == ValueZone::FAR_ABOVE_VALUE;
+    }
+
+    bool IsBelowValue() const {
+        return zone == ValueZone::AT_VAL ||
+               zone == ValueZone::NEAR_BELOW_VALUE ||
+               zone == ValueZone::FAR_BELOW_VALUE;
+    }
+
+    bool IsAtPOC() const {
+        return zone == ValueZone::AT_POC;
+    }
 
     // =========================================================================
     // PREFERRED: Build from ValueLocationResult (SSOT-compliant)
@@ -464,20 +453,13 @@ struct DeltaLocationContext {
             return ctx;
         }
 
-        // Map SSOT ValueZone to simplified ValueZoneSimple
-        ctx.zone = MapValueZoneToSimple(valLocResult.confirmedZone);
+        // Copy zone directly from SSOT (full 9-state, no mapping)
+        ctx.zone = valLocResult.confirmedZone;
 
         // Copy distances from SSOT
         ctx.distanceFromPOCTicks = valLocResult.distFromPOCTicks;
         ctx.distanceFromVAHTicks = valLocResult.distFromVAHTicks;
         ctx.distanceFromVALTicks = valLocResult.distFromVALTicks;
-
-        // Set convenience flags based on zone
-        ctx.isInValue = (ctx.zone == ValueZoneSimple::IN_VALUE);
-        ctx.isAtEdge = (ctx.zone == ValueZoneSimple::AT_VALUE_EDGE);
-        ctx.isOutsideValue = (ctx.zone == ValueZoneSimple::OUTSIDE_VALUE ||
-                              ctx.zone == ValueZoneSimple::IN_DISCOVERY);
-        ctx.isInDiscovery = (ctx.zone == ValueZoneSimple::IN_DISCOVERY);
 
         // Migration context from SSOT
         ctx.isMigratingTowardPrice = (valLocResult.valueMigration == ValueMigration::HIGHER &&
@@ -531,35 +513,36 @@ struct DeltaLocationContext {
         ctx.distanceFromVAHTicks = (currentPrice - vah) / tickSize;
         ctx.distanceFromVALTicks = (currentPrice - val) / tickSize;
 
-        // Classify zone
+        // Classify zone using full 9-state ValueZone
         double distFromVAH = std::abs(ctx.distanceFromVAHTicks);
         double distFromVAL = std::abs(ctx.distanceFromVALTicks);
+        double distFromPOC = std::abs(ctx.distanceFromPOCTicks);
 
         if (distFromVAH <= edgeToleranceTicks) {
-            ctx.zone = ValueZoneSimple::AT_VALUE_EDGE;
-            ctx.isAtEdge = true;
+            ctx.zone = ValueZone::AT_VAH;
         } else if (distFromVAL <= edgeToleranceTicks) {
-            ctx.zone = ValueZoneSimple::AT_VALUE_EDGE;
-            ctx.isAtEdge = true;
+            ctx.zone = ValueZone::AT_VAL;
         } else if (currentPrice > vah) {
             if (ctx.distanceFromVAHTicks > discoveryThresholdTicks) {
-                ctx.zone = ValueZoneSimple::IN_DISCOVERY;
-                ctx.isInDiscovery = true;
+                ctx.zone = ValueZone::FAR_ABOVE_VALUE;
             } else {
-                ctx.zone = ValueZoneSimple::OUTSIDE_VALUE;
+                ctx.zone = ValueZone::NEAR_ABOVE_VALUE;
             }
-            ctx.isOutsideValue = true;
         } else if (currentPrice < val) {
             if (std::abs(ctx.distanceFromVALTicks) > discoveryThresholdTicks) {
-                ctx.zone = ValueZoneSimple::IN_DISCOVERY;
-                ctx.isInDiscovery = true;
+                ctx.zone = ValueZone::FAR_BELOW_VALUE;
             } else {
-                ctx.zone = ValueZoneSimple::OUTSIDE_VALUE;
+                ctx.zone = ValueZone::NEAR_BELOW_VALUE;
             }
-            ctx.isOutsideValue = true;
         } else {
-            ctx.zone = ValueZoneSimple::IN_VALUE;
-            ctx.isInValue = true;
+            // Inside value - distinguish POC from upper/lower regions
+            if (distFromPOC <= edgeToleranceTicks) {
+                ctx.zone = ValueZone::AT_POC;
+            } else if (currentPrice > poc) {
+                ctx.zone = ValueZone::UPPER_VALUE;
+            } else {
+                ctx.zone = ValueZone::LOWER_VALUE;
+            }
         }
 
         // Migration context
@@ -918,19 +901,32 @@ struct DeltaResult {
     }
 
     bool IsInValue() const {
-        return location.isValid && location.zone == ValueZoneSimple::IN_VALUE;
+        return location.isValid && location.IsInValue();
     }
 
     bool IsAtValueEdge() const {
-        return location.isValid && location.zone == ValueZoneSimple::AT_VALUE_EDGE;
+        return location.isValid && location.IsAtEdge();
     }
 
     bool IsOutsideValue() const {
-        return location.isValid && location.zone == ValueZoneSimple::OUTSIDE_VALUE;
+        return location.isValid && location.IsOutsideValue();
     }
 
     bool IsInDiscovery() const {
-        return location.isValid && location.zone == ValueZoneSimple::IN_DISCOVERY;
+        return location.isValid && location.IsInDiscovery();
+    }
+
+    // Direction-aware accessors (new with 9-state)
+    bool IsAboveValue() const {
+        return location.isValid && location.IsAboveValue();
+    }
+
+    bool IsBelowValue() const {
+        return location.isValid && location.IsBelowValue();
+    }
+
+    bool IsAtPOC() const {
+        return location.isValid && location.IsAtPOC();
     }
 
     // =========================================================================
@@ -1819,7 +1815,7 @@ private:
         // Outside value: Sustained delta is more significant (acceptance/rejection)
         // In value: Delta signals are less decisive (rotation expected)
 
-        if (loc.zone == ValueZoneSimple::AT_VALUE_EDGE) {
+        if (loc.IsAtEdge()) {
             // At VAH/VAL: Divergence signals absorption, may indicate reversal
             if (result.IsDiverging()) {
                 // Boost divergence significance at edges
@@ -1830,7 +1826,7 @@ private:
                 result.absorptionScore = (std::min)(result.absorptionScore, 1.0);
             }
         }
-        else if (loc.zone == ValueZoneSimple::OUTSIDE_VALUE) {
+        else if (loc.IsOutsideValue()) {
             // Outside value: Convergent delta supports acceptance
             // Sustained + aligned = stronger acceptance signal
             if (result.IsAligned() && result.IsSustained()) {
@@ -1838,7 +1834,7 @@ private:
                 result.constraints.allowContinuation = true;
             }
         }
-        else if (loc.zone == ValueZoneSimple::IN_DISCOVERY) {
+        else if (loc.IsInDiscovery()) {
             // Discovery zone: High-conviction signals only
             // Require stronger delta for action
             if (!result.IsSustained() || !result.IsAligned()) {
@@ -1846,7 +1842,7 @@ private:
                 result.constraints.positionSizeMultiplier *= 0.75;
             }
         }
-        else if (loc.zone == ValueZoneSimple::IN_VALUE) {
+        else if (loc.IsInValue()) {
             // Inside value: Expect rotation, delta less decisive
             // Breakout signals need extra confirmation
             result.constraints.requireDeltaAlignment = true;
@@ -1867,12 +1863,12 @@ private:
         double rotation = 0.0;
 
         // Base case: In value area, rotation is default
-        if (loc.zone == ValueZoneSimple::IN_VALUE) {
+        if (loc.IsInValue()) {
             rotation = 0.6;
             acceptance = 0.2;
             rejection = 0.2;
         }
-        else if (loc.zone == ValueZoneSimple::AT_VALUE_EDGE) {
+        else if (loc.IsAtEdge()) {
             // At edge: Outcome depends on delta character and alignment
 
             if (result.IsDiverging()) {
@@ -1900,7 +1896,7 @@ private:
                 rejection = 0.25;
             }
         }
-        else if (loc.zone == ValueZoneSimple::OUTSIDE_VALUE) {
+        else if (loc.IsOutsideValue()) {
             // Outside value: Acceptance vs rejection decision point
 
             if (result.IsAligned() && result.IsSustained()) {
@@ -1922,7 +1918,7 @@ private:
                 rotation = 0.30;
             }
         }
-        else if (loc.zone == ValueZoneSimple::IN_DISCOVERY) {
+        else if (loc.IsInDiscovery()) {
             // Discovery zone: Far outside value
 
             if (result.IsAligned() && result.IsSustained() && !result.IsFading()) {

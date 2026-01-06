@@ -32,44 +32,19 @@ void check(bool condition, const char* testName) {
 }
 
 // Helper to create a valid ValueLocationResult for testing
+// NOTE: zone is SSOT - helpers (IsInsideValue, etc.) derive all state from zone
 AMT::ValueLocationResult createMockValueLocationResult(
     AMT::ValueZone zone,
     double distPOC = 0.0, double distVAH = 0.0, double distVAL = 0.0)
 {
     AMT::ValueLocationResult result;
     result.confirmedZone = zone;
-    result.zone = zone;
+    result.zone = zone;  // SSOT for location classification
     result.distFromPOCTicks = distPOC;
     result.distFromVAHTicks = distVAH;
     result.distFromVALTicks = distVAL;
     result.errorReason = AMT::ValueLocationErrorReason::NONE;  // Makes IsReady() true
-
-    // Set location field to match zone (for IsInsideValue() etc to work correctly)
-    switch (zone) {
-        case AMT::ValueZone::UPPER_VALUE:
-        case AMT::ValueZone::LOWER_VALUE:
-        case AMT::ValueZone::AT_POC:
-            result.location = AMT::ValueLocation::INSIDE_VALUE;
-            break;
-        case AMT::ValueZone::AT_VAH:
-            result.location = AMT::ValueLocation::AT_VAH;
-            break;
-        case AMT::ValueZone::AT_VAL:
-            result.location = AMT::ValueLocation::AT_VAL;
-            break;
-        case AMT::ValueZone::FAR_ABOVE_VALUE:
-        case AMT::ValueZone::NEAR_ABOVE_VALUE:
-            result.location = AMT::ValueLocation::ABOVE_VALUE;
-            break;
-        case AMT::ValueZone::FAR_BELOW_VALUE:
-        case AMT::ValueZone::NEAR_BELOW_VALUE:
-            result.location = AMT::ValueLocation::BELOW_VALUE;
-            break;
-        default:
-            result.location = AMT::ValueLocation::INSIDE_VALUE;
-            break;
-    }
-
+    // NOTE: location field is deprecated - helpers use zone (SSOT) only
     return result;
 }
 
