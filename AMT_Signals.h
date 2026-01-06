@@ -153,8 +153,8 @@ public:
         // 4. Store volume conviction (clamped to [0, 2])
         result.volumeConviction = (std::max)(0.0, (std::min)(2.0, volumeConviction));
 
-        // 5. Use SSOT location directly (map from ValueZone to ValueLocation)
-        result.location = valLocResult.location;
+        // 5. Derive coarse location from SSOT zone
+        result.location = valLocResult.GetCoarseLocation();
 
         // 6. Determine Intent using SSOT POC distance
         const double poc = price - (valLocResult.distFromPOCTicks * tickSize);

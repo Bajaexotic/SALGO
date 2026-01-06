@@ -7262,8 +7262,8 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
 
                             // Define "level" based on value area relationship
                             // If outside value area, we're at a "new" level to track
-                            const bool outsideVA = (st->lastDaltonState.location == AMT::ValueLocation::ABOVE_VALUE ||
-                                                    st->lastDaltonState.location == AMT::ValueLocation::BELOW_VALUE);
+                            // Use ValueLocationResult SSOT helper instead of DaltonState.location
+                            const bool outsideVA = st->lastValueLocationResult.IsOutsideValue();
 
                             // Determine current level anchor (use close for simplicity)
                             // Reset tracking if level changed significantly (> 4 ticks)
