@@ -996,6 +996,10 @@ enum class ZoneType : int {
     SESSION_HIGH = 12,
     SESSION_LOW = 13,
 
+    // Overnight (GLOBEX) structure
+    GLOBEX_HIGH = 15,
+    GLOBEX_LOW = 16,
+
     // Benchmark
     VWAP = 14,
 
@@ -1341,6 +1345,9 @@ inline const char* ZoneTypeToString(ZoneType type) {
         case ZoneType::IB_LOW: return "IB_LOW";
         case ZoneType::SESSION_HIGH: return "SESSION_HIGH";
         case ZoneType::SESSION_LOW: return "SESSION_LOW";
+        // Overnight (GLOBEX) structure
+        case ZoneType::GLOBEX_HIGH: return "GLOBEX_HIGH";
+        case ZoneType::GLOBEX_LOW: return "GLOBEX_LOW";
         // VWAP
         case ZoneType::VWAP: return "VWAP";
         default: return "NONE";

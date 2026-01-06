@@ -34,6 +34,8 @@ inline ZoneRole DeriveRoleFromType(ZoneType type) {
         case ZoneType::IB_LOW:
         case ZoneType::SESSION_HIGH:
         case ZoneType::SESSION_LOW:
+        case ZoneType::GLOBEX_HIGH:
+        case ZoneType::GLOBEX_LOW:
             return ZoneRole::RANGE_BOUNDARY;
 
         case ZoneType::VWAP:
@@ -65,6 +67,8 @@ inline AnchorMechanism DeriveMechanismFromType(ZoneType type) {
         case ZoneType::IB_LOW:
         case ZoneType::SESSION_HIGH:
         case ZoneType::SESSION_LOW:
+        case ZoneType::GLOBEX_HIGH:
+        case ZoneType::GLOBEX_LOW:
             return AnchorMechanism::TIME_RANGE;
 
         case ZoneType::VWAP:

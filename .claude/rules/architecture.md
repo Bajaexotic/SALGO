@@ -136,3 +136,61 @@ amt_core.h
 | `DeltaHistoryTracker` | AMT_DeltaEngine.h (rolling window for character/alignment hysteresis) |
 | `DomHistoryBuffer` | AMT_DomEvents.h (session-scoped circular buffer for DOM time-series, owned by LiquidityEngine) |
 | `DomDetectionResult` | AMT_DomEvents.h (DOM patterns detected from time-series: control patterns + events) |
+
+---
+
+## Value Location SSOT Hierarchy
+
+**`ValueLocationEngine`** is the Single Source of Truth for all value-relative location classification.
+
+```
+ValueLocationEngine (SSOT)
+         │
+         ▼
+    ValueZone (9 states) ─────────────────────────────────────────┐
+         │                                                         │
+         ├──► ValueLocation (6 states) ← ZoneToLocation() mapping  │
+         │         └──► DaltonState.location                       │
+         │         └──► ActivityClassification.location            │
+         │                                                         │
+         ├──► ValueZoneSimple (5 states) ← MapValueZoneToSimple()  │
+         │         └──► DeltaLocationContext.zone                  │
+         │                                                         │
+         └──► ValueZone (direct) ─────────────────────────────────┘
+                   └──► DomPatternContext.valueZone
+                   └──► Liq3Result.spatialValueZone
+```
+
+### Enum Granularities
+
+| Enum | States | Purpose |
+|------|--------|---------|
+| `ValueZone` | 9 | Fine-grained SSOT (FAR_ABOVE, NEAR_ABOVE, AT_VAH, UPPER, AT_POC, LOWER, AT_VAL, NEAR_BELOW, FAR_BELOW) |
+| `ValueLocation` | 6 | Coarse classification for high-level decisions (INSIDE, ABOVE, BELOW, AT_POC, AT_VAH, AT_VAL) |
+| `ValueZoneSimple` | 5 | Delta-specific simplification (IN_VALUE, AT_VALUE_EDGE, OUTSIDE_VALUE, IN_DISCOVERY) |
+
+### SSOT Consumer Pattern
+
+All consumers MUST use `BuildFromValueLocation()` or equivalent SSOT-consuming methods:
+
+```cpp
+// CORRECT: Consume from SSOT
+auto locCtx = DeltaLocationContext::BuildFromValueLocation(st->lastValueLocationResult);
+auto domCtx = DomPatternContext::BuildFromValueLocation(st->lastValueLocationResult, ...);
+auto activity = classifier.ClassifyFromValueLocation(st->lastValueLocationResult, ...);
+
+// DEPRECATED: Computes own location (bypasses SSOT)
+auto locCtx = DeltaLocationContext::Build(price, poc, vah, val, ...);  // [[deprecated]]
+auto domCtx = DomPatternContext::Build(price, poc, vah, val, ...);     // [[deprecated]]
+auto activity = classifier.Classify(price, prevPrice, poc, vah, val, ...);  // [[deprecated]]
+```
+
+### Orchestration Order
+
+The orchestrator (AuctionSensor) MUST call `ValueLocationEngine` first, then pass `ValueLocationResult` to all downstream engines:
+
+1. `ValueLocationEngine.Compute()` → `lastValueLocationResult` (SSOT)
+2. `DeltaEngine.Compute()` with `BuildFromValueLocation()`
+3. `ActivityClassifier.ClassifyFromValueLocation()`
+4. `LiquidityEngine` spatial patterns with `BuildPatternContextFromValueLocation()`
+5. Other engines consume location from step 1

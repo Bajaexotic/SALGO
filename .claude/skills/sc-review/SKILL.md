@@ -1,3 +1,8 @@
+---
+name: sc-review
+description: Review code for Sierra Chart ACSIL protocol compliance and AMT Framework conventions. Use when checking code quality against SSOT contracts, Windows compatibility, and DRY patterns.
+---
+
 # Sierra Chart Code Review Skill
 
 Review code for Sierra Chart ACSIL protocol compliance and AMT Framework conventions.

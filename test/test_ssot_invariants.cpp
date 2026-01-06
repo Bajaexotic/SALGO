@@ -29,6 +29,7 @@
 #include "../AMT_Invariants.h"
 #include "../AMT_ProfileShape.h"
 #include "../AMT_DayType.h"
+#include "../AMT_Arbitration_Seam.h"
 
 // ============================================================================
 // TEST INFRASTRUCTURE
@@ -401,6 +402,120 @@ void test_invariant_helpers() {
     checkpoint.Reset();
     checkpoint.CheckPercentile(150.0, "test_pctl");  // Invalid
     CHECK(checkpoint.HasViolations(), "Checkpoint detected violation");
+}
+
+/**
+ * Test 8b: New AMT_Invariants.h validators (Jan 2025)
+ * Tests the new validators: ValidateRankRange, ValidateBarIndex,
+ * ValidateSessionExtremes, ValidatePhaseBucketIndex
+ */
+void test_new_invariant_validators() {
+    std::cout << "\n--- Test: New AMT_Invariants.h Validators (Jan 2025) ---\n";
+
+    // ValidateRankRange - [0.0, 1.0]
+    CHECK(AMT::ValidateRankRange(0.0), "Rank 0.0 valid");
+    CHECK(AMT::ValidateRankRange(0.5), "Rank 0.5 valid");
+    CHECK(AMT::ValidateRankRange(1.0), "Rank 1.0 valid");
+    CHECK(!AMT::ValidateRankRange(-0.01), "Rank -0.01 invalid");
+    CHECK(!AMT::ValidateRankRange(1.01), "Rank 1.01 invalid");
+    CHECK(!AMT::ValidateRankRange(-1.0), "Rank -1.0 invalid");
+    CHECK(!AMT::ValidateRankRange(2.0), "Rank 2.0 invalid");
+
+    // ValidateBarIndex - [0, maxExpected]
+    CHECK(AMT::ValidateBarIndex(0), "Bar index 0 valid");
+    CHECK(AMT::ValidateBarIndex(100), "Bar index 100 valid");
+    CHECK(AMT::ValidateBarIndex(1000000), "Bar index 1000000 valid (default max)");
+    CHECK(!AMT::ValidateBarIndex(-1), "Bar index -1 invalid");
+    CHECK(!AMT::ValidateBarIndex(-100), "Bar index -100 invalid");
+    CHECK(!AMT::ValidateBarIndex(1000001), "Bar index 1000001 invalid (exceeds default max)");
+
+    // ValidateBarIndex with custom max
+    CHECK(AMT::ValidateBarIndex(500, 1000), "Bar index 500 valid (max=1000)");
+    CHECK(AMT::ValidateBarIndex(1000, 1000), "Bar index 1000 valid (at max)");
+    CHECK(!AMT::ValidateBarIndex(1001, 1000), "Bar index 1001 invalid (exceeds max=1000)");
+
+    // ValidateSessionExtremes - high > low && both > 0
+    CHECK(AMT::ValidateSessionExtremes(6100.00, 6090.00), "Session extremes valid (high > low)");
+    CHECK(AMT::ValidateSessionExtremes(100.0, 99.0), "Session extremes valid (minimal spread)");
+    CHECK(!AMT::ValidateSessionExtremes(6090.00, 6100.00), "Session extremes invalid (high < low)");
+    CHECK(!AMT::ValidateSessionExtremes(6100.00, 6100.00), "Session extremes invalid (high == low)");
+    CHECK(!AMT::ValidateSessionExtremes(0.0, -10.0), "Session extremes invalid (high = 0)");
+    CHECK(!AMT::ValidateSessionExtremes(100.0, 0.0), "Session extremes invalid (low = 0)");
+    CHECK(!AMT::ValidateSessionExtremes(-10.0, -20.0), "Session extremes invalid (both negative)");
+
+    // ValidatePhaseBucketIndex - [0, bucketCount)
+    const int bucketCount = 7;  // EFFORT_BUCKET_COUNT
+    CHECK(AMT::ValidatePhaseBucketIndex(0, bucketCount), "Phase index 0 valid");
+    CHECK(AMT::ValidatePhaseBucketIndex(3, bucketCount), "Phase index 3 valid");
+    CHECK(AMT::ValidatePhaseBucketIndex(6, bucketCount), "Phase index 6 valid (max)");
+    CHECK(!AMT::ValidatePhaseBucketIndex(-1, bucketCount), "Phase index -1 invalid");
+    CHECK(!AMT::ValidatePhaseBucketIndex(7, bucketCount), "Phase index 7 invalid (>= count)");
+    CHECK(!AMT::ValidatePhaseBucketIndex(100, bucketCount), "Phase index 100 invalid");
+}
+
+/**
+ * Test 8c: New SSOTCheckpoint methods (Jan 2025)
+ * Tests CheckRank and CheckSessionExtremes
+ */
+void test_new_ssot_checkpoint_methods() {
+    std::cout << "\n--- Test: New SSOTCheckpoint Methods (Jan 2025) ---\n";
+
+    // CheckRank tests
+    {
+        AMT::SSOTCheckpoint checkpoint;
+
+        // Valid rank
+        checkpoint.CheckRank(0.5, "stressRank");
+        CHECK(!checkpoint.HasViolations(), "CheckRank valid rank no violation");
+
+        checkpoint.Reset();
+        checkpoint.CheckRank(0.0, "minRank");
+        CHECK(!checkpoint.HasViolations(), "CheckRank 0.0 valid");
+
+        checkpoint.Reset();
+        checkpoint.CheckRank(1.0, "maxRank");
+        CHECK(!checkpoint.HasViolations(), "CheckRank 1.0 valid");
+
+        // Invalid ranks
+        checkpoint.Reset();
+        checkpoint.CheckRank(-0.1, "negativeRank");
+        CHECK(checkpoint.HasViolations(), "CheckRank -0.1 detected violation");
+
+        checkpoint.Reset();
+        checkpoint.CheckRank(1.5, "overRank");
+        CHECK(checkpoint.HasViolations(), "CheckRank 1.5 detected violation");
+    }
+
+    // CheckSessionExtremes tests
+    {
+        AMT::SSOTCheckpoint checkpoint;
+
+        // Valid extremes
+        checkpoint.CheckSessionExtremes(6100.00, 6090.00);
+        CHECK(!checkpoint.HasViolations(), "CheckSessionExtremes valid no violation");
+
+        // Invalid extremes (high <= low)
+        checkpoint.Reset();
+        checkpoint.CheckSessionExtremes(6090.00, 6100.00);
+        CHECK(checkpoint.HasViolations(), "CheckSessionExtremes high < low detected");
+
+        checkpoint.Reset();
+        checkpoint.CheckSessionExtremes(6100.00, 6100.00);
+        CHECK(checkpoint.HasViolations(), "CheckSessionExtremes high == low detected");
+
+        // Invalid extremes (non-positive)
+        checkpoint.Reset();
+        checkpoint.CheckSessionExtremes(0.0, -10.0);
+        CHECK(checkpoint.HasViolations(), "CheckSessionExtremes zero high detected");
+    }
+
+    // Multiple violations accumulate
+    {
+        AMT::SSOTCheckpoint checkpoint;
+        checkpoint.CheckRank(1.5, "badRank1");
+        checkpoint.CheckRank(-0.5, "badRank2");
+        CHECK(checkpoint.violationCount >= 2, "Multiple violations accumulated");
+    }
 }
 
 // ============================================================================
@@ -779,9 +894,8 @@ void test_activity_classification_ssot() {
     CHECK(AMT::MapAMTActivityToLegacy(AMT::AMTActivityType::NEUTRAL) == AMT::AggressionType::NEUTRAL,
           "AMTActivityType::NEUTRAL -> AggressionType::NEUTRAL");
 
-    // UNKNOWN maps to NEUTRAL (conservative default)
-    CHECK(AMT::MapAMTActivityToLegacy(AMT::AMTActivityType::UNKNOWN) == AMT::AggressionType::NEUTRAL,
-          "AMTActivityType::UNKNOWN -> AggressionType::NEUTRAL");
+    // NOTE: AMTActivityType has no UNKNOWN value - it only has NEUTRAL/INITIATIVE/RESPONSIVE
+    // The enum is intentionally minimal to enforce proper classification
 
     std::cout << "  INVARIANT: Activity classification is SSOT from AMT_Signals.h\n";
     std::cout << "  INVARIANT: ContextBuilder consumes SSOT, does NOT compute delta-only\n";
@@ -802,7 +916,7 @@ void test_activity_classification_ssot() {
 void test_arbitration_seam_scope() {
     std::cout << "\n--- Test: ArbitrationSeam Scope (Delta Primitives Only) ---\n";
 
-    // Create valid input
+    // Create valid input (ArbitrationInput is at global scope, not AMT namespace)
     ArbitrationInput in;
     in.pocId = 1;
     in.vahId = 2;
@@ -857,6 +971,8 @@ int main() {
     test_tick_math_roundtrip();
     test_dry_violation_patterns();
     test_invariant_helpers();
+    test_new_invariant_validators();
+    test_new_ssot_checkpoint_methods();
 
     std::cout << "\n--- Circularity Tests (DayStructure vs ProfileShape) ---\n";
     test_daystructure_independence_from_shape();
@@ -891,6 +1007,10 @@ int main() {
     std::cout << "  10. RE acceptance counts CLOSE-based bars (not just extension bars)\n";
     std::cout << "  11. Activity classification SSOT (AMT_Signals.h, location-gated)\n";
     std::cout << "  12. ArbitrationSeam provides delta PRIMITIVES only (not activity)\n";
+    std::cout << "  13. Rank values in [0.0, 1.0] range (stressRank, spreadRank, etc.)\n";
+    std::cout << "  14. Bar indices in valid range [0, maxExpected]\n";
+    std::cout << "  15. Session extremes ordering (high > low, both positive)\n";
+    std::cout << "  16. Phase bucket indices in valid range [0, bucketCount)\n";
 
     return testsFailed > 0 ? 1 : 0;
 }

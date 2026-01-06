@@ -200,7 +200,7 @@ struct ZonePosture {
     // Structure tracking mode:
     // If false: structure levels are tracked/logged but NOT created as zones
     // If true: structure levels ARE created as zones (enables engagement tracking)
-    bool createStructureZones = false;  // Default: track only, don't create zones
+    bool createStructureZones = true;  // Enable structure zones for engagement tracking
 
     /**
      * Check if a zone type is allowed by current posture.
@@ -226,6 +226,8 @@ struct ZonePosture {
             case ZoneType::IB_LOW:
             case ZoneType::SESSION_HIGH:
             case ZoneType::SESSION_LOW:
+            case ZoneType::GLOBEX_HIGH:
+            case ZoneType::GLOBEX_LOW:
                 return enableStructure && createStructureZones;
 
             case ZoneType::VWAP:

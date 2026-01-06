@@ -59,6 +59,7 @@
 
 #include "amt_core.h"
 #include "AMT_Snapshots.h"
+#include "AMT_ValueLocation.h"  // For ValueLocationResult (SSOT)
 #include <algorithm>
 #include <cmath>
 #include <deque>
@@ -807,6 +808,8 @@ public:
     //   delta - Cumulative delta
     //   priorPOC, priorVAH, priorVAL - Prior session levels
     //
+    // DEPRECATED: Use ComputeFromValueLocation() for SSOT compliance
+    [[deprecated("Use ComputeFromValueLocation() with ValueLocationResult from ValueLocationEngine (SSOT)")]]
     VolumeAcceptanceResult Compute(
         // Price data (required)
         double close, double high, double low,
@@ -1046,6 +1049,65 @@ public:
         }
 
         return result;
+    }
+
+    // =========================================================================
+    // SSOT-COMPLIANT COMPUTE (Jan 2025)
+    // =========================================================================
+    //
+    // Preferred entry point. Consumes ValueLocationResult from ValueLocationEngine
+    // instead of receiving raw POC/VAH/VAL values. This ensures:
+    //   - Single source of truth for value-relative location
+    //   - Consistent VA overlap and acceptance calculations
+    //   - Pre-computed value migration available for acceptance detection
+    //
+    VolumeAcceptanceResult ComputeFromValueLocation(
+        const ValueLocationResult& valLocResult,
+        // Price data (required)
+        double close, double high, double low,
+        double tickSize, int barIndex,
+        // Volume data (required)
+        double totalVolume,
+        // Optional volume split
+        double bidVolume = 0.0, double askVolume = 0.0,
+        double delta = 0.0,
+        // Rate data (optional)
+        double volumePerSecond = 0.0
+    ) {
+        // Extract POC/VAH/VAL from SSOT result
+        double poc = 0.0, vah = 0.0, val = 0.0;
+        double priorPOC = 0.0, priorVAH = 0.0, priorVAL = 0.0;
+
+        if (valLocResult.IsReady()) {
+            // Derive prices from SSOT distance fields
+            poc = close - (valLocResult.distFromPOCTicks * tickSize);
+            vah = close - (valLocResult.distFromVAHTicks * tickSize);
+            val = close - (valLocResult.distFromVALTicks * tickSize);
+
+            // Prior levels from SSOT
+            priorPOC = close - (valLocResult.distToPriorPOCTicks * tickSize);
+            priorVAH = close - (valLocResult.distToPriorVAHTicks * tickSize);
+            priorVAL = close - (valLocResult.distToPriorVALTicks * tickSize);
+        }
+
+        // Suppress deprecation warning: SSOT method calling deprecated method is expected
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
+        // Delegate to full Compute() with extracted values
+        return Compute(
+            close, high, low,
+            tickSize, barIndex,
+            totalVolume,
+            bidVolume, askVolume, delta,
+            poc, vah, val,
+            priorPOC, priorVAH, priorVAL,
+            volumePerSecond
+        );
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
     }
 
     // =========================================================================

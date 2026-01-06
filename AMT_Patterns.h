@@ -81,6 +81,7 @@ enum class ImbalanceDeltaPattern : int
 
 enum class DOMControlPattern : int
 {
+    NONE = 0,                   // No pattern detected
     BUYERS_LIFTING_ASKS = 1,    // Aggressive Buy
     SELLERS_HITTING_BIDS = 2,   // Aggressive Sell
     LIQUIDITY_PULLING = 3,      // Weakness
@@ -90,6 +91,7 @@ enum class DOMControlPattern : int
 
 enum class DOMEvent : int
 {
+    NONE = 0,                   // No event detected
     LIQUIDITY_DISAPPEARANCE = 1,
     ORDER_FLOW_REVERSAL = 2,
     SWEEP_LIQUIDATION = 3,
@@ -744,6 +746,7 @@ inline const char* to_string(DOMControlPattern p)
 {
     switch (p)
     {
+    case DOMControlPattern::NONE:                  return "NONE";
     case DOMControlPattern::BUYERS_LIFTING_ASKS:   return "BUYERS_LIFT";
     case DOMControlPattern::SELLERS_HITTING_BIDS:  return "SELLERS_HIT";
     case DOMControlPattern::LIQUIDITY_PULLING:     return "LIQ_PULLING";
@@ -757,6 +760,7 @@ inline const char* to_string(DOMEvent e)
 {
     switch (e)
     {
+    case DOMEvent::NONE:                    return "NONE";
     case DOMEvent::LIQUIDITY_DISAPPEARANCE: return "LIQ_DISAPPEAR";
     case DOMEvent::ORDER_FLOW_REVERSAL:     return "FLOW_REVERSAL";
     case DOMEvent::SWEEP_LIQUIDATION:       return "SWEEP_LIQ";

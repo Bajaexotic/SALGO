@@ -521,6 +521,10 @@ struct StudyState
     // === PHASE 1B: DOM-AWARE DYNAMIC WIDTHS ===
     // Tracks legacy liqTicks for change detection; only updates AMT when changed
     int cachedAmtLiqTicks = 0;
+    // Tracks volatility regime for zone width adjustment
+    AMT::VolatilityRegime cachedVolRegimeForZones = AMT::VolatilityRegime::UNKNOWN;
+    // Tracks market state (1TF/2TF) for zone width adjustment
+    AMT::AMTMarketState cachedMarketStateForZones = AMT::AMTMarketState::UNKNOWN;
 
     // === PHASE 2: BASELINE INTEGRATION COUNTERS ===
     // Invariant: amtEngagementsFinalized == amtBaselineSamplesPushed
@@ -706,6 +710,11 @@ struct StudyState
         // resolutionPolicy uses defaults, no reset needed
         zoneContextSnapshot.Reset();
 
+        // Reset DOM-aware dynamic width cache (Phase 1B)
+        cachedAmtLiqTicks = 0;
+        cachedVolRegimeForZones = AMT::VolatilityRegime::UNKNOWN;
+        cachedMarketStateForZones = AMT::AMTMarketState::UNKNOWN;
+
         // Reset unified LogManager (handles all CSV files)
         logManager.Shutdown();
         amtPhaseHistory.clear();
@@ -887,6 +896,120 @@ static DepthMassHaloResult ComputeDepthMassHalo(
     // If totalMass is ~0, leave valid = false (don't push zeros)
 
     return result;
+}
+
+// ============================================================================
+// SPATIAL DOM SNAPSHOT CAPTURE (Per-Price-Level DOM Time-Series)
+// ============================================================================
+// Captures DOM depth at ±10 levels from reference price for spatial pattern
+// detection (spoofing, iceberg, wall breaking, flip detection).
+//
+// CRITICAL: Per-level DOM data is only available on LIVE BARS.
+// Historical bars use aggregate depth from c_ACSILDepthBars (different API).
+// ============================================================================
+static AMT::SpatialDomSnapshot CaptureSpatialDom(
+    SCStudyInterfaceRef sc,
+    double referencePrice,
+    double tickSize,
+    int64_t timestampMs,
+    int barIndex
+)
+{
+    AMT::SpatialDomSnapshot snapshot;
+    snapshot.timestampMs = timestampMs;
+    snapshot.barIndex = barIndex;
+    snapshot.referencePrice = referencePrice;
+    snapshot.tickSize = tickSize;
+
+    // Validate inputs
+    if (!IsValidPrice(referencePrice) || tickSize <= 0.0)
+    {
+        return snapshot;  // Invalid - all levels remain default (invalid=false)
+    }
+
+    const long long refTicks = PriceToTicks(referencePrice, tickSize);
+    s_MarketDepthEntry e;
+
+    // Get available levels from SC
+    const int bidLevels = sc.GetBidMarketDepthNumberOfLevels();
+    const int askLevels = sc.GetAskMarketDepthNumberOfLevels();
+
+    // Build a map of tick offset -> quantity for quick lookup
+    // Bid side: negative tick offsets (below reference)
+    std::map<int, double> bidByOffset;  // tickOffset -> quantity
+    std::map<int, double> askByOffset;  // tickOffset -> quantity
+
+    // Scan bid levels
+    for (int i = 0; i < bidLevels && i < AMT::SpatialDomConfig::TOTAL_LEVELS * 2; ++i)
+    {
+        if (sc.GetBidMarketDepthEntryAtLevel(e, i) && e.Quantity > 0)
+        {
+            const long long priceTicks = PriceToTicks(e.Price, tickSize);
+            const int offset = static_cast<int>(priceTicks - refTicks);
+
+            // Only include within our spatial range
+            if (offset >= -AMT::SpatialDomConfig::LEVELS_PER_SIDE &&
+                offset <= AMT::SpatialDomConfig::LEVELS_PER_SIDE)
+            {
+                bidByOffset[offset] = static_cast<double>(e.Quantity);
+            }
+        }
+    }
+
+    // Scan ask levels
+    for (int i = 0; i < askLevels && i < AMT::SpatialDomConfig::TOTAL_LEVELS * 2; ++i)
+    {
+        if (sc.GetAskMarketDepthEntryAtLevel(e, i) && e.Quantity > 0)
+        {
+            const long long priceTicks = PriceToTicks(e.Price, tickSize);
+            const int offset = static_cast<int>(priceTicks - refTicks);
+
+            // Only include within our spatial range
+            if (offset >= -AMT::SpatialDomConfig::LEVELS_PER_SIDE &&
+                offset <= AMT::SpatialDomConfig::LEVELS_PER_SIDE)
+            {
+                askByOffset[offset] = static_cast<double>(e.Quantity);
+            }
+        }
+    }
+
+    // Populate snapshot levels
+    // Bid levels: indices 0-9 (offsets -10 to -1, mapping to indices)
+    // Ask levels: indices 10-19 (offsets +1 to +10)
+    for (int i = 0; i < AMT::SpatialDomConfig::LEVELS_PER_SIDE; ++i)
+    {
+        // Bid: offset = -(LEVELS_PER_SIDE - i)  e.g., for i=0: -10, i=9: -1
+        const int bidOffset = -(AMT::SpatialDomConfig::LEVELS_PER_SIDE - i);
+        AMT::SpatialDomLevel& bidLevel = snapshot.levels[i];
+        bidLevel.tickOffset = bidOffset;
+        bidLevel.isBid = true;
+        auto bidIt = bidByOffset.find(bidOffset);
+        if (bidIt != bidByOffset.end())
+        {
+            bidLevel.quantity = bidIt->second;
+            bidLevel.isValid = true;
+            snapshot.totalBidQuantity += bidIt->second;
+            if (bidIt->second > snapshot.maxBidQuantity)
+                snapshot.maxBidQuantity = bidIt->second;
+        }
+
+        // Ask: offset = i + 1  e.g., for i=0: +1, i=9: +10
+        const int askOffset = i + 1;
+        AMT::SpatialDomLevel& askLevel = snapshot.levels[AMT::SpatialDomConfig::LEVELS_PER_SIDE + i];
+        askLevel.tickOffset = askOffset;
+        askLevel.isBid = false;
+        auto askIt = askByOffset.find(askOffset);
+        if (askIt != askByOffset.end())
+        {
+            askLevel.quantity = askIt->second;
+            askLevel.isValid = true;
+            snapshot.totalAskQuantity += askIt->second;
+            if (askIt->second > snapshot.maxAskQuantity)
+                snapshot.maxAskQuantity = askIt->second;
+        }
+    }
+
+    return snapshot;
 }
 
 // ============================================================================
@@ -3900,6 +4023,24 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
         const double closedAskVol = sc.AskVolume[closedBarIdx];  // Aggressive buys
         const double closedBidVol = sc.BidVolume[closedBarIdx];  // Aggressive sells
 
+        // ====================================================================
+        // Build LiquidityLocationContext for AMT-aware liquidity interpretation
+        // ====================================================================
+        // Uses previous bar's values for ValueLocation and Volatility (acceptable
+        // since these contexts change slowly and have hysteresis).
+        // Session/IB levels are current (from StructureTracker).
+        // Used by both ComputeSpatialProfileWithLocation and ComputeWithLocation.
+        // ====================================================================
+        const AMT::StructureTracker& structure = st->amtZoneManager.structure;
+        const AMT::LiquidityLocationContext liqLocCtx = AMT::LiquidityLocationContext::BuildFromValueLocation(
+            st->lastValueLocationResult,                           // SSOT: ValueLocationEngine (prev bar)
+            st->lastDaltonState.phase,                            // SSOT: DaltonEngine market state
+            st->lastVolResult.regime,                             // SSOT: VolatilityEngine (prev bar)
+            structure.GetSessionHigh(), structure.GetSessionLow(), // SSOT: StructureTracker
+            structure.GetIBHigh(), structure.GetIBLow(),          // SSOT: StructureTracker (frozen after IB)
+            refPrice, tickSize
+        );
+
         // Get historical market depth data via c_ACSILDepthBars
         c_ACSILDepthBars* p_DepthBars = sc.GetMarketDepthBars();
 
@@ -4053,11 +4194,13 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                     st->domWarmup.PushHalo(closedBarPhase, histHaloTotal, histHaloImbalance);
                 }
 
-                // Compute spatial liquidity profile (walls, voids, OBI, POLR)
-                st->lastSpatialProfile = st->liquidityEngine.ComputeSpatialProfile(
+                // Compute spatial liquidity profile with location context (walls, voids, OBI, POLR)
+                // Location context adjusts wall/void significance based on auction location
+                st->lastSpatialProfile = st->liquidityEngine.ComputeSpatialProfileWithLocation(
                     histBidLevels, histAskLevels,
                     refPrice, tickSize,
-                    curBarIdx
+                    curBarIdx,
+                    liqLocCtx  // AMT location context for significance adjustment
                 );
 
                 // Copy spatial summary to Liq3Result for downstream consumers
@@ -4126,7 +4269,8 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
         // Set phase BEFORE Compute() for phase-aware baseline queries (SSOT: DOMWarmup)
         st->liquidityEngine.SetPhase(closedBarPhase);
         if (st->domInputsValid && refPrice > 0.0 && tickSize > 0.0 && histDepthAvailable) {
-            st->lastLiqSnap = st->liquidityEngine.Compute(
+            // Use location-aware Compute for AMT context adjustments
+            st->lastLiqSnap = st->liquidityEngine.ComputeWithLocation(
                 refPrice,
                 tickSize,
                 maxLevels,
@@ -4135,6 +4279,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                 closedAskVol,
                 closedBidVol,
                 barDurationSec,
+                liqLocCtx,  // Location context (SSOT-derived)
                 savedHistBidAskValid ? savedHistSpreadTicks : -1.0  // Kyle's Tightness (spread in ticks)
                 // Note: consumed values passed as -1.0 (computed externally below)
             );
@@ -4259,6 +4404,21 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
             } else {
                 st->amtContext.confidence.liquidityAvailabilityValid = false;
             }
+
+            // SSOT Invariants: Validate LiquidityEngine output
+#if AMT_SSOT_ASSERTIONS
+            if (st->lastLiqSnap.liqValid) {
+                AMT_SSOT_ASSERT_RANGE(st->lastLiqSnap.stressRank, 0.0, 1.0, "LIQ stressRank");
+                AMT_SSOT_ASSERT_RANGE(st->lastLiqSnap.spreadRank, 0.0, 1.0, "LIQ spreadRank");
+                if (st->lastLiqSnap.peakValid) {
+                    AMT_SSOT_ASSERT(st->lastLiqSnap.peakDepthMass >= st->lastLiqSnap.depthMass,
+                                    "LIQ peak >= current depth");
+                }
+                if (st->lastLiqSnap.toxicityValid) {
+                    AMT_SSOT_ASSERT_RANGE(st->lastLiqSnap.toxicityProxy, 0.0, 1.0, "LIQ toxicity");
+                }
+            }
+#endif
         } else {
             // Pre-Compute validation failed - set specific error reason (F1/F2/F3/F4)
             st->lastLiqSnap = AMT::Liq3Result();
@@ -4354,6 +4514,16 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
         st->lastVolResult = st->volatilityEngine.ComputeFromRawBar(
             sc.High[curBarIdx], sc.Low[curBarIdx], sc.Close[curBarIdx],
             barDurationSec, tickSize, 0.0);
+
+        // SSOT Invariants: Validate VolatilityEngine output
+#if AMT_SSOT_ASSERTIONS
+        if (st->lastVolResult.IsReady()) {
+            AMT_SSOT_ASSERT(st->lastVolResult.regime != AMT::VolatilityRegime::UNKNOWN,
+                            "VOL regime not UNKNOWN when ready");
+            AMT_SSOT_ASSERT_RANGE(st->lastVolResult.confirmationProgress, 0.0, 1.0,
+                                  "VOL confirmationProgress");
+        }
+#endif
 
         // Populate synthetic baseline when a new synthetic bar forms
         // This happens every N raw bars (e.g., every 5 bars for 5-bar aggregation)
@@ -4460,23 +4630,46 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                                st->lastDaltonState.timeframe == AMT::TimeframePattern::ONE_TIME_FRAMING_DOWN);
 
             // ----------------------------------------------------------------
-            // LOCATION CONTEXT (value-relative)
+            // VALUE LOCATION (SSOT - compute first, all engines consume this)
             // ----------------------------------------------------------------
+            // ValueLocationEngine is the Single Source of Truth for value-relative
+            // location classification. Compute it BEFORE other engines so they
+            // can consume ValueLocationResult instead of duplicating logic.
             const double poc = st->sessionVolumeProfile.session_poc;
             const double vah = st->sessionVolumeProfile.session_vah;
             const double val = st->sessionVolumeProfile.session_val;
             const double priorPOC = st->amtZoneManager.sessionCtx.prior_poc;
+            const double priorVAH = st->amtZoneManager.sessionCtx.prior_vah;
+            const double priorVAL = st->amtZoneManager.sessionCtx.prior_val;
             const AMT::StructureTracker& structure = st->amtZoneManager.structure;
             const double sessionHigh = structure.GetSessionHigh();
             const double sessionLow = structure.GetSessionLow();
             const double ibHigh = structure.GetIBHigh();
             const double ibLow = structure.GetIBLow();
 
-            AMT::DeltaLocationContext locCtx = AMT::DeltaLocationContext::Build(
-                sc.Close[closedBarIdx], poc, vah, val, tickSize,
-                2.0,   // edgeToleranceTicks
-                8.0,   // discoveryThresholdTicks
-                sessionHigh, sessionLow, ibHigh, ibLow, priorPOC);
+            // Get HVN/LVN from session volume profile (may be empty)
+            const std::vector<double>* hvnLevels = st->sessionVolumeProfile.session_hvn.empty() ?
+                nullptr : &st->sessionVolumeProfile.session_hvn;
+            const std::vector<double>* lvnLevels = st->sessionVolumeProfile.session_lvn.empty() ?
+                nullptr : &st->sessionVolumeProfile.session_lvn;
+
+            // Set phase and compute ValueLocation (SSOT)
+            st->valueLocationEngine.SetPhase(closedBarPhase);
+            st->lastValueLocationResult = st->valueLocationEngine.Compute(
+                sc.Close[closedBarIdx], tickSize, closedBarIdx,
+                poc, vah, val,
+                priorPOC, priorVAH, priorVAL,
+                st->amtZoneManager.structure,
+                st->amtZoneManager,
+                hvnLevels, lvnLevels,
+                daltonState
+            );
+
+            // ----------------------------------------------------------------
+            // LOCATION CONTEXT (consume from SSOT)
+            // ----------------------------------------------------------------
+            AMT::DeltaLocationContext locCtx = AMT::DeltaLocationContext::BuildFromValueLocation(
+                st->lastValueLocationResult);
 
             // Set phase BEFORE Compute() for phase-aware baseline queries
             st->deltaEngine.SetPhase(closedBarPhase);
@@ -4502,6 +4695,18 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                 deltaInput, locCtx,
                 liqState, volRegime, stressRank,
                 daltonState, is1TF);
+
+            // SSOT Invariants: Validate DeltaEngine output
+#if AMT_SSOT_ASSERTIONS
+            if (st->lastDeltaResult.IsReady()) {
+                AMT_SSOT_ASSERT(st->lastDeltaResult.character != AMT::DeltaCharacter::UNKNOWN,
+                                "DELTA character not UNKNOWN when ready");
+                AMT_SSOT_ASSERT_RANGE(st->lastDeltaResult.barDeltaPctile, 0.0, 100.0,
+                                      "DELTA barDeltaPctile");
+                AMT_SSOT_ASSERT_RANGE(st->lastDeltaResult.sessionDeltaPctile, 0.0, 100.0,
+                                      "DELTA sessionDeltaPctile");
+            }
+#endif
 
             // Log-on-change for character transitions (rate-limited)
             if (isLiveBar && st->lastDeltaResult.IsReady()) {
@@ -4639,19 +4844,42 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
             // Set phase BEFORE Compute() for phase-aware baseline queries
             st->imbalanceEngine.SetPhase(closedBarPhase);
 
-            // Compute imbalance/displacement
-            st->lastImbalanceResult = st->imbalanceEngine.Compute(
+            // Get consumed excess from SSOT (ExcessDetector, Jan 2025)
+            const AMT::ExcessType consumedExcess = st->amtSignalEngine.GetExcessDetector().GetCombinedExcess();
+
+            // Get prior session levels from SSOT (DaltonEngine.SessionBridge, Jan 2025)
+            const AMT::SessionBridge& bridge = st->daltonEngine.GetSessionBridge();
+            const double priorPOC = bridge.valid ? bridge.priorRTHPOC : 0.0;
+            const double priorVAH = bridge.valid ? bridge.priorRTHVAH : 0.0;
+            const double priorVAL = bridge.valid ? bridge.priorRTHVAL : 0.0;
+
+            // Compute imbalance/displacement (SSOT: uses ValueLocationResult + ExcessType)
+            st->lastImbalanceResult = st->imbalanceEngine.ComputeFromValueLocation(
+                st->lastValueLocationResult,
                 high, low, close, open,
                 prevHigh, prevLow, prevClose,
                 tickSize, closedBarIdx,
-                poc, vah, val,
-                prevPOC, prevVAH, prevVAL,
                 diagPosDelta, diagNegDelta,
                 totalVolume, barDelta, cumDelta,
                 liqState, volRegime, execFriction,
                 ibHigh, ibLow, sessionHigh, sessionLow,
-                rotationFactor, is1TF
+                rotationFactor, is1TF,
+                -1.0, -1.0, -1.0,  // consumedBidMass, consumedAskMass, toxicityProxy (not wired)
+                -1.0, -1.0, -1.0, -1.0,  // nearestBidWallTicks, nearestAskWallTicks, nearestBidVoidTicks, nearestAskVoidTicks (not wired)
+                0,  // pathOfLeastResistance (not wired)
+                consumedExcess,  // SSOT consumed excess (Jan 2025)
+                priorPOC, priorVAH, priorVAL  // SSOT prior session levels (Jan 2025)
             );
+
+            // SSOT Invariants: Validate ImbalanceEngine output
+#if AMT_SSOT_ASSERTIONS
+            if (st->lastImbalanceResult.IsReady()) {
+                AMT_SSOT_ASSERT_RANGE(st->lastImbalanceResult.displacementScore, 0.0, 1.0,
+                                      "IMB displacementScore");
+                AMT_SSOT_ASSERT_RANGE(st->lastImbalanceResult.confidenceScore, 0.0, 1.0,
+                                      "IMB confidenceScore");
+            }
+#endif
 
             // Log-on-change for imbalance type transitions (rate-limited)
             if (isLiveBar && st->lastImbalanceResult.IsReady()) {
@@ -4739,15 +4967,22 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                 st->volumeAcceptanceEngine.SetPriorSessionLevels(priorPOC, priorVAH, priorVAL);
             }
 
-            // Compute volume acceptance/rejection
-            st->lastVolumeResult = st->volumeAcceptanceEngine.Compute(
+            // Compute volume acceptance/rejection (SSOT: uses ValueLocationResult)
+            st->lastVolumeResult = st->volumeAcceptanceEngine.ComputeFromValueLocation(
+                st->lastValueLocationResult,
                 close, high, low, tickSize, closedBarIdx,
                 totalVolume,
                 bidVolume, askVolume, delta,
-                poc, vah, val,
-                priorPOC, priorVAH, priorVAL,
                 volumePerSecond
             );
+
+            // SSOT Invariants: Validate VolumeAcceptanceEngine output
+#if AMT_SSOT_ASSERTIONS
+            if (st->lastVolumeResult.IsReady()) {
+                AMT_SSOT_ASSERT_RANGE(st->lastVolumeResult.confirmationMultiplier, 0.5, 1.5,
+                                      "VOLUME confirmationMultiplier");
+            }
+#endif
 
             // Log-on-change for acceptance state transitions (rate-limited)
             if (isLiveBar && st->lastVolumeResult.IsReady()) {
@@ -4796,53 +5031,21 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
     }
 
     // ========================================================================
-    // VALUE LOCATION ENGINE: Where am I relative to value and structure?
+    // VALUE LOCATION ENGINE: Validation and Logging
     // ========================================================================
-    // Answers 5 questions:
-    //   1. Where am I relative to value? (ValueZone classification)
-    //   2. Am I in balance or imbalance structurally? (VA overlap)
-    //   3. What session context applies? (Session phase, IB status)
-    //   4. What nearby reference levels matter? (Prior levels, IB, HVN/LVN)
-    //   5. How does location gate strategies? (Fade in value, breakout from balance)
-    // Uses CLOSED BAR data for temporal coherence with other engines.
-    // NOTE: closedBarIdx, closedBarPhase, tickSize computed above (DRY consolidation)
+    // NOTE: ValueLocationEngine.Compute() is called earlier in the DeltaEngine
+    // section (~line 4627) to ensure SSOT is available for all consumers.
+    // This block only handles validation and logging.
     {
         if (closedBarIdx >= 0) {
-            // Price data for closed bar
-            const double close = sc.Close[closedBarIdx];
-
-            // Profile levels (current session)
-            const double poc = st->sessionVolumeProfile.session_poc;
-            const double vah = st->sessionVolumeProfile.session_vah;
-            const double val = st->sessionVolumeProfile.session_val;
-
-            // Prior profile levels (for overlap calculation)
-            const double priorPOC = st->amtZoneManager.sessionCtx.prior_poc;
-            const double priorVAH = st->amtZoneManager.sessionCtx.prior_vah;
-            const double priorVAL = st->amtZoneManager.sessionCtx.prior_val;
-
-            // Set phase BEFORE Compute() for phase-aware processing
-            st->valueLocationEngine.SetPhase(closedBarPhase);
-
-            // Get market state from Dalton (1TF=IMBALANCE, 2TF=BALANCE)
-            const AMT::AMTMarketState marketState = st->lastDaltonState.phase;
-
-            // Get HVN/LVN from session volume profile (may be empty)
-            const std::vector<double>* hvnLevels = st->sessionVolumeProfile.session_hvn.empty() ?
-                nullptr : &st->sessionVolumeProfile.session_hvn;
-            const std::vector<double>* lvnLevels = st->sessionVolumeProfile.session_lvn.empty() ?
-                nullptr : &st->sessionVolumeProfile.session_lvn;
-
-            // Compute value location
-            st->lastValueLocationResult = st->valueLocationEngine.Compute(
-                close, tickSize, closedBarIdx,
-                poc, vah, val,
-                priorPOC, priorVAH, priorVAL,
-                st->amtZoneManager.structure,  // Delegate session/IB extremes
-                st->amtZoneManager,             // Delegate nearest zone lookup
-                hvnLevels, lvnLevels,
-                marketState
-            );
+            // SSOT Invariants: Validate ValueLocationEngine output
+#if AMT_SSOT_ASSERTIONS
+            if (st->lastValueLocationResult.IsReady()) {
+                // Distance from POC is SIGNED (+ above, - below) - just check it's finite
+                AMT_SSOT_ASSERT(std::isfinite(st->lastValueLocationResult.distFromPOCTicks),
+                                "VALUELOC distFromPOC is finite");
+            }
+#endif
 
             // Log-on-change for zone transitions (rate-limited)
             if (isLiveBar && st->lastValueLocationResult.IsReady()) {
@@ -5175,6 +5378,87 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
             else
             {
                 st->amtContext.confidence.domStrengthValid = false;
+            }
+
+            // =====================================================================
+            // SPATIAL DOM PATTERN DETECTION (LIVE BAR ONLY)
+            // =====================================================================
+            // Per-level DOM data is only available on live bars via SC API.
+            // Capture per-price-level snapshot for spoofing/iceberg/wall/flip detection.
+            // =====================================================================
+            if (isLiveBar && domSnap.hasAnyLevels())
+            {
+                // Get reference price (current close or midpoint)
+                const double refPrice = (st->currentSnapshot.liquidity.bestBid > 0.0 &&
+                                         st->currentSnapshot.liquidity.bestAsk > 0.0)
+                    ? (st->currentSnapshot.liquidity.bestBid + st->currentSnapshot.liquidity.bestAsk) / 2.0
+                    : sc.Close[curBarIdx];
+
+                // Capture spatial DOM snapshot
+                AMT::SpatialDomSnapshot spatialSnap = CaptureSpatialDom(
+                    sc, refPrice, tickSize, currentTimeMs, curBarIdx);
+
+                // Push to history buffer for time-series analysis
+                st->liquidityEngine.PushSpatialDomSnapshot(spatialSnap);
+
+                // Detect spatial patterns if we have enough history
+                if (st->liquidityEngine.HasSpatialDomMinSamples())
+                {
+                    const int windowMs = AMT::SpatialDomConfig::DEFAULT_WINDOW_MS;
+
+                    // Build auction context from ValueLocationEngine (SSOT) for context-aware pattern interpretation
+                    // Context adjusts significance based on WHERE in the auction patterns occur
+                    const AMT::AMTMarketState marketState = st->lastDaltonState.phase;
+
+                    // Get value migration from DaltonEngine
+                    const bool valueMigratingHigher = (st->lastDaltonState.valueMigration == AMT::ValueMigration::HIGHER);
+                    const bool valueMigratingLower = (st->lastDaltonState.valueMigration == AMT::ValueMigration::LOWER);
+
+                    // Build context from ValueLocationEngine output (SSOT-compliant)
+                    // ValueLocationEngine already computed zone, distances, etc. - don't duplicate
+                    const AMT::DomPatternContext ctx = AMT::LiquidityEngine::BuildPatternContextFromValueLocation(
+                        st->lastValueLocationResult, marketState,
+                        valueMigratingHigher, valueMigratingLower,
+                        false, false);  // priceRising/Falling not tracked yet
+
+                    AMT::SpatialDomPatternResult spatialResult =
+                        st->liquidityEngine.DetectAndCopySpatialPatterns(
+                            st->lastLiqSnap, refPrice, tickSize, ctx, windowMs);
+
+                    // Log spatial patterns (rate-limited)
+                    if (spatialResult.HasPatterns() && diagLevel >= 2)
+                    {
+                        if (st->liquidityEngine.ShouldLogSpatialPatterns(spatialResult, curBarIdx))
+                        {
+                            SCString spatialMsg;
+                            // Include context-aware significance in log output
+                            if (spatialResult.hasContext)
+                            {
+                                spatialMsg.Format("[SPATIAL-DOM] Bar %d | SPOOF=%d ICE=%d WALL=%d FLIP=%d | LOC=%s SIG=%.2f INTERP=%d | samples=%zu",
+                                    curBarIdx,
+                                    static_cast<int>(spatialResult.spoofingHits.size()),
+                                    static_cast<int>(spatialResult.icebergHits.size()),
+                                    static_cast<int>(spatialResult.wallBreakHits.size()),
+                                    static_cast<int>(spatialResult.flipHits.size()),
+                                    AMT::ValueZoneToString(spatialResult.appliedContext.valueZone),
+                                    spatialResult.GetMaxSignificance(),
+                                    static_cast<int>(spatialResult.GetDominantInterpretation()),
+                                    st->liquidityEngine.GetSpatialDomHistorySize());
+                            }
+                            else
+                            {
+                                spatialMsg.Format("[SPATIAL-DOM] Bar %d | SPOOF=%d ICE=%d WALL=%d FLIP=%d | samples=%zu",
+                                    curBarIdx,
+                                    static_cast<int>(spatialResult.spoofingHits.size()),
+                                    static_cast<int>(spatialResult.icebergHits.size()),
+                                    static_cast<int>(spatialResult.wallBreakHits.size()),
+                                    static_cast<int>(spatialResult.flipHits.size()),
+                                    st->liquidityEngine.GetSpatialDomHistorySize());
+                            }
+                            sc.AddMessageToLog(spatialMsg.GetChars(), 0);
+                        }
+                    }
+                }
             }
         }
         else
@@ -6689,7 +6973,8 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                 st->sessionMgr.GetVAH(),  // SSOT: vah from SessionManager
                 st->sessionMgr.GetVAL(),  // SSOT: val from SessionManager
                 st->sessionMgr.GetSessionStartBar(),  // SSOT: sessionStartBar from SessionManager
-                ssotThresholds);
+                ssotThresholds,
+                &st->lastValueLocationResult);  // SSOT: from ValueLocationEngine
         }
 
         // ========================================================================
@@ -6702,6 +6987,14 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
 
             // Update session extremes
             structure.UpdateExtremes(probeHigh, probeLow, currentBar);
+
+            // SSOT Invariant: Session extremes must be ordered high > low
+#if AMT_SSOT_ASSERTIONS
+            if (structure.GetSessionHigh() > 0.0 && structure.GetSessionLow() > 0.0) {
+                AMT_SSOT_ASSERT(structure.GetSessionHigh() > structure.GetSessionLow(),
+                                "Session extremes: high > low");
+            }
+#endif
 
             // ================================================================
             // EXTREME ACCEPTANCE TRACKER UPDATE (AMT-aligned)
@@ -6889,15 +7182,13 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                         // Determine session type for Dalton processing
                         const bool isGlobexSession = st->sessionMgr.IsGlobex();
 
-                        // Process bar through Dalton engine FIRST
-                        st->lastDaltonState = st->daltonEngine.ProcessBar(
+                        // Process bar through Dalton engine FIRST (using ValueLocationResult SSOT)
+                        st->lastDaltonState = st->daltonEngine.ProcessBarFromValueLocation(
+                            st->lastValueLocationResult,  // SSOT: ValueLocationResult
                             probeHigh,      // Bar high
                             probeLow,       // Bar low
                             probeClose,     // Bar close
                             prevPrice,      // Previous close
-                            poc,            // Point of Control
-                            vah,            // Value Area High
-                            val,            // Value Area Low
                             deltaPct,       // Bar delta as fraction of volume
                             sc.TickSize,    // Tick size
                             minutesFromOpen,// Minutes since RTH open
@@ -6907,6 +7198,18 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                             deltaCoherence,      // SSOT: Directional coherence
                             isGlobexSession      // NEW: Session type flag (Jan 2025)
                         );
+
+                        // SSOT Invariants: Validate DaltonEngine output
+#if AMT_SSOT_ASSERTIONS
+                        AMT_SSOT_ASSERT(st->lastDaltonState.phase == AMT::AMTMarketState::BALANCE ||
+                                        st->lastDaltonState.phase == AMT::AMTMarketState::IMBALANCE ||
+                                        st->lastDaltonState.phase == AMT::AMTMarketState::UNKNOWN,
+                                        "DALTON phase is valid enum");
+                        if (st->lastDaltonState.ibFrozen && st->lastDaltonState.ibHigh > 0.0) {
+                            AMT_SSOT_ASSERT(st->lastDaltonState.ibHigh > st->lastDaltonState.ibLow,
+                                            "DALTON IB high > low when frozen");
+                        }
+#endif
 
                         // ============================================================
                         // OPENING TYPE CLASSIFICATION (Jan 2025)
@@ -7087,11 +7390,11 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                     const double tailAtHigh = st->sessionVolumeProfile.GetTailAtExtreme(sessionHigh, poc);
                     const double tailAtLow = st->sessionVolumeProfile.GetTailAtExtreme(sessionLow, poc);
 
-                    // Process bar through signal engine (with Dalton state/phase as SSOT)
-                    AMT::StateEvidence evidence = st->amtSignalEngine.ProcessBar(
+                    // Process bar through signal engine (using ValueLocationResult SSOT)
+                    AMT::StateEvidence evidence = st->amtSignalEngine.ProcessBarFromValueLocation(
+                        st->lastValueLocationResult,  // SSOT: ValueLocationResult
                         probeClose,
                         prevPrice,
-                        poc, vah, val,
                         deltaPct,
                         sc.TickSize,
                         sessionHigh,
@@ -7215,6 +7518,17 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
             // Update range-adaptive thresholds (logging removed - too verbose)
             structure.UpdateAdaptiveThresholds(sc.TickSize, currentBar);
 
+            // Update structure zones (SESSION_HIGH/LOW, IB_HIGH/LOW, GLOBEX_HIGH/LOW) if enabled
+            // - SESSION extremes are DYNAMIC (recenter as new highs/lows made)
+            // - IB extremes are DYNAMIC until frozen, then static
+            // - GLOBEX extremes are STATIC (captured at RTH open, never update)
+            const AMT::SessionBridge& bridge = st->daltonEngine.GetSessionBridge();
+            const double globexHigh = bridge.valid ? bridge.overnight.onHigh : 0.0;
+            const double globexLow = bridge.valid ? bridge.overnight.onLow : 0.0;
+            AMT::UpdateStructureZones(st->amtZoneManager, sc.TickSize, probeBarTime,
+                                      currentBar, st->sessionMgr.IsRTH(),
+                                      globexHigh, globexLow);
+
             // ================================================================
             // DAY TYPE CLASSIFIER UPDATE (Phase 2)
             // ================================================================
@@ -7312,10 +7626,19 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                 sc.TickSize
             );
 
-            // Only update when liqTicks changes (avoid redundant updates)
-            if (st->cachedAmtLiqTicks != liqTicks) {
+            // Get volatility regime and market state for zone width adjustment
+            const AMT::VolatilityRegime volRegime = st->lastVolResult.IsReady()
+                ? st->lastVolResult.regime : AMT::VolatilityRegime::UNKNOWN;
+            const AMT::AMTMarketState mktState = daltonState;  // From Dalton SSOT
+
+            // Only update when liqTicks, volRegime, or mktState changes (avoid redundant updates)
+            if (st->cachedAmtLiqTicks != liqTicks ||
+                st->cachedVolRegimeForZones != volRegime ||
+                st->cachedMarketStateForZones != mktState) {
                 st->cachedAmtLiqTicks = liqTicks;
-                AMT::UpdateZoneDynamicWidths(*amtPOC, liqTicks, haloMult);
+                st->cachedVolRegimeForZones = volRegime;
+                st->cachedMarketStateForZones = mktState;
+                AMT::UpdateZoneDynamicWidths(*amtPOC, liqTicks, haloMult, volRegime, mktState);
             }
         }
 

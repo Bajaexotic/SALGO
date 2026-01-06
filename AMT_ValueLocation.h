@@ -79,6 +79,45 @@ inline const char* ValueZoneToString(ValueZone zone) {
     }
 }
 
+/**
+ * Map ValueZone (9 states) to ValueAreaRegion (5 states)
+ *
+ * SSOT: Use this instead of CalculateVARegion() when you have a ValueLocationResult.
+ *
+ * Mapping:
+ * - FAR_ABOVE, NEAR_ABOVE → OUTSIDE_ABOVE
+ * - AT_VAH, UPPER_VALUE   → UPPER_VA
+ * - AT_POC                → CORE_VA
+ * - AT_VAL, LOWER_VALUE   → LOWER_VA
+ * - FAR_BELOW, NEAR_BELOW → OUTSIDE_BELOW
+ */
+inline ValueAreaRegion ValueZoneToValueAreaRegion(ValueZone zone) {
+    switch (zone) {
+        case ValueZone::FAR_ABOVE_VALUE:
+        case ValueZone::NEAR_ABOVE_VALUE:
+            return ValueAreaRegion::OUTSIDE_ABOVE;
+
+        case ValueZone::AT_VAH:
+        case ValueZone::UPPER_VALUE:
+            return ValueAreaRegion::UPPER_VA;
+
+        case ValueZone::AT_POC:
+        case ValueZone::UNKNOWN:  // Default to CORE (safe fallback)
+            return ValueAreaRegion::CORE_VA;
+
+        case ValueZone::AT_VAL:
+        case ValueZone::LOWER_VALUE:
+            return ValueAreaRegion::LOWER_VA;
+
+        case ValueZone::FAR_BELOW_VALUE:
+        case ValueZone::NEAR_BELOW_VALUE:
+            return ValueAreaRegion::OUTSIDE_BELOW;
+
+        default:
+            return ValueAreaRegion::CORE_VA;
+    }
+}
+
 // ============================================================================
 // VA OVERLAP STATE (Balance vs Separation)
 // ============================================================================
@@ -424,6 +463,14 @@ struct ValueLocationResult {
     bool IsTrendStructure() const {
         return overlapState == VAOverlapState::SEPARATED_ABOVE ||
                overlapState == VAOverlapState::SEPARATED_BELOW;
+    }
+
+    /**
+     * Get ValueAreaRegion (5 states) from this result's ValueZone (9 states).
+     * SSOT: Use this instead of CalculateVARegion().
+     */
+    ValueAreaRegion GetValueAreaRegion() const {
+        return ValueZoneToValueAreaRegion(zone);
     }
 
     // Strategy recommendations

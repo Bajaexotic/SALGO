@@ -15,6 +15,8 @@
 #include "AMT_config.h"
 #include "AMT_Helpers.h"
 #include "AMT_Zones.h"
+#include "AMT_ValueLocation.h"  // For ValueLocationResult SSOT
+#include "AMT_Volatility.h"     // For VolatilityRegime
 #include <algorithm>
 #include <cmath>
 #include <climits>
@@ -435,7 +437,8 @@ inline void UpdateZoneComplete(ZoneRuntime& zone,
                               double vah,        // SSOT: from SessionManager.GetVAH()
                               double val,        // SSOT: from SessionManager.GetVAL()
                               int sessionStartBar,  // SSOT: from SessionManager.sessionStartBar
-                              const VolumeThresholds* ssotThresholds = nullptr)
+                              const VolumeThresholds* ssotThresholds = nullptr,
+                              const ValueLocationResult* valLocResult = nullptr)  // SSOT from ValueLocationEngine
 {
     // NOTE: UpdateZoneProximity is already called by ZoneManager::UpdateZones()
     // before this function. Calling it again here would corrupt priorProximity.
@@ -449,7 +452,17 @@ inline void UpdateZoneComplete(ZoneRuntime& zone,
     // 2.5 Update boundary tracking (for failed auction detection)
     // Only relevant for VALUE_BOUNDARY zones (VAH/VAL)
     if (zone.role == ZoneRole::VALUE_BOUNDARY) {
-        ValueAreaRegion currentRegion = CalculateVARegion(currentPrice, vah, val);
+        // SSOT: Use ValueLocationResult if provided, else fall back to CalculateVARegion()
+        ValueAreaRegion currentRegion;
+        if (valLocResult != nullptr && valLocResult->IsReady()) {
+            currentRegion = valLocResult->GetValueAreaRegion();
+        } else {
+            // Legacy fallback - suppress deprecation warning for internal use
+            #pragma warning(push)
+            #pragma warning(disable: 4996)
+            currentRegion = CalculateVARegion(currentPrice, vah, val);
+            #pragma warning(pop)
+        }
 
         bool isOutsideBoundary = false;
         if (zone.type == ZoneType::VPB_VAH) {
@@ -540,14 +553,27 @@ inline void UpdateZoneComplete(ZoneRuntime& zone,
 // ============================================================================
 
 /**
- * Update zone core and halo widths from DOM-derived liquidity.
+ * Update zone core and halo widths from DOM-derived liquidity, volatility, and market state.
  *
- * Phase 1B: Applies DOM-computed core ticks to AMT zones, running in parallel
- * with legacy ComputeLiquidityCoreTicks() to validate equivalence.
+ * Phase 1B: Applies DOM-computed core ticks to AMT zones, adjusted for context.
  *
  * @param zone The zone to update (typically POC only, matching legacy behavior)
  * @param coreTicksFromDOM Core width in ticks computed from DOM liquidity
  * @param haloMultiplier Multiplier to compute halo from core (e.g., 2.0)
+ * @param volRegime Current volatility regime (COMPRESSION/NORMAL/EXPANSION/EVENT)
+ * @param marketState Current market state from Dalton (BALANCE/IMBALANCE)
+ *
+ * Volatility adjustments:
+ * - COMPRESSION: 0.75x width (tighter zones in quiet markets)
+ * - NORMAL: 1.0x width (no adjustment)
+ * - EXPANSION: 1.3x width (wider zones in volatile markets)
+ * - EVENT: 1.5x width (very wide zones in extreme volatility)
+ * - UNKNOWN: 1.0x width (baseline not ready, use default)
+ *
+ * Market state adjustments (compounds with volatility):
+ * - BALANCE (2TF): 1.0x (mean reversion, expect levels to hold)
+ * - IMBALANCE (1TF): 1.2x (trending, wider to avoid chopout on pullbacks)
+ * - UNKNOWN: 1.0x (not ready, use default)
  *
  * Invariants enforced:
  * - coreWidthTicks >= 2 (minimum core is 2 ticks)
@@ -556,9 +582,47 @@ inline void UpdateZoneComplete(ZoneRuntime& zone,
  */
 inline void UpdateZoneDynamicWidths(ZoneRuntime& zone,
                                     int coreTicksFromDOM,
-                                    double haloMultiplier) {
+                                    double haloMultiplier,
+                                    VolatilityRegime volRegime = VolatilityRegime::UNKNOWN,
+                                    AMTMarketState marketState = AMTMarketState::UNKNOWN) {
+    // Volatility regime multiplier
+    double volMultiplier = 1.0;
+    switch (volRegime) {
+        case VolatilityRegime::COMPRESSION:
+            volMultiplier = 0.75;  // Tighter zones in quiet markets
+            break;
+        case VolatilityRegime::NORMAL:
+        case VolatilityRegime::UNKNOWN:
+            volMultiplier = 1.0;   // Default
+            break;
+        case VolatilityRegime::EXPANSION:
+            volMultiplier = 1.3;   // Wider zones in volatile markets
+            break;
+        case VolatilityRegime::EVENT:
+            volMultiplier = 1.5;   // Very wide zones in extreme volatility
+            break;
+    }
+
+    // Market state multiplier (Dalton 1TF/2TF)
+    double stateMultiplier = 1.0;
+    switch (marketState) {
+        case AMTMarketState::BALANCE:
+        case AMTMarketState::UNKNOWN:
+            stateMultiplier = 1.0;   // Mean reversion - zones should hold
+            break;
+        case AMTMarketState::IMBALANCE:
+            stateMultiplier = 1.2;   // Trending - wider to avoid chopout
+            break;
+    }
+
+    // Compound multipliers: volatility × market state
+    double totalMultiplier = volMultiplier * stateMultiplier;
+
+    // Apply combined adjustment to DOM-derived core
+    int adjustedCore = static_cast<int>(std::round(coreTicksFromDOM * totalMultiplier));
+
     // Enforce invariants (parentheses prevent Windows min/max macro interference)
-    int newCore = (std::max)(2, coreTicksFromDOM);
+    int newCore = (std::max)(2, adjustedCore);
     int newHalo = (std::max)(newCore, static_cast<int>(std::round(newCore * haloMultiplier)));
 
     zone.coreWidthTicks = newCore;
@@ -832,6 +896,154 @@ inline void CreateZonesFromProfile(ZoneManager& zm,
     }
 
     // PRIOR zones don't get volume characteristics updated (they're historical)
+}
+
+// ============================================================================
+// STRUCTURE ZONES (Session Extremes + IB)
+// Creates/updates zones for SESSION_HIGH, SESSION_LOW, IB_HIGH, IB_LOW
+// Only active when g_zonePosture.createStructureZones = true
+// ============================================================================
+
+/**
+ * Update structure zones from StructureTracker and optional overnight levels.
+ *
+ * Unlike profile zones which are created once per session, structure zones
+ * have different update behaviors:
+ * - SESSION_HIGH/LOW: Dynamic - recenter as new highs/lows are made
+ * - IB_HIGH/LOW: Dynamic until IB window closes, then frozen
+ * - GLOBEX_HIGH/LOW: Frozen - created once at RTH open from overnight session
+ *
+ * @param zm ZoneManager with StructureTracker (zm.structure)
+ * @param tickSize Tick size for price conversion
+ * @param time Current bar time
+ * @param bar Current bar index
+ * @param isRTH True if in RTH session (IB only tracks during RTH)
+ * @param globexHigh Overnight (GLOBEX) high - pass 0.0 if not available
+ * @param globexLow Overnight (GLOBEX) low - pass 0.0 if not available
+ */
+inline void UpdateStructureZones(ZoneManager& zm,
+                                 double tickSize,
+                                 SCDateTime time,
+                                 int bar,
+                                 bool isRTH,
+                                 double globexHigh = 0.0,
+                                 double globexLow = 0.0) {
+    // Skip if structure zones disabled
+    if (!g_zonePosture.createStructureZones) return;
+
+    const StructureTracker& st = zm.structure;
+
+    // Helper lambda to find existing zone by type
+    auto findExistingZone = [&zm, tickSize](ZoneType type, double anchor) -> int {
+        const long long searchTicks = PriceToTicks(anchor, tickSize);
+        for (const auto& [id, zone] : zm.activeZones) {
+            if (zone.type == type && zone.GetAnchorTicks() == searchTicks) {
+                return id;
+            }
+        }
+        return -1;
+    };
+
+    // Helper to create or recenter a structure zone (for dynamic zones)
+    auto createOrRecenter = [&](ZoneType type, double price, int& anchorId) {
+        if (price <= 0.0) return;
+
+        ZoneRuntime* existing = zm.GetZone(anchorId);
+        if (existing) {
+            // Zone exists - check if recenter needed
+            const long long currentTicks = existing->GetAnchorTicks();
+            const long long newTicks = PriceToTicks(price, tickSize);
+            const int drift = static_cast<int>(std::abs(newTicks - currentTicks));
+
+            if (drift >= 1) {
+                // Recenter to new level (preserves stats)
+                existing->RecenterEx(price, tickSize);
+            }
+        } else {
+            // Zone doesn't exist - create it
+            auto result = zm.CreateZone(type, price, time, bar, isRTH);
+            if (result.ok) {
+                anchorId = result.zoneId;
+            } else if (result.failure == ZoneCreationFailure::DUPLICATE_ANCHOR) {
+                anchorId = findExistingZone(type, price);
+            } else {
+                anchorId = -1;
+            }
+        }
+    };
+
+    // Helper to create a frozen zone (for static zones like GLOBEX)
+    auto createFrozenZone = [&](ZoneType type, double price, int& anchorId) {
+        if (price <= 0.0) return;
+        if (anchorId >= 0) return;  // Already created, don't recreate
+
+        auto result = zm.CreateZone(type, price, time, bar, isRTH);
+        if (result.ok) {
+            anchorId = result.zoneId;
+        } else if (result.failure == ZoneCreationFailure::DUPLICATE_ANCHOR) {
+            anchorId = findExistingZone(type, price);
+        } else {
+            anchorId = -1;
+        }
+    };
+
+    // ========================================================================
+    // SESSION EXTREMES (dynamic - update every bar)
+    // ========================================================================
+    createOrRecenter(ZoneType::SESSION_HIGH, st.GetSessionHigh(), zm.sessionHighId);
+    createOrRecenter(ZoneType::SESSION_LOW, st.GetSessionLow(), zm.sessionLowId);
+
+    // ========================================================================
+    // INITIAL BALANCE (freeze after IB window)
+    // ========================================================================
+    if (isRTH) {
+        // Only create/update IB zones during RTH
+        if (!st.IsIBFrozen()) {
+            // IB window still open - update zones
+            createOrRecenter(ZoneType::IB_HIGH, st.GetIBHigh(), zm.ibHighId);
+            createOrRecenter(ZoneType::IB_LOW, st.GetIBLow(), zm.ibLowId);
+        }
+        // After freeze, IB zones remain at frozen levels (no updates)
+
+        // ====================================================================
+        // GLOBEX (Overnight) EXTREMES - frozen at RTH open
+        // ====================================================================
+        // GLOBEX zones are captured at GLOBEX→RTH transition and never update
+        createFrozenZone(ZoneType::GLOBEX_HIGH, globexHigh, zm.globexHighId);
+        createFrozenZone(ZoneType::GLOBEX_LOW, globexLow, zm.globexLowId);
+    }
+}
+
+/**
+ * Clear structure zones (called on session reset).
+ * Removes SESSION_HIGH, SESSION_LOW, IB_HIGH, IB_LOW, GLOBEX_HIGH, GLOBEX_LOW zones.
+ */
+inline void ClearStructureZones(ZoneManager& zm) {
+    // Remove zones if they exist
+    if (zm.sessionHighId >= 0) {
+        zm.RemoveZone(zm.sessionHighId);
+        zm.sessionHighId = -1;
+    }
+    if (zm.sessionLowId >= 0) {
+        zm.RemoveZone(zm.sessionLowId);
+        zm.sessionLowId = -1;
+    }
+    if (zm.ibHighId >= 0) {
+        zm.RemoveZone(zm.ibHighId);
+        zm.ibHighId = -1;
+    }
+    if (zm.ibLowId >= 0) {
+        zm.RemoveZone(zm.ibLowId);
+        zm.ibLowId = -1;
+    }
+    if (zm.globexHighId >= 0) {
+        zm.RemoveZone(zm.globexHighId);
+        zm.globexHighId = -1;
+    }
+    if (zm.globexLowId >= 0) {
+        zm.RemoveZone(zm.globexLowId);
+        zm.globexLowId = -1;
+    }
 }
 
 } // namespace AMT

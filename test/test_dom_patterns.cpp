@@ -526,7 +526,7 @@ TEST(BuildDomPatternLogMessage_Format)
     ASSERT_TRUE(msg.find("BAL=") != std::string::npos);
     ASSERT_TRUE(msg.find("STACKED_BIDS") != std::string::npos);
     ASSERT_TRUE(msg.find("IMB=") != std::string::npos);
-    ASSERT_TRUE(msg.find("BA_RATIO_EXT") != std::string::npos);
+    ASSERT_TRUE(msg.find("BID_ASK_EXTREME") != std::string::npos);
 }
 
 TEST(BuildDomPatternLogMessage_EmptyResult)

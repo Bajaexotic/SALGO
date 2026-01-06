@@ -1054,7 +1054,6 @@ struct PhaseSnapshot {
     PhasePrimitives primitives;
 
     // Context tags
-    ValueAreaRegion vaRegion = ValueAreaRegion::CORE_VA;
     bool isOutsideVA = false;
     bool hasAcceptanceAfterglow = false;
     int barsSinceAcceptance = -1;
@@ -1474,7 +1473,6 @@ inline PhaseSnapshot BuildPhaseSnapshot(
 #endif
 
     // Populate derived fields
-    snap.vaRegion = CalculateVARegion(p.price, p.vah, p.val);
     snap.isOutsideVA = (p.outsideLow || p.outsideHigh);
     snap.distFromPOCTicks = p.dPOC_ticks;
     snap.vaRangeTicks = p.vaRangeTicks;

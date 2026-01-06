@@ -10,6 +10,7 @@
 #include "AMT_config.h"
 #include "AMT_Helpers.h"
 #include "AMT_Bridge.h"
+#include "AMT_Invariants.h"
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
@@ -919,7 +920,6 @@ public:
     // ========================================================================
     // STRUCTURAL CONTEXT (slow-changing, updated on session/profile change)
     // ========================================================================
-    ValueAreaRegion vaRegion = ValueAreaRegion::CORE_VA;
     int distanceFromPOCTicks = 0;        // Signed: + above, - below
     VolumeCharacteristics levelProfile;  // Volume attributes of the level
 
@@ -1026,6 +1026,10 @@ public:
         tickSizeCache_ = (tickSize > 0.0) ? tickSize : 0.25;
         anchorTicks_ = PriceToTicks(anchor, tickSizeCache_);
         anchorPrice_ = TicksToPrice(anchorTicks_, tickSizeCache_);  // Derived from ticks
+
+        // SSOT Invariant: anchorPrice == anchorTicks * tickSize
+        AMT_SSOT_ASSERT(AMT::ValidateZoneAnchorInvariant(anchorTicks_, anchorPrice_, tickSizeCache_),
+                        "ZoneRuntime::Initialize anchor invariant");
     }
 
     // Delete copy constructor/assignment (zones are unique)
@@ -1151,6 +1155,10 @@ public:
         recenterCount++;
         pendingAction = PendingAction::NONE;
         pendingTicks = 0;
+
+        // SSOT Invariant: anchorPrice == anchorTicks * tickSize after recenter
+        AMT_SSOT_ASSERT_EQ(anchorPrice_, anchorTicks_ * tickSize, 1e-9, "RecenterEx anchor invariant");
+
         return RecenterResult::APPLIED;
     }
 
@@ -1207,6 +1215,9 @@ public:
             anchorPrice_ = TicksToPrice(anchorTicks_, tickSizeCache_);  // Derive price from ticks
             recenterCount++;
             result = PendingApplyResult::RECENTER_APPLIED;
+
+            // SSOT Invariant: anchorPrice == anchorTicks * tickSize after pending recenter
+            AMT_SSOT_ASSERT_EQ(anchorPrice_, anchorTicks_ * tickSize, 1e-9, "ApplyPendingAction anchor invariant");
         }
 
         // Clear pending state
@@ -1703,6 +1714,8 @@ struct SessionAnchors {
     int ibLowId = -1;
     int sessionHighId = -1;
     int sessionLowId = -1;
+    int globexHighId = -1;
+    int globexLowId = -1;
 
     /**
      * Clear an anchor if it matches the given zone ID.
@@ -1720,6 +1733,8 @@ struct SessionAnchors {
         if (ibLowId == zoneId) ibLowId = -1;
         if (sessionHighId == zoneId) sessionHighId = -1;
         if (sessionLowId == zoneId) sessionLowId = -1;
+        if (globexHighId == zoneId) globexHighId = -1;
+        if (globexLowId == zoneId) globexLowId = -1;
     }
 
     /**
@@ -1729,7 +1744,8 @@ struct SessionAnchors {
         return pocId == zoneId || vahId == zoneId || valId == zoneId ||
                vwapId == zoneId || ibHighId == zoneId || ibLowId == zoneId ||
                priorPocId == zoneId || priorVahId == zoneId || priorValId == zoneId ||
-               sessionHighId == zoneId || sessionLowId == zoneId;
+               sessionHighId == zoneId || sessionLowId == zoneId ||
+               globexHighId == zoneId || globexLowId == zoneId;
     }
 
     /**
@@ -1740,6 +1756,7 @@ struct SessionAnchors {
         pocId = vahId = valId = vwapId = -1;
         priorPocId = priorVahId = priorValId = -1;
         ibHighId = ibLowId = sessionHighId = sessionLowId = -1;
+        globexHighId = globexLowId = -1;
     }
 
     /**
@@ -1753,7 +1770,8 @@ struct SessionAnchors {
         return valid(pocId) && valid(vahId) && valid(valId) &&
                valid(vwapId) && valid(ibHighId) && valid(ibLowId) &&
                valid(priorPocId) && valid(priorVahId) && valid(priorValId) &&
-               valid(sessionHighId) && valid(sessionLowId);
+               valid(sessionHighId) && valid(sessionLowId) &&
+               valid(globexHighId) && valid(globexLowId);
     }
 };
 
@@ -2042,6 +2060,8 @@ struct ZoneManager {
     // Structure zone accessors
     int& sessionHighId = anchors.sessionHighId;
     int& sessionLowId = anchors.sessionLowId;
+    int& globexHighId = anchors.globexHighId;
+    int& globexLowId = anchors.globexLowId;
 
     // ========================================================================
     // STRUCTURE TRACKER (SSOT for session extremes and IB levels)
@@ -2450,6 +2470,8 @@ struct ZoneManager {
     // Structure zone accessors
     ZoneRuntime* GetSessionHighZone() { return GetZone(sessionHighId); }
     ZoneRuntime* GetSessionLowZone() { return GetZone(sessionLowId); }
+    ZoneRuntime* GetGlobexHighZone() { return GetZone(globexHighId); }
+    ZoneRuntime* GetGlobexLowZone() { return GetZone(globexLowId); }
 
     // ========================================================================
     // SESSION EXTREMES ACCESSORS (SSOT: StructureTracker)
@@ -2853,6 +2875,8 @@ double CalculateStrengthScore(const ZoneRuntime& zone, int currentBar);
 ZoneStrength ClassifyStrength(double score, int touchCount);
 
 // Value area region calculation (takes vah/val from SessionManager, not from ZoneSessionState)
+// DEPRECATED: Use ValueLocationResult::GetValueAreaRegion() instead (SSOT)
+[[deprecated("Use ValueLocationResult::GetValueAreaRegion() for SSOT compliance")]]
 ValueAreaRegion CalculateVARegion(double price, double vah, double val);
 
 // ============================================================================
@@ -3172,6 +3196,7 @@ inline ZoneStrength ClassifyStrength(double score, int touchCount)
 
 /**
  * Calculate value area region
+ * @deprecated Use ValueLocationResult::GetValueAreaRegion() for SSOT compliance
  * @param price Current price
  * @param vah Value Area High (from SessionManager)
  * @param val Value Area Low (from SessionManager)

@@ -60,6 +60,9 @@
 
 #include "amt_core.h"
 #include "AMT_Snapshots.h"
+#include "AMT_Invariants.h"
+#include "AMT_ValueLocation.h"  // For ValueZone (SSOT) and ValueLocationResult
+#include "AMT_Volatility.h"     // For VolatilityRegime (context gating)
 #include <algorithm>
 #include <cmath>
 #include <deque>
@@ -381,6 +384,41 @@ inline const char* ValueZoneSimpleToString(ValueZoneSimple z) {
     return "?";
 }
 
+// ============================================================================
+// SSOT MAPPING: ValueZone (SSOT) -> ValueZoneSimple (simplified for delta)
+// ============================================================================
+// ValueZone is the SSOT from ValueLocationEngine (9 states).
+// ValueZoneSimple is a simplified 5-state representation for delta interpretation.
+// This mapping ensures DeltaEngine consumes from SSOT rather than computing its own.
+
+inline ValueZoneSimple MapValueZoneToSimple(ValueZone zone) {
+    switch (zone) {
+        // POC and value interior -> IN_VALUE
+        case ValueZone::AT_POC:
+        case ValueZone::UPPER_VALUE:
+        case ValueZone::LOWER_VALUE:
+            return ValueZoneSimple::IN_VALUE;
+
+        // Value edges -> AT_VALUE_EDGE
+        case ValueZone::AT_VAH:
+        case ValueZone::AT_VAL:
+            return ValueZoneSimple::AT_VALUE_EDGE;
+
+        // Near outside -> OUTSIDE_VALUE
+        case ValueZone::NEAR_ABOVE_VALUE:
+        case ValueZone::NEAR_BELOW_VALUE:
+            return ValueZoneSimple::OUTSIDE_VALUE;
+
+        // Far outside -> IN_DISCOVERY
+        case ValueZone::FAR_ABOVE_VALUE:
+        case ValueZone::FAR_BELOW_VALUE:
+            return ValueZoneSimple::IN_DISCOVERY;
+
+        default:
+            return ValueZoneSimple::UNKNOWN;
+    }
+}
+
 struct DeltaLocationContext {
     // Zone classification (simplified for delta interpretation)
     ValueZoneSimple zone = ValueZoneSimple::UNKNOWN;
@@ -408,7 +446,69 @@ struct DeltaLocationContext {
     // Validity
     bool isValid = false;
 
-    // Build from raw values (typically called by orchestrator)
+    // =========================================================================
+    // PREFERRED: Build from ValueLocationResult (SSOT-compliant)
+    // =========================================================================
+    // ValueLocationEngine is the SSOT for value location. This method consumes
+    // its output rather than duplicating the classification logic.
+    // NOTE: sessionHigh/Low and ibHigh/Low are already computed into
+    // distToSessionHighTicks/etc in ValueLocationResult, so not needed here.
+    static DeltaLocationContext BuildFromValueLocation(
+        const ValueLocationResult& valLocResult,
+        double edgeToleranceTicks = 2.0)
+    {
+        DeltaLocationContext ctx;
+
+        if (!valLocResult.IsReady()) {
+            ctx.isValid = false;
+            return ctx;
+        }
+
+        // Map SSOT ValueZone to simplified ValueZoneSimple
+        ctx.zone = MapValueZoneToSimple(valLocResult.confirmedZone);
+
+        // Copy distances from SSOT
+        ctx.distanceFromPOCTicks = valLocResult.distFromPOCTicks;
+        ctx.distanceFromVAHTicks = valLocResult.distFromVAHTicks;
+        ctx.distanceFromVALTicks = valLocResult.distFromVALTicks;
+
+        // Set convenience flags based on zone
+        ctx.isInValue = (ctx.zone == ValueZoneSimple::IN_VALUE);
+        ctx.isAtEdge = (ctx.zone == ValueZoneSimple::AT_VALUE_EDGE);
+        ctx.isOutsideValue = (ctx.zone == ValueZoneSimple::OUTSIDE_VALUE ||
+                              ctx.zone == ValueZoneSimple::IN_DISCOVERY);
+        ctx.isInDiscovery = (ctx.zone == ValueZoneSimple::IN_DISCOVERY);
+
+        // Migration context from SSOT
+        ctx.isMigratingTowardPrice = (valLocResult.valueMigration == ValueMigration::HIGHER &&
+                                       valLocResult.distFromPOCTicks > 0) ||
+                                     (valLocResult.valueMigration == ValueMigration::LOWER &&
+                                       valLocResult.distFromPOCTicks < 0);
+        ctx.isMigratingAwayFromPrice = (valLocResult.valueMigration == ValueMigration::HIGHER &&
+                                         valLocResult.distFromPOCTicks < 0) ||
+                                       (valLocResult.valueMigration == ValueMigration::LOWER &&
+                                         valLocResult.distFromPOCTicks > 0);
+
+        // Structure context from SSOT (ValueLocationResult has session/IB tick distances)
+        ctx.isAboveSessionHigh = valLocResult.distToSessionHighTicks > 0 &&
+                                 valLocResult.confirmedZone == ValueZone::FAR_ABOVE_VALUE;
+        ctx.isBelowSessionLow = valLocResult.distToSessionLowTicks < 0 &&
+                                valLocResult.confirmedZone == ValueZone::FAR_BELOW_VALUE;
+
+        // IB extreme detection from SSOT tick distances
+        ctx.isAtIBExtreme = (std::abs(valLocResult.distToIBHighTicks) <= edgeToleranceTicks) ||
+                            (std::abs(valLocResult.distToIBLowTicks) <= edgeToleranceTicks);
+
+        ctx.isValid = true;
+        return ctx;
+    }
+
+    // =========================================================================
+    // DEPRECATED: Build from raw values (duplicates ValueLocationEngine logic)
+    // =========================================================================
+    // This method computes its own location classification, which duplicates
+    // ValueLocationEngine. Use BuildFromValueLocation() instead.
+    [[deprecated("Use BuildFromValueLocation() with ValueLocationResult from ValueLocationEngine (SSOT)")]]
     static DeltaLocationContext Build(
         double currentPrice,
         double poc, double vah, double val,
@@ -1350,6 +1450,8 @@ public:
         if (sessionBaseline_ != nullptr) {
             auto pctile = sessionBaseline_->TryGetPercentile(currentPhase_, result.sessionDeltaPct);
             if (pctile.valid) {
+                // SSOT Invariant: Percentiles must be in [0, 100]
+                AMT_SSOT_ASSERT_RANGE(pctile.value, 0.0, 100.0, "DeltaEngine sessionDeltaPctile");
                 result.sessionDeltaPctile = pctile.value;
                 result.sessionBaselineReady = true;
             }

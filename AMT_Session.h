@@ -9,6 +9,7 @@
 
 #include "amt_core.h"
 #include "AMT_Snapshots.h"  // For RollingDist, EffortBaselineStore, SessionDeltaBaseline
+#include "AMT_Invariants.h"
 #include <cassert>
 #include <vector>
 #include <set>
@@ -332,6 +333,13 @@ public:
         if (tickSize > 0.0 && vah > val) {
             sessionVARangeTicks_ = static_cast<int>((vah - val) / tickSize);
         }
+
+        // SSOT Invariant: Session levels must be ordered VAL < POC < VAH
+        // Only validate when all levels are non-zero (populated)
+        if (poc > 0.0 && vah > 0.0 && val > 0.0) {
+            AMT_SSOT_ASSERT(ValidateSessionLevelOrder(poc, vah, val),
+                            "SessionManager::UpdateLevels level order: VAL < POC < VAH");
+        }
     }
 
     // NOTE: UpdateExtremes() removed - session extremes are now managed by
@@ -346,7 +354,10 @@ public:
     double GetTickSizeCache() const { return tickSizeCache_; }
 
     // --- Single-writer for session timing ---
-    void SetSessionStartBar(int bar) { sessionStartBar_ = bar; }
+    void SetSessionStartBar(int bar) {
+        AMT_SSOT_ASSERT_RANGE(bar, 0, 1000000, "SetSessionStartBar valid range");
+        sessionStartBar_ = bar;
+    }
     // Consume-on-read: Returns true ONCE per session change, then auto-clears.
     // This is the SSOT for session transition detection - no manual clear needed.
     bool ConsumeSessionChange() {

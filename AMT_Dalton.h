@@ -1613,6 +1613,9 @@ public:
     /**
      * Process a bar and update all Dalton framework components.
      *
+     * DEPRECATED: Use ProcessBarFromValueLocation() which consumes ValueLocationResult
+     * from ValueLocationEngine (SSOT) instead of computing location internally.
+     *
      * @param high            Bar high
      * @param low             Bar low
      * @param close           Bar close
@@ -1629,6 +1632,7 @@ public:
      * @param deltaCoherence       Session delta sign matches bar delta direction
      * @return                Complete DaltonState
      */
+    [[deprecated("Use ProcessBarFromValueLocation() with ValueLocationResult from ValueLocationEngine (SSOT)")]]
     DaltonState ProcessBar(
         double high,
         double low,
@@ -1701,8 +1705,16 @@ public:
         }
 
         // 5. Classify activity
+        // Suppress deprecation warning: deprecated method calling deprecated method is expected
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
         auto activity = activityClassifier_.Classify(
             close, prevClose, poc, vah, val, deltaPct, tickSize);
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
         state.activity = activity.activityType;
         state.location = activity.location;
         state.distFromPOCTicks = activity.priceVsPOC;
@@ -1718,6 +1730,111 @@ public:
         }
 
         // 7. Copy session bridge to state (for downstream access)
+        state.bridge = bridge_;
+        state.openingType = openingClassifier_.GetOpeningType();
+        state.openingClassified = openingClassifier_.IsClassified();
+
+        return state;
+    }
+
+    /**
+     * Process bar with SSOT value location from ValueLocationEngine.
+     *
+     * @param valLocResult    SSOT: ValueLocationResult from ValueLocationEngine.Compute()
+     * @param high            Bar high
+     * @param low             Bar low
+     * @param close           Bar close
+     * @param prevClose       Previous bar close
+     * @param deltaPct        Bar delta as fraction of volume
+     * @param tickSize        Tick size
+     * @param minutesFromOpen Minutes since session open
+     * @param barIndex        Current bar index
+     * @param extremeDeltaBar      Per-bar extreme delta (deltaConsistency > 0.7 or < 0.3)
+     * @param extremeDeltaSession  Session extreme delta (sessionDeltaPctile >= 85)
+     * @param deltaCoherence       Session delta sign matches bar delta direction
+     * @param isGlobexSession      True if in GLOBEX session
+     * @return                Complete DaltonState
+     */
+    DaltonState ProcessBarFromValueLocation(
+        const ValueLocationResult& valLocResult,
+        double high,
+        double low,
+        double close,
+        double prevClose,
+        double deltaPct,
+        double tickSize,
+        int minutesFromOpen,
+        int barIndex,
+        bool extremeDeltaBar = false,
+        bool extremeDeltaSession = false,
+        bool deltaCoherence = false,
+        bool isGlobexSession = false
+    ) {
+        DaltonState state;
+        state.valid = true;
+        state.isGlobexSession = isGlobexSession;
+
+        // 1. Update rotation tracking (1TF/2TF detection)
+        RotationTracker::RotationResult rotation;
+        if (isGlobexSession) {
+            rotation = globexRotationTracker_.Update(high, low, barIndex);
+            globexMiniIBTracker_.Update(high, low, minutesFromOpen);
+        } else {
+            rotation = rotationTracker_.Update(high, low, barIndex);
+        }
+        state.timeframe = rotation.pattern;
+        state.rotationFactor = rotation.rotationFactor;
+        state.consecutiveUp = rotation.consecutiveUp;
+        state.consecutiveDown = rotation.consecutiveDown;
+
+        // 2. Set extreme delta flags
+        state.isExtremeDeltaBar = extremeDeltaBar;
+        state.isExtremeDeltaSession = extremeDeltaSession;
+        state.isExtremeDelta = extremeDeltaBar && extremeDeltaSession;
+        state.directionalCoherence = deltaCoherence;
+
+        // 3. Derive phase from timeframe pattern + extreme delta
+        state.DerivePhase();
+
+        // 4. Update Initial Balance tracking
+        if (!isGlobexSession) {
+            auto ib = ibTracker_.Update(high, low, close, minutesFromOpen, barIndex);
+            state.ibHigh = ib.ibHigh;
+            state.ibLow = ib.ibLow;
+            state.ibRange = ib.ibRange;
+            state.ibComplete = ib.ibComplete;
+            state.extension = ib.extension;
+            state.extensionRatio = ib.extensionRatio;
+            state.failedAuctionAbove = ib.failedAuctionAbove;
+            state.failedAuctionBelow = ib.failedAuctionBelow;
+        } else {
+            const auto& miniIB = globexMiniIBTracker_.GetState();
+            state.ibHigh = miniIB.high;
+            state.ibLow = miniIB.low;
+            state.ibRange = miniIB.range;
+            state.ibComplete = miniIB.frozen;
+            state.extension = miniIB.extension;
+            state.extensionRatio = 0.0;
+            state.failedAuctionAbove = false;
+            state.failedAuctionBelow = false;
+        }
+
+        // 5. Classify activity using SSOT
+        auto activity = activityClassifier_.ClassifyFromValueLocation(
+            valLocResult, close, prevClose, deltaPct);
+        state.activity = activity.activityType;
+        state.location = activity.location;
+        state.distFromPOCTicks = activity.priceVsPOC;
+
+        // 6. Classify Dalton day type (RTH only)
+        if (!isGlobexSession && state.ibComplete) {
+            const auto& ibState = ibTracker_.GetState();
+            state.dayType = ClassifyDaltonDayType(ibState, rotation, close);
+        } else {
+            state.dayType = DaltonDayType::UNKNOWN;
+        }
+
+        // 7. Copy session bridge to state
         state.bridge = bridge_;
         state.openingType = openingClassifier_.GetOpeningType();
         state.openingClassified = openingClassifier_.IsClassified();

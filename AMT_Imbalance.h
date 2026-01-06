@@ -53,6 +53,8 @@
 #include "amt_core.h"
 #include "AMT_Snapshots.h"
 #include "AMT_Volatility.h"  // For VolatilityRegime enum
+#include "AMT_ValueLocation.h"  // For ValueLocationResult (SSOT)
+#include "AMT_Invariants.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -96,7 +98,7 @@ enum class ImbalanceType : int {
     CLIMAX_LOW = 12,        // Exhaustion at lows (extreme vol + delta + at extreme)
     POOR_HIGH = 13,         // Weak high (no excess, no acceptance)
     POOR_LOW = 14,          // Weak low (no excess, no acceptance)
-    FAILED_AUCTION = 15     // Breakout + rapid return (trap)
+    FAILED_AUCTION_VA = 15  // VA boundary breakout + rapid return (trap, distinct from IB)
 };
 
 inline const char* ImbalanceTypeToString(ImbalanceType t) {
@@ -114,9 +116,9 @@ inline const char* ImbalanceTypeToString(ImbalanceType t) {
         case ImbalanceType::EXCESS:           return "EXCESS";
         case ImbalanceType::CLIMAX_HIGH:      return "CLIMAX_HIGH";
         case ImbalanceType::CLIMAX_LOW:       return "CLIMAX_LOW";
-        case ImbalanceType::POOR_HIGH:        return "POOR_HIGH";
-        case ImbalanceType::POOR_LOW:         return "POOR_LOW";
-        case ImbalanceType::FAILED_AUCTION:   return "FAIL_AUCT";
+        case ImbalanceType::POOR_HIGH:         return "POOR_HIGH";
+        case ImbalanceType::POOR_LOW:          return "POOR_LOW";
+        case ImbalanceType::FAILED_AUCTION_VA: return "FAIL_AUCT_VA";
     }
     return "UNK";
 }
@@ -327,6 +329,45 @@ struct FailedAuctionTracker {
 };
 
 // ============================================================================
+// AUCTION LEVEL CONTEXT (Jan 2025)
+// ============================================================================
+// Provides actionable levels for the current imbalance state:
+// - Where the move would be ACCEPTED (confirmed)
+// - Where the move would be REJECTED (failed)
+// - Target objective if imbalance continues
+// - Prior session reference levels
+// ============================================================================
+
+struct AuctionLevelContext {
+    // Acceptance levels (where move becomes "real")
+    double acceptanceLevel = 0.0;      // Price that would confirm acceptance
+    bool acceptanceLevelValid = false;
+
+    // Failure levels (where move is rejected)
+    double failureLevel = 0.0;         // Price that would confirm rejection
+    bool failureLevelValid = false;
+
+    // Auction objective (target if imbalance continues)
+    double auctionObjective = 0.0;     // Next reference level target
+    bool auctionObjectiveValid = false;
+
+    // Prior reference levels (from DaltonEngine.SessionBridge)
+    double priorPOC = 0.0;
+    double priorVAH = 0.0;
+    double priorVAL = 0.0;
+    bool priorLevelsValid = false;
+
+    // Consumed excess from SSOT (ExcessDetector)
+    ExcessType consumedExcess = ExcessType::NONE;
+
+    // Helpers
+    bool HasAcceptanceLevel() const { return acceptanceLevelValid; }
+    bool HasFailureLevel() const { return failureLevelValid; }
+    bool HasAuctionObjective() const { return auctionObjectiveValid; }
+    bool HasPriorLevels() const { return priorLevelsValid; }
+};
+
+// ============================================================================
 // IMBALANCE RESULT (Per-Bar Output)
 // ============================================================================
 // Complete snapshot of imbalance detection state for the current bar.
@@ -446,6 +487,11 @@ struct ImbalanceResult {
     // CONTEXT GATES
     // ========================================================================
     ContextGateResult contextGate;
+
+    // ========================================================================
+    // AUCTION LEVEL CONTEXT (Jan 2025)
+    // ========================================================================
+    AuctionLevelContext levels;
 
     // ========================================================================
     // DOM CONTEXT (From LiquidityEngine)
@@ -790,6 +836,8 @@ public:
     //   ibHigh, ibLow - Initial Balance levels for range extension
     //   sessionHigh, sessionLow - Session extremes
     //
+    // DEPRECATED: Use ComputeFromValueLocation() for SSOT compliance
+    [[deprecated("Use ComputeFromValueLocation() with ValueLocationResult from ValueLocationEngine (SSOT)")]]
     ImbalanceResult Compute(
         // Price data (required)
         double high, double low, double close, double open,
@@ -816,7 +864,11 @@ public:
         // DOM spatial liquidity (optional, from LiquidityEngine.spatialGating)
         double nearestBidWallTicks = -1.0, double nearestAskWallTicks = -1.0,
         double nearestBidVoidTicks = -1.0, double nearestAskVoidTicks = -1.0,
-        int pathOfLeastResistance = 0  // -1=DOWN, 0=BALANCED, +1=UP
+        int pathOfLeastResistance = 0,  // -1=DOWN, 0=BALANCED, +1=UP
+        // SSOT consumed excess (from ExcessDetector, Jan 2025)
+        ExcessType consumedExcess = ExcessType::NONE,
+        // Prior session levels (from DaltonEngine.SessionBridge, for AuctionLevelContext)
+        double priorPOC = 0.0, double priorVAH = 0.0, double priorVAL = 0.0
     ) {
         ImbalanceResult result;
         result.phase = currentPhase;
@@ -880,9 +932,28 @@ public:
         // ====================================================================
         // STEP 4: ABSORPTION DETECTION (with DOM consumed depth)
         // ====================================================================
+        // LOCATION-GATING (Jan 2025): Absorption is only meaningful at significant
+        // levels (VAH/VAL, session extremes, IB extremes). Absorption in the middle
+        // of the value area is noise - passive activity there is normal rotation.
         if (totalVolume > 0.0 && barDelta > -1e9) {
-            DetectAbsorption(result, high, low, totalVolume, barDelta, tickSize,
-                             consumedBidMass, consumedAskMass, toxicityProxy);
+            // Check if we're at a meaningful level for absorption
+            const double tolerance = tickSize * 3.0;  // 3 ticks tolerance
+            const bool atVAH = (vah > 0.0 && std::abs(close - vah) <= tolerance);
+            const bool atVAL = (val > 0.0 && std::abs(close - val) <= tolerance);
+            const bool atSessionHigh = (sessionHigh > 0.0 && std::abs(high - sessionHigh) <= tolerance);
+            const bool atSessionLow = (sessionLow > 0.0 && std::abs(low - sessionLow) <= tolerance);
+            const bool atIBHigh = (ibHigh > 0.0 && std::abs(high - ibHigh) <= tolerance);
+            const bool atIBLow = (ibLow > 0.0 && std::abs(low - ibLow) <= tolerance);
+
+            const bool atMeaningfulLevel = atVAH || atVAL ||
+                                            atSessionHigh || atSessionLow ||
+                                            atIBHigh || atIBLow;
+
+            if (atMeaningfulLevel) {
+                DetectAbsorption(result, high, low, totalVolume, barDelta, tickSize,
+                                 consumedBidMass, consumedAskMass, toxicityProxy);
+            }
+            // If not at meaningful level, skip absorption detection (it's noise)
         }
 
         // ====================================================================
@@ -910,9 +981,12 @@ public:
         }
 
         // ====================================================================
-        // STEP 7: EXCESS DETECTION
+        // STEP 7: CONSUME EXCESS FROM SSOT (ExcessDetector, Jan 2025)
         // ====================================================================
-        DetectExcess(result, high, low, open, close, prevHigh, prevLow, tickSize);
+        // NOTE: Excess and Poor High/Low detection is now centralized in ExcessDetector
+        // (AMT_Signals.h). This engine CONSUMES the SSOT result instead of computing its own.
+        // The caller passes consumedExcess from ExcessDetector.GetCombinedExcess().
+        ConsumeExcessFromSSOT(result, consumedExcess);
 
         // ====================================================================
         // STEP 8: CLIMAX DETECTION (requires baselines)
@@ -923,18 +997,16 @@ public:
         }
 
         // ====================================================================
-        // STEP 9: POOR HIGH/LOW DETECTION
+        // STEP 9: POPULATE AUCTION LEVEL CONTEXT (Jan 2025)
         // ====================================================================
-        if (totalVolume > 0.0 && sessionHigh > 0.0 && sessionLow > 0.0) {
-            DetectPoorHighLow(result, high, low, totalVolume, barDelta,
-                              sessionHigh, sessionLow, tickSize);
-        }
+        PopulateAuctionLevelContext(result, poc, vah, val, close, tickSize,
+                                     priorPOC, priorVAH, priorVAL);
 
         // ====================================================================
-        // STEP 10: FAILED AUCTION DETECTION
+        // STEP 10: FAILED AUCTION VA DETECTION
         // ====================================================================
         if (vah > 0.0 && val > 0.0) {
-            DetectFailedAuction(result, high, low, close, vah, val, tickSize, barIndex);
+            DetectFailedAuctionVA(result, high, low, close, vah, val, tickSize, barIndex);
         }
 
         // ====================================================================
@@ -1003,6 +1075,93 @@ public:
         if (result.absorptionDetected) absorptionCount++;
 
         return result;
+    }
+
+    // ========================================================================
+    // SSOT-COMPLIANT COMPUTE (Jan 2025)
+    // ========================================================================
+    //
+    // Preferred entry point. Consumes ValueLocationResult from ValueLocationEngine
+    // instead of receiving raw POC/VAH/VAL values. This ensures:
+    //   - Single source of truth for value-relative location
+    //   - Consistent VA overlap and migration calculations
+    //   - Pre-computed distances available for displacement detection
+    //
+    ImbalanceResult ComputeFromValueLocation(
+        const ValueLocationResult& valLocResult,
+        // Price data (required)
+        double high, double low, double close, double open,
+        double prevHigh, double prevLow, double prevClose,
+        double tickSize, int barIndex,
+        // Diagonal delta from Numbers Bars (optional, pass -1 if unavailable)
+        double diagonalPosDelta = -1.0, double diagonalNegDelta = -1.0,
+        // Volume/delta (optional, pass -1 if unavailable)
+        double totalVolume = -1.0, double barDelta = -1.0, double cumulativeDelta = -1.0,
+        // Context gates (optional)
+        LiquidityState liqState = LiquidityState::LIQ_NOT_READY,
+        VolatilityRegime volRegime = VolatilityRegime::UNKNOWN,
+        double executionFriction = -1.0,
+        // IB/Session context (optional)
+        double ibHigh = 0.0, double ibLow = 0.0,
+        double sessionHigh = 0.0, double sessionLow = 0.0,
+        int rotationFactor = 0, bool is1TF = false,
+        // DOM consumed depth (optional, from LiquidityEngine)
+        double consumedBidMass = -1.0, double consumedAskMass = -1.0,
+        double toxicityProxy = -1.0,
+        // DOM spatial liquidity (optional, from LiquidityEngine.spatialGating)
+        double nearestBidWallTicks = -1.0, double nearestAskWallTicks = -1.0,
+        double nearestBidVoidTicks = -1.0, double nearestAskVoidTicks = -1.0,
+        int pathOfLeastResistance = 0,  // -1=DOWN, 0=BALANCED, +1=UP
+        // SSOT consumed excess (from ExcessDetector, Jan 2025)
+        ExcessType consumedExcess = ExcessType::NONE,
+        // Prior session levels (from DaltonEngine.SessionBridge, for AuctionLevelContext)
+        double priorPOC = 0.0, double priorVAH = 0.0, double priorVAL = 0.0
+    ) {
+        // Extract POC/VAH/VAL from SSOT result
+        // If valLocResult is not ready, we can still compute with zeros (optional inputs)
+        double poc = 0.0, vah = 0.0, val = 0.0;
+        double inputPrevPOC = 0.0, inputPrevVAH = 0.0, inputPrevVAL = 0.0;
+
+        if (valLocResult.IsReady()) {
+            // Derive prices from SSOT distance fields
+            // POC = close - (distFromPOCTicks * tickSize)
+            poc = close - (valLocResult.distFromPOCTicks * tickSize);
+            vah = close - (valLocResult.distFromVAHTicks * tickSize);
+            val = close - (valLocResult.distFromVALTicks * tickSize);
+
+            // Prior levels from SSOT
+            inputPrevPOC = close - (valLocResult.distToPriorPOCTicks * tickSize);
+            inputPrevVAH = close - (valLocResult.distToPriorVAHTicks * tickSize);
+            inputPrevVAL = close - (valLocResult.distToPriorVALTicks * tickSize);
+        }
+
+        // Suppress deprecation warning: SSOT method calling deprecated method is expected
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
+        // Delegate to full Compute() with extracted values
+        return Compute(
+            high, low, close, open,
+            prevHigh, prevLow, prevClose,
+            tickSize, barIndex,
+            poc, vah, val,
+            inputPrevPOC, inputPrevVAH, inputPrevVAL,
+            diagonalPosDelta, diagonalNegDelta,
+            totalVolume, barDelta, cumulativeDelta,
+            liqState, volRegime, executionFriction,
+            ibHigh, ibLow, sessionHigh, sessionLow,
+            rotationFactor, is1TF,
+            consumedBidMass, consumedAskMass, toxicityProxy,
+            nearestBidWallTicks, nearestAskWallTicks,
+            nearestBidVoidTicks, nearestAskVoidTicks,
+            pathOfLeastResistance,
+            consumedExcess,
+            priorPOC, priorVAH, priorVAL
+        );
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
     }
 
     // ========================================================================
@@ -1210,6 +1369,8 @@ private:
             if (diagonalNetBaseline[phaseIdx].size() >= config.baselineMinSamples) {
                 auto pctile = diagonalNetBaseline[phaseIdx].TryPercentile(std::abs(result.diagonalNetDelta));
                 if (pctile.valid) {
+                    // SSOT Invariant: Percentiles must be in [0, 100]
+                    AMT_SSOT_ASSERT_RANGE(pctile.value, 0.0, 100.0, "IMB diagonalPercentile");
                     result.diagonalPercentile = pctile.value;
                 }
             }
@@ -1219,6 +1380,8 @@ private:
                 diagonalRatioBaseline[phaseIdx].size() >= config.baselineMinSamples) {
                 auto pctile = diagonalRatioBaseline[phaseIdx].TryPercentile(maxRatio);
                 if (pctile.valid) {
+                    // SSOT Invariant: Percentiles must be in [0, 100]
+                    AMT_SSOT_ASSERT_RANGE(pctile.value, 0.0, 100.0, "IMB ratioPercentile");
                     usePercentile = true;
                     ratioPercentile = pctile.value;
                 }
@@ -1622,34 +1785,110 @@ private:
     }
 
     // ========================================================================
-    // EXCESS DETECTION
+    // CONSUME EXCESS FROM SSOT (Jan 2025)
+    // ========================================================================
+    // Maps ExcessType from ExcessDetector (SSOT) to ImbalanceResult fields.
+    // This replaces the deprecated DetectExcess() and DetectPoorHighLow() methods.
     // ========================================================================
 
-    void DetectExcess(ImbalanceResult& result,
-                       double high, double low, double open, double close,
-                       double prevHigh, double prevLow, double tickSize) {
-        // Excess = single-print tail (long wick with rejection)
-        // Indicates auction rejection at extreme
+    void ConsumeExcessFromSSOT(ImbalanceResult& result, ExcessType consumedExcess) {
+        // Store the consumed excess in levels context
+        result.levels.consumedExcess = consumedExcess;
 
-        const double range = high - low;
-        if (range <= 0.0) return;
+        // Map to result fields for backward compatibility
+        switch (consumedExcess) {
+            case ExcessType::EXCESS_HIGH:
+                result.excessDetected = true;
+                result.excessHigh = true;
+                break;
+            case ExcessType::EXCESS_LOW:
+                result.excessDetected = true;
+                result.excessLow = true;
+                break;
+            case ExcessType::POOR_HIGH:
+                result.poorHighDetected = true;
+                result.poorHighScore = 0.6;  // Default score for SSOT-detected poor high
+                break;
+            case ExcessType::POOR_LOW:
+                result.poorLowDetected = true;
+                result.poorLowScore = 0.6;  // Default score for SSOT-detected poor low
+                break;
+            case ExcessType::NONE:
+            default:
+                // No excess detected
+                break;
+        }
+    }
 
-        const double upperWick = high - (std::max)(open, close);
-        const double lowerWick = (std::min)(open, close) - low;
+    // ========================================================================
+    // POPULATE AUCTION LEVEL CONTEXT (Jan 2025)
+    // ========================================================================
+    // Computes acceptance/failure levels and auction objectives based on
+    // current imbalance state and profile context.
+    // ========================================================================
 
-        const double upperWickRatio = upperWick / range;
-        const double lowerWickRatio = lowerWick / range;
+    void PopulateAuctionLevelContext(ImbalanceResult& result,
+                                      double poc, double vah, double val,
+                                      double close, double tickSize,
+                                      double priorPOC, double priorVAH, double priorVAL) {
+        AuctionLevelContext& ctx = result.levels;
 
-        // Excess high: long upper wick (>40% of range) + new high + closes weak
-        if (upperWickRatio > 0.4 && high > prevHigh && close < open) {
-            result.excessDetected = true;
-            result.excessHigh = true;
+        // Store prior levels if available
+        if (priorPOC > 0.0 || priorVAH > 0.0 || priorVAL > 0.0) {
+            ctx.priorPOC = priorPOC;
+            ctx.priorVAH = priorVAH;
+            ctx.priorVAL = priorVAL;
+            ctx.priorLevelsValid = (priorPOC > 0.0 && priorVAH > 0.0 && priorVAL > 0.0);
         }
 
-        // Excess low: long lower wick (>40% of range) + new low + closes strong
-        if (lowerWickRatio > 0.4 && low < prevLow && close > open) {
-            result.excessDetected = true;
-            result.excessLow = true;
+        // Can't compute levels without current profile
+        if (vah <= 0.0 || val <= 0.0 || poc <= 0.0) return;
+
+        const bool aboveVAH = (close > vah);
+        const bool belowVAL = (close < val);
+
+        if (aboveVAH) {
+            // Price above value: acceptance requires sustained move
+            // Failure = return to VAH (re-entry into value)
+            ctx.failureLevel = vah;
+            ctx.failureLevelValid = true;
+
+            // Acceptance = POC migration toward price (future target)
+            // Use prior POC + some distance as acceptance level
+            ctx.acceptanceLevel = vah + (vah - poc) * 0.5;  // Extension target
+            ctx.acceptanceLevelValid = true;
+
+            // Objective = prior VAH or extension target
+            if (ctx.priorLevelsValid && priorVAH > vah) {
+                ctx.auctionObjective = priorVAH;
+            } else {
+                ctx.auctionObjective = vah + (vah - val);  // Full VA range extension
+            }
+            ctx.auctionObjectiveValid = true;
+
+        } else if (belowVAL) {
+            // Price below value: acceptance requires sustained move
+            // Failure = return to VAL (re-entry into value)
+            ctx.failureLevel = val;
+            ctx.failureLevelValid = true;
+
+            // Acceptance = POC migration toward price
+            ctx.acceptanceLevel = val - (poc - val) * 0.5;
+            ctx.acceptanceLevelValid = true;
+
+            // Objective = prior VAL or extension target
+            if (ctx.priorLevelsValid && priorVAL < val) {
+                ctx.auctionObjective = priorVAL;
+            } else {
+                ctx.auctionObjective = val - (vah - val);  // Full VA range extension
+            }
+            ctx.auctionObjectiveValid = true;
+
+        } else {
+            // Inside value: no strong directional objective
+            // Failure levels are both edges
+            ctx.failureLevel = poc;  // Failure to break POC
+            ctx.failureLevelValid = false;  // Not meaningful inside value
         }
     }
 
@@ -1724,68 +1963,21 @@ private:
     }
 
     // ========================================================================
-    // POOR HIGH/LOW DETECTION (Weak Auction Ends)
+    // POOR HIGH/LOW DETECTION - REMOVED (Jan 2025)
+    // ========================================================================
+    // This functionality is now provided by ExcessDetector (AMT_Signals.h).
+    // ImbalanceEngine CONSUMES the SSOT via ConsumeExcessFromSSOT().
+    // See ExcessType::POOR_HIGH and ExcessType::POOR_LOW.
     // ========================================================================
 
-    void DetectPoorHighLow(ImbalanceResult& result,
-                            double high, double low, double volume, double delta,
-                            double sessionHigh, double sessionLow, double tickSize) {
-        // POOR HIGH/LOW = New extreme but with weak volume and no conviction
-        // These are "unfinished business" levels - price will likely revisit
-        //
-        // Contrast with EXCESS (strong rejection) and CLIMAX (strong exhaustion)
-        // A poor high has neither - it's a tentative probe that didn't find
-        // responsive selling (no excess) or aggressive buying (no climax)
-
-        if (volume <= 0.0 || sessionHigh <= 0.0 || sessionLow <= 0.0) return;
-
-        const int phaseIdx = SessionPhaseToBucketIndex(currentPhase);
-        if (phaseIdx < 0 || phaseIdx >= EFFORT_BUCKET_COUNT) return;
-        if (effortStore == nullptr) return;
-
-        const auto& bucket = effortStore->Get(currentPhase);
-        const auto& volBaseline = bucket.vol_sec;
-        const auto& deltaBaseline = bucket.delta_pct;
-
-        if (volBaseline.size() < config.baselineMinSamples) return;
-
-        // Compute percentiles
-        const double volPerSec = volume / 60.0;
-        auto volPctile = volBaseline.TryPercentile(volPerSec);
-        if (!volPctile.valid) return;
-
-        const double deltaPct = (volume > 0.0) ? std::abs(delta / volume) : 0.0;
-        auto deltaPctile = deltaBaseline.TryPercentile(deltaPct);
-
-        // Check if at new extreme
-        const bool atNewHigh = (std::abs(high - sessionHigh) < tickSize * 2.0);
-        const bool atNewLow = (std::abs(low - sessionLow) < tickSize * 2.0);
-
-        // POOR HIGH/LOW requires: weak volume + weak delta + no excess
-        const bool hasWeakVol = (volPctile.value < config.poorHighLowVolThreshold);
-        const bool hasWeakDelta = !deltaPctile.valid ||
-                                   (deltaPctile.value < config.poorHighLowDeltaThreshold);
-
-        if (hasWeakVol && hasWeakDelta && !result.excessDetected) {
-            // Score based on how weak (invert percentile)
-            const double weaknessScore = 1.0 - (volPctile.value / 100.0);
-
-            if (atNewHigh && !result.climaxHigh) {
-                result.poorHighDetected = true;
-                result.poorHighScore = weaknessScore;
-            }
-            if (atNewLow && !result.climaxLow) {
-                result.poorLowDetected = true;
-                result.poorLowScore = weaknessScore;
-            }
-        }
-    }
-
     // ========================================================================
-    // FAILED AUCTION DETECTION (Breakout Trap)
+    // FAILED AUCTION VA DETECTION (Breakout Trap at VA Boundary)
+    // ========================================================================
+    // NOTE: This is the VA-boundary failed auction, distinct from IB failed
+    // auction which is owned by DaltonEngine (failedAuctionAbove/Below).
     // ========================================================================
 
-    void DetectFailedAuction(ImbalanceResult& result,
+    void DetectFailedAuctionVA(ImbalanceResult& result,
                               double high, double low, double close,
                               double vah, double val, double tickSize,
                               int barIndex) {
@@ -1852,10 +2044,9 @@ private:
     ImbalanceType DetermineType(const ImbalanceResult& result) {
         // Priority order based on signal strength and actionability
 
-        // 1. Failed auction (highest priority - active trap in progress)
+        // 1. Failed auction VA (highest priority - active trap in progress)
         if (result.failedAuctionDetected) {
-            return result.failedBreakoutAbove ? ImbalanceType::FAILED_AUCTION
-                                               : ImbalanceType::FAILED_AUCTION;
+            return ImbalanceType::FAILED_AUCTION_VA;
         }
 
         // 2. Climax (exhaustion at extremes - important reversal signal)
@@ -1947,8 +2138,8 @@ private:
             case ImbalanceType::POOR_HIGH:    // Weak high -> expect revisit from below
                 return ImbalanceDirection::BEARISH;
 
-            case ImbalanceType::FAILED_AUCTION:
-                // Direction is opposite to the failed breakout
+            case ImbalanceType::FAILED_AUCTION_VA:
+                // Direction is opposite to the failed breakout at VA boundary
                 return result.failedBreakoutAbove ? ImbalanceDirection::BEARISH
                                                    : ImbalanceDirection::BULLISH;
 

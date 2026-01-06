@@ -210,6 +210,34 @@ inline bool ValidateSessionLevelOrder(double poc, double vah, double val) {
     return val < poc && poc < vah;
 }
 
+/**
+ * Validate rank/score is in [0.0, 1.0] range
+ */
+inline bool ValidateRankRange(double rank) {
+    return rank >= 0.0 && rank <= 1.0;
+}
+
+/**
+ * Validate bar index is reasonable (non-negative, within max)
+ */
+inline bool ValidateBarIndex(int barIndex, int maxExpected = 1000000) {
+    return barIndex >= 0 && barIndex <= maxExpected;
+}
+
+/**
+ * Validate session extremes ordering: high > low, both positive
+ */
+inline bool ValidateSessionExtremes(double high, double low) {
+    return high > low && high > 0.0 && low > 0.0;
+}
+
+/**
+ * Validate phase bucket index is within array bounds
+ */
+inline bool ValidatePhaseBucketIndex(int idx, int bucketCount) {
+    return idx >= 0 && idx < bucketCount;
+}
+
 // ============================================================================
 // SSOT CHECKPOINT (for periodic validation)
 // ============================================================================
@@ -239,6 +267,20 @@ struct SSOTCheckpoint {
         if (!ValidateSessionLevelOrder(poc, vah, val)) {
             violationCount++;
             AMT_SSOT_ASSERT(val < poc && poc < vah, "Session level order: VAL < POC < VAH");
+        }
+    }
+
+    void CheckRank(double rank, const char* name) {
+        if (!ValidateRankRange(rank)) {
+            violationCount++;
+            AMT_SSOT_ASSERT_RANGE(rank, 0.0, 1.0, name);
+        }
+    }
+
+    void CheckSessionExtremes(double high, double low) {
+        if (!ValidateSessionExtremes(high, low)) {
+            violationCount++;
+            AMT_SSOT_ASSERT(high > low && high > 0.0 && low > 0.0, "Session extremes: high > low");
         }
     }
 

@@ -36,6 +36,7 @@
 #include "amt_core.h"
 #include "AMT_Snapshots.h"
 #include "AMT_Liquidity.h"
+#include "AMT_Invariants.h"
 
 namespace AMT {
 
@@ -341,6 +342,11 @@ public:
     ExtremeDeltaInput QueryExtremeDelta(double barDeltaPct, double sessionDeltaPct) const {
         ExtremeDeltaInput result;
 
+        // SSOT Invariant: Validate phase index before baseline queries
+        const int phaseIdx = SessionPhaseToBucketIndex(currentPhase);
+        AMT_SSOT_ASSERT(ValidatePhaseBucketIndex(phaseIdx, EFFORT_BUCKET_COUNT),
+                        "BaselineGate: invalid phase index");
+
         // Bar-level delta percentile from EffortBaselineStore
         if (effortStore != nullptr) {
             const auto& bucket = effortStore->Get(currentPhase);
@@ -361,6 +367,11 @@ public:
         SessionPhase phase, double barDeltaPct, double sessionDeltaPct) const {
 
         ExtremeDeltaInput result;
+
+        // SSOT Invariant: Validate explicit phase index
+        const int phaseIdx = SessionPhaseToBucketIndex(phase);
+        AMT_SSOT_ASSERT(ValidatePhaseBucketIndex(phaseIdx, EFFORT_BUCKET_COUNT),
+                        "BaselineGate: invalid explicit phase index in QueryExtremeDelta");
 
         if (effortStore != nullptr) {
             const auto& bucket = effortStore->Get(phase);
@@ -389,6 +400,11 @@ public:
 
         MarketCompositionInput result;
 
+        // SSOT Invariant: Validate phase index
+        const int phaseIdx = SessionPhaseToBucketIndex(currentPhase);
+        AMT_SSOT_ASSERT(ValidatePhaseBucketIndex(phaseIdx, EFFORT_BUCKET_COUNT),
+                        "BaselineGate: invalid phase index in QueryMarketComposition");
+
         if (effortStore != nullptr) {
             const auto& bucket = effortStore->Get(currentPhase);
             result.volSecPctile = bucket.vol_sec.TryPercentile(volSec);
@@ -406,6 +422,11 @@ public:
         SessionPhase phase, double volSec, double tradesSec, double avgTradeSize = 0.0) const {
 
         MarketCompositionInput result;
+
+        // SSOT Invariant: Validate explicit phase index
+        const int phaseIdx = SessionPhaseToBucketIndex(phase);
+        AMT_SSOT_ASSERT(ValidatePhaseBucketIndex(phaseIdx, EFFORT_BUCKET_COUNT),
+                        "BaselineGate: invalid explicit phase index in QueryMarketComposition");
 
         if (effortStore != nullptr) {
             const auto& bucket = effortStore->Get(phase);
@@ -429,6 +450,11 @@ public:
     RangeClassificationInput QueryRangeClassification(double barRangeTicks) const {
         RangeClassificationInput result;
 
+        // SSOT Invariant: Validate phase index
+        const int phaseIdx = SessionPhaseToBucketIndex(currentPhase);
+        AMT_SSOT_ASSERT(ValidatePhaseBucketIndex(phaseIdx, EFFORT_BUCKET_COUNT),
+                        "BaselineGate: invalid phase index in QueryRangeClassification");
+
         if (effortStore != nullptr) {
             const auto& bucket = effortStore->Get(currentPhase);
             result.rangePctile = bucket.bar_range.TryPercentile(barRangeTicks);
@@ -442,6 +468,11 @@ public:
         SessionPhase phase, double barRangeTicks) const {
 
         RangeClassificationInput result;
+
+        // SSOT Invariant: Validate explicit phase index
+        const int phaseIdx = SessionPhaseToBucketIndex(phase);
+        AMT_SSOT_ASSERT(ValidatePhaseBucketIndex(phaseIdx, EFFORT_BUCKET_COUNT),
+                        "BaselineGate: invalid explicit phase index in QueryRangeClassification");
 
         if (effortStore != nullptr) {
             const auto& bucket = effortStore->Get(phase);
@@ -461,6 +492,11 @@ public:
     DirectionalTravelInput QueryDirectionalTravel(double absCloseChangeTicks) const {
         DirectionalTravelInput result;
 
+        // SSOT Invariant: Validate phase index
+        const int phaseIdx = SessionPhaseToBucketIndex(currentPhase);
+        AMT_SSOT_ASSERT(ValidatePhaseBucketIndex(phaseIdx, EFFORT_BUCKET_COUNT),
+                        "BaselineGate: invalid phase index in QueryDirectionalTravel");
+
         if (effortStore != nullptr) {
             const auto& bucket = effortStore->Get(currentPhase);
             result.absChangePctile = bucket.abs_close_change.TryPercentile(absCloseChangeTicks);
@@ -474,6 +510,11 @@ public:
         SessionPhase phase, double absCloseChangeTicks) const {
 
         DirectionalTravelInput result;
+
+        // SSOT Invariant: Validate explicit phase index
+        const int phaseIdx = SessionPhaseToBucketIndex(phase);
+        AMT_SSOT_ASSERT(ValidatePhaseBucketIndex(phaseIdx, EFFORT_BUCKET_COUNT),
+                        "BaselineGate: invalid explicit phase index in QueryDirectionalTravel");
 
         if (effortStore != nullptr) {
             const auto& bucket = effortStore->Get(phase);
@@ -514,6 +555,11 @@ public:
 
         DepthPercentileInput result;
 
+        // SSOT Invariant: Validate phase index
+        const int phaseIdx = SessionPhaseToBucketIndex(currentPhase);
+        AMT_SSOT_ASSERT(ValidatePhaseBucketIndex(phaseIdx, EFFORT_BUCKET_COUNT),
+                        "BaselineGate: invalid phase index in QueryDepthPercentile");
+
         if (domWarmup != nullptr) {
             result.depthPctile = domWarmup->TryDepthPercentile(currentPhase, depthMassCore);
 
@@ -539,6 +585,11 @@ public:
         double spreadTicks = -1.0) const {
 
         DepthPercentileInput result;
+
+        // SSOT Invariant: Validate explicit phase index
+        const int phaseIdx = SessionPhaseToBucketIndex(phase);
+        AMT_SSOT_ASSERT(ValidatePhaseBucketIndex(phaseIdx, EFFORT_BUCKET_COUNT),
+                        "BaselineGate: invalid explicit phase index in QueryDepthPercentile");
 
         if (domWarmup != nullptr) {
             result.depthPctile = domWarmup->TryDepthPercentile(phase, depthMassCore);

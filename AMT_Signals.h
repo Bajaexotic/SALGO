@@ -13,6 +13,7 @@
 #define AMT_SIGNALS_H
 
 #include "amt_core.h"
+#include "AMT_ValueLocation.h"  // For ValueLocationResult (SSOT)
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -46,7 +47,8 @@ public:
     explicit ActivityClassifier(const Config& cfg) : config_(cfg) {}
 
     /**
-     * Classify activity for a bar given price context and delta.
+     * DEPRECATED: Classify activity for a bar given price context and delta.
+     * Use ClassifyFromValueLocation() instead which consumes ValueLocationResult (SSOT).
      *
      * @param price            Current price (typically close)
      * @param prevPrice        Previous price (for direction)
@@ -58,6 +60,7 @@ public:
      * @param volumeConviction Volume conviction (0-2, 1.0 = normal, from percentile/50)
      * @return                 Complete ActivityClassification
      */
+    [[deprecated("Use ClassifyFromValueLocation() with ValueLocationResult from ValueLocationEngine (SSOT)")]]
     ActivityClassification Classify(
         double price,
         double prevPrice,
@@ -100,6 +103,67 @@ public:
         result.participation_ = DetermineParticipation(result.priceChange, deltaPct);
 
         // 8. Derive activity type from Intent × Participation
+        result.DeriveActivityType();
+
+        return result;
+    }
+
+    /**
+     * PREFERRED: Classify activity using ValueLocationResult (SSOT-compliant)
+     *
+     * ValueLocationEngine is the SSOT for value location. This overload consumes
+     * its output rather than duplicating the location classification logic.
+     *
+     * @param valLocResult   ValueLocationResult from ValueLocationEngine (SSOT)
+     * @param price          Current price (typically close)
+     * @param prevPrice      Previous price (for direction)
+     * @param deltaPct       Bar delta as fraction of volume (-1 to +1)
+     * @param volumeConviction Volume conviction (0-2, 1.0 = normal)
+     * @return               Complete ActivityClassification
+     */
+    ActivityClassification ClassifyFromValueLocation(
+        const ValueLocationResult& valLocResult,
+        double price,
+        double prevPrice,
+        double deltaPct,
+        double volumeConviction = 1.0
+    ) const {
+        ActivityClassification result;
+
+        // Validate SSOT input
+        if (!valLocResult.IsReady()) {
+            result.valid = false;
+            return result;
+        }
+
+        result.valid = true;
+
+        // 1. Use SSOT distances directly
+        result.priceVsPOC = valLocResult.distFromPOCTicks;
+
+        // 2. Compute price change (from raw inputs, not in SSOT)
+        const double tickSize = valLocResult.vaWidthTicks > 0
+            ? (valLocResult.distFromVAHTicks - valLocResult.distFromVALTicks) / valLocResult.vaWidthTicks
+            : 0.25;  // Fallback to ES tick size
+        result.priceChange = (price - prevPrice) / tickSize;
+
+        // 3. Store delta
+        result.deltaPct = deltaPct;
+
+        // 4. Store volume conviction (clamped to [0, 2])
+        result.volumeConviction = (std::max)(0.0, (std::min)(2.0, volumeConviction));
+
+        // 5. Use SSOT location directly (map from ValueZone to ValueLocation)
+        result.location = valLocResult.location;
+
+        // 6. Determine Intent using SSOT POC distance
+        const double poc = price - (valLocResult.distFromPOCTicks * tickSize);
+        result.intent_ = DetermineIntent(price, prevPrice, poc, tickSize);
+
+        // 7. Determine Participation
+        result.participation_ = DetermineParticipation(result.priceChange, deltaPct);
+
+        // 8. Derive activity type
         result.DeriveActivityType();
 
         return result;
@@ -804,6 +868,9 @@ public:
     /**
      * Process a bar and update all AMT signals.
      *
+     * DEPRECATED: Use ProcessBarFromValueLocation() which consumes ValueLocationResult
+     * from ValueLocationEngine (SSOT) instead of computing location internally.
+     *
      * SSOT: The daltonState parameter (derived from 1TF/2TF) is the authoritative
      * source for Balance/Imbalance. Activity classification determines WHO is in
      * control (INITIATIVE/RESPONSIVE), not WHAT the state is.
@@ -827,6 +894,7 @@ public:
      *                         If UNKNOWN, StateEvidence.DerivePhase() computes locally
      * @return                 Complete StateEvidence
      */
+    [[deprecated("Use ProcessBarFromValueLocation() with ValueLocationResult from ValueLocationEngine (SSOT)")]]
     StateEvidence ProcessBar(
         double price,
         double prevPrice,
@@ -846,8 +914,16 @@ public:
     ) {
         // 1. Classify activity (with volume conviction for strength weighting)
         // This determines WHO is in control, not WHAT the state is
+        // Suppress deprecation warning: deprecated method calling deprecated method is expected
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
         ActivityClassification activity = activityClassifier_.Classify(
             price, prevPrice, poc, vah, val, deltaPct, tickSize, volumeConviction);
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
         // 2. Update state tracker (daltonState/daltonPhase are SSOT)
         StateEvidence evidence = stateTracker_.Update(activity, currentBar, daltonState, daltonPhase);
@@ -871,6 +947,71 @@ public:
         // 5. Set range extension flag
         const double prevSessionHigh = sessionHigh;  // Would need tracking
         const double prevSessionLow = sessionLow;
+        evidence.rangeExtended = (price >= sessionHigh || price <= sessionLow);
+
+        return evidence;
+    }
+
+    /**
+     * Process bar with SSOT value location from ValueLocationEngine.
+     *
+     * @param valLocResult    SSOT: ValueLocationResult from ValueLocationEngine.Compute()
+     * @param price           Current price
+     * @param prevPrice       Previous bar close
+     * @param deltaPct        Delta percentage for this bar
+     * @param tickSize        Tick size for conversions
+     * @param sessionHigh     Current session high
+     * @param sessionLow      Current session low
+     * @param currentBar      Current bar index
+     * @param tailAtHigh      Tail size at high (ticks)
+     * @param tailAtLow       Tail size at low (ticks)
+     * @param volumeConviction Volume conviction score [0,1]
+     * @param daltonState     SSOT: AMTMarketState from DaltonEngine
+     * @param daltonPhase     SSOT: CurrentPhase from DaltonState.DeriveCurrentPhase()
+     * @return                Complete StateEvidence
+     */
+    StateEvidence ProcessBarFromValueLocation(
+        const ValueLocationResult& valLocResult,
+        double price,
+        double prevPrice,
+        double deltaPct,
+        double tickSize,
+        double sessionHigh,
+        double sessionLow,
+        int currentBar,
+        double tailAtHigh = 0.0,
+        double tailAtLow = 0.0,
+        double volumeConviction = 1.0,
+        AMTMarketState daltonState = AMTMarketState::UNKNOWN,
+        CurrentPhase daltonPhase = CurrentPhase::UNKNOWN
+    ) {
+        // 1. Classify activity using SSOT (value location from ValueLocationEngine)
+        ActivityClassification activity = activityClassifier_.ClassifyFromValueLocation(
+            valLocResult, price, prevPrice, deltaPct, volumeConviction);
+
+        // 2. Update state tracker (daltonState/daltonPhase are SSOT)
+        StateEvidence evidence = stateTracker_.Update(activity, currentBar, daltonState, daltonPhase);
+
+        // 3. Update excess detection
+        ExcessType highExcess = excessDetector_.UpdateHigh(
+            sessionHigh, price, tickSize, currentBar, activity, tailAtHigh);
+        ExcessType lowExcess = excessDetector_.UpdateLow(
+            sessionLow, price, tickSize, currentBar, activity, tailAtLow);
+
+        evidence.excessDetected = excessDetector_.GetCombinedExcess();
+
+        // 4. Fill in value context - derive prices from SSOT distances
+        //    POC = price - (distFromPOCTicks * tickSize)
+        //    VAH = price - (distFromVAHTicks * tickSize)
+        //    VAL = price - (distFromVALTicks * tickSize)
+        evidence.pocPrice = price - (valLocResult.distFromPOCTicks * tickSize);
+        evidence.vahPrice = price - (valLocResult.distFromVAHTicks * tickSize);
+        evidence.valPrice = price - (valLocResult.distFromVALTicks * tickSize);
+        evidence.distFromPOCTicks = valLocResult.distFromPOCTicks;
+        evidence.distFromVAHTicks = valLocResult.distFromVAHTicks;
+        evidence.distFromVALTicks = valLocResult.distFromVALTicks;
+
+        // 5. Set range extension flag
         evidence.rangeExtended = (price >= sessionHigh || price <= sessionLow);
 
         return evidence;

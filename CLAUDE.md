@@ -70,3 +70,22 @@ int val = (std::min)(a, b);
 // Always check validity before using engine results
 if (result.IsReady()) { ... }
 ```
+
+---
+
+## Test Compilation
+
+**ALWAYS use `compile.bat`** - never use raw g++ commands or ad-hoc scripts.
+
+```batch
+# From any directory:
+E:/SierraChart/ACS_Source/test/compile.bat <test_name> run     # compile and run
+E:/SierraChart/ACS_Source/test/compile.bat <test_name> syntax  # syntax check only
+E:/SierraChart/ACS_Source/test/compile.bat all                 # run all tests
+```
+
+The script handles TEMP/TMP environment issues automatically. Do NOT:
+- Create new .bat files for compilation
+- Use `C:/msys64/usr/bin/bash.exe` commands
+- Use `powershell` for compilation
+- Set environment variables manually

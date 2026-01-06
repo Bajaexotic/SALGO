@@ -38,6 +38,8 @@
 #include "amt_core.h"
 #include "AMT_Snapshots.h"
 #include "AMT_DomEvents.h"  // DOM time-series patterns (SSOT via composition)
+#include "AMT_DomPatterns.h" // Static DOM patterns: Balance/Imbalance (Group 2)
+#include "AMT_Volatility.h"  // For VolatilityRegime (location context)
 #include <algorithm>
 #include <cmath>
 #include <deque>
@@ -86,6 +88,135 @@ struct LiquidityConfig {
     // PROCEED: friction < widenThreshold (and NORMAL/THICK)
     double hardBlockFrictionThreshold = 0.80;  // Severe friction -> hard block
     double widenFrictionThreshold = 0.50;      // Moderate friction -> widen tolerance
+
+    // ========================================================================
+    // SPATIAL PROFILE COMPUTATION GATING (Optional)
+    // ========================================================================
+    // When enabled, skip expensive spatial profile analysis when deep in
+    // balance rotation (2TF + inside value + not at edges). In this context,
+    // walls/voids are less meaningful and computation can be saved.
+    bool enableSpatialGating = false;  // Default OFF (always compute)
+};
+
+// ============================================================================
+// LIQUIDITY LOCATION CONTEXT (SSOT-Compliant Value Awareness)
+// ============================================================================
+// Provides location context for liquidity interpretation per AMT principles.
+// Walls/voids at value edges (VAH/VAL) are more significant than those at POC.
+// Market state (1TF/2TF) affects expected liquidity consumption patterns.
+//
+// SSOT: All location data derived from ValueLocationResult (ValueLocationEngine).
+// Builder pattern ensures SSOT-compliant construction.
+// ============================================================================
+
+struct LiquidityLocationContext {
+    // ========================================================================
+    // VALUE-RELATIVE LOCATION (from ValueLocationResult SSOT)
+    // ========================================================================
+    ValueZone zone = ValueZone::UNKNOWN;
+    bool atValueEdge = false;        // AT_VAH or AT_VAL (significant levels)
+    bool insideValue = false;        // Between VAH and VAL (rotation zone)
+    bool outsideValue = false;       // FAR_ABOVE or FAR_BELOW (discovery zone)
+    double distanceFromPOCTicks = 0.0;
+    double distanceFromVAHTicks = 0.0;
+    double distanceFromVALTicks = 0.0;
+
+    // ========================================================================
+    // SESSION STRUCTURE PROXIMITY
+    // ========================================================================
+    bool atSessionExtreme = false;   // Near session high/low
+    bool atIBBoundary = false;       // Near IB high/low
+
+    // ========================================================================
+    // MARKET STATE CONTEXT
+    // ========================================================================
+    AMTMarketState marketState = AMTMarketState::UNKNOWN;
+    bool is1TF = false;              // IMBALANCE (one-time framing, trending)
+    bool is2TF = false;              // BALANCE (two-time framing, rotation)
+
+    // ========================================================================
+    // VOLATILITY CONTEXT (for threshold adjustment)
+    // ========================================================================
+    VolatilityRegime volRegime = VolatilityRegime::UNKNOWN;
+    bool isCompression = false;      // Tighter spreads expected, depth looks thinner
+    bool isExpansion = false;        // Wider spreads normal, depth gets consumed
+
+    // ========================================================================
+    // VALIDITY
+    // ========================================================================
+    bool isValid = false;
+
+    // ========================================================================
+    // HELPERS
+    // ========================================================================
+    bool IsAtMeaningfulLevel() const {
+        return atValueEdge || atSessionExtreme || atIBBoundary;
+    }
+
+    bool IsInDiscovery() const {
+        return outsideValue && !atValueEdge;
+    }
+
+    // ========================================================================
+    // SSOT-COMPLIANT BUILDER
+    // ========================================================================
+    // Builds context from ValueLocationResult (SSOT) + external market context.
+    // All location classification comes from ValueLocationEngine, not recomputed.
+    //
+    // Parameters:
+    //   valLocResult: ValueLocationResult from ValueLocationEngine (SSOT)
+    //   marketState: AMTMarketState from DaltonEngine
+    //   volRegime: VolatilityRegime from VolatilityEngine
+    //   sessionHigh/Low: From StructureTracker (ZoneManager.structure)
+    //   ibHigh/Low: Initial Balance from DaltonEngine (frozen after IB window)
+    //   currentPrice: Current reference price
+    //   tickSize: Instrument tick size
+    // ========================================================================
+    static LiquidityLocationContext BuildFromValueLocation(
+        const ValueLocationResult& valLocResult,
+        AMTMarketState marketState,
+        VolatilityRegime volRegime,
+        double sessionHigh, double sessionLow,
+        double ibHigh, double ibLow,
+        double currentPrice, double tickSize)
+    {
+        LiquidityLocationContext ctx;
+
+        if (!valLocResult.IsReady() || tickSize <= 0.0) {
+            ctx.isValid = false;
+            return ctx;
+        }
+
+        // Extract from SSOT (NO recomputation of location)
+        ctx.zone = valLocResult.confirmedZone;
+        ctx.atValueEdge = (ctx.zone == ValueZone::AT_VAH || ctx.zone == ValueZone::AT_VAL);
+        ctx.insideValue = valLocResult.IsInsideValue();
+        ctx.outsideValue = (ctx.zone == ValueZone::FAR_ABOVE_VALUE || ctx.zone == ValueZone::FAR_BELOW_VALUE);
+        ctx.distanceFromPOCTicks = valLocResult.distFromPOCTicks;
+        ctx.distanceFromVAHTicks = valLocResult.distFromVAHTicks;
+        ctx.distanceFromVALTicks = valLocResult.distFromVALTicks;
+
+        // Session structure proximity (2 tick tolerance)
+        const double tolerance = 2.0 * tickSize;
+        ctx.atSessionExtreme = (sessionHigh > 0.0 && std::abs(currentPrice - sessionHigh) <= tolerance) ||
+                               (sessionLow > 0.0 && std::abs(currentPrice - sessionLow) <= tolerance);
+        ctx.atIBBoundary = (ibHigh > 0.0 && std::abs(currentPrice - ibHigh) <= tolerance) ||
+                           (ibLow > 0.0 && std::abs(currentPrice - ibLow) <= tolerance);
+
+        // Market state
+        ctx.marketState = marketState;
+        ctx.is1TF = (marketState == AMTMarketState::IMBALANCE);
+        ctx.is2TF = (marketState == AMTMarketState::BALANCE);
+
+        // Volatility
+        ctx.volRegime = volRegime;
+        ctx.isCompression = (volRegime == VolatilityRegime::COMPRESSION);
+        ctx.isExpansion = (volRegime == VolatilityRegime::EXPANSION ||
+                           volRegime == VolatilityRegime::EVENT);
+
+        ctx.isValid = true;
+        return ctx;
+    }
 };
 
 // ============================================================================
@@ -454,7 +585,12 @@ struct SpatialLiquidityProfile {
     int errorBar = -1;                // Bar index when computed
     bool wallBaselineReady = false;   // True if baseline has enough data for sigma
 
+    // Computation gating (optional optimization)
+    bool skipped = false;             // True if spatial analysis was skipped (gating)
+    const char* skippedReason = nullptr;  // Reason for skip (nullptr = not skipped)
+
     // Helpers
+    bool WasSkipped() const { return skipped; }
     bool IsReady() const { return valid; }
     bool HasWalls() const { return !walls.empty(); }
     bool HasVoids() const { return !voids.empty(); }
@@ -672,6 +808,104 @@ struct Liq3Result {
     bool HasSweepLiquidation() const { return HasDomEvent(DOMEvent::SWEEP_LIQUIDATION); }
     bool HasOrderFlowReversal() const { return HasDomEvent(DOMEvent::ORDER_FLOW_REVERSAL); }
 
+    // ========================================================================
+    // GROUP 2: STATIC DOM PATTERNS (Balance + Imbalance)
+    // ========================================================================
+    // Detected from DomHistoryBuffer using Group 1 features.
+    // Patterns: BalanceDOMPattern (4 types) + ImbalanceDOMPattern (5 types)
+    // See AMT_DomPatterns.h for pattern definitions and detection logic.
+    // ========================================================================
+    std::vector<BalanceDOMPattern> balancePatterns;     // Active balance patterns
+    std::vector<ImbalanceDOMPattern> imbalancePatterns; // Active imbalance patterns
+    std::vector<BalanceDOMHit> balanceHits;             // Balance hits with strength
+    std::vector<ImbalanceDOMHit> imbalanceHits;         // Imbalance hits with strength
+
+    // Group 2 pattern helpers
+    bool HasGroup2Patterns() const { return !balancePatterns.empty() || !imbalancePatterns.empty(); }
+    bool HasBalancePattern(BalanceDOMPattern p) const {
+        for (auto& bp : balancePatterns) if (bp == p) return true;
+        return false;
+    }
+    bool HasImbalancePattern(ImbalanceDOMPattern p) const {
+        for (auto& ip : imbalancePatterns) if (ip == p) return true;
+        return false;
+    }
+    // Specific Group 2 queries
+    bool HasStackedBids() const { return HasBalancePattern(BalanceDOMPattern::STACKED_BIDS); }
+    bool HasStackedAsks() const { return HasBalancePattern(BalanceDOMPattern::STACKED_ASKS); }
+    bool HasOrderReloading() const { return HasBalancePattern(BalanceDOMPattern::ORDER_RELOADING); }
+    bool HasSpoofOrderFlip() const { return HasBalancePattern(BalanceDOMPattern::SPOOF_ORDER_FLIP); }
+    bool HasChasingOrdersBuy() const { return HasImbalancePattern(ImbalanceDOMPattern::CHASING_ORDERS_BUY); }
+    bool HasChasingOrdersSell() const { return HasImbalancePattern(ImbalanceDOMPattern::CHASING_ORDERS_SELL); }
+    bool HasBidAskRatioExtreme() const { return HasImbalancePattern(ImbalanceDOMPattern::BID_ASK_RATIO_EXTREME); }
+    bool HasAbsorptionFailure() const { return HasImbalancePattern(ImbalanceDOMPattern::ABSORPTION_FAILURE); }
+
+    // Combined pattern check (Group 1 + Group 2)
+    bool HasAnyDomPattern() const { return HasDomPatterns() || HasGroup2Patterns(); }
+
+    // ========================================================================
+    // SPATIAL DOM PATTERNS (Per-Price-Level Time-Series Detection)
+    // ========================================================================
+    // Detected from SpatialDomHistoryBuffer per-level tracking.
+    // Tracks quantity changes at ±10 price levels over time to detect:
+    //   - Spoofing: Large orders that appear then vanish before execution
+    //   - Iceberg: Hidden orders that refill after partial fills
+    //   - Wall Breaking: Large resting orders being progressively absorbed
+    //   - Flip Detection: Bid walls becoming ask walls (trapped traders)
+    // See AMT_DomEvents.h for SpatialDomSnapshot and detection logic.
+    // ========================================================================
+    bool hasSpoofing = false;              // Spoofing detected this bar
+    bool hasIceberg = false;               // Iceberg refilling detected
+    bool hasWallBreak = false;             // Wall being absorbed
+    bool hasFlip = false;                  // Order book flip detected
+    int spoofingCount = 0;                 // Number of spoofing hits
+    int icebergCount = 0;                  // Number of iceberg hits
+    int wallBreakCount = 0;                // Number of wall break hits
+    int flipCount = 0;                     // Number of flip hits
+    bool spatialPatternsEligible = false;  // True if enough spatial history
+
+    // Context-aware spatial pattern fields (Jan 2025)
+    // Context adjusts significance based on auction location (POC/VAH/VAL) and market state (balance/imbalance)
+    bool spatialContextValid = false;                       // True if context was applied
+    float maxSpatialSignificance = 0.0f;                    // Highest significance after context adjustment
+    PatternInterpretation dominantInterpretation = PatternInterpretation::NOISE;  // Most significant pattern's meaning
+    ValueZone spatialValueZone = ValueZone::UNKNOWN;        // Where in auction context was captured (SSOT)
+    DomMarketState spatialMarketState = DomMarketState::UNKNOWN;        // Balance/Imbalance state when captured
+
+    // Context-aware helpers
+    bool HasHighSignificanceSpatialPatterns(float threshold = 0.7f) const {
+        return spatialContextValid && maxSpatialSignificance >= threshold;
+    }
+    bool IsSpatialPatternAtEdge() const {
+        return spatialValueZone == ValueZone::AT_VAH ||
+               spatialValueZone == ValueZone::AT_VAL;
+    }
+    bool IsSpatialPatternSignificant() const {
+        // Patterns at value edges are always significant, or if significance exceeds threshold
+        return HasSpatialPatterns() && (IsSpatialPatternAtEdge() || maxSpatialSignificance >= 0.6f);
+    }
+
+    // Spatial pattern helpers
+    bool HasSpatialPatterns() const {
+        return hasSpoofing || hasIceberg || hasWallBreak || hasFlip;
+    }
+    int GetSpatialPatternCount() const {
+        return spoofingCount + icebergCount + wallBreakCount + flipCount;
+    }
+    bool HasManipulativePattern() const {
+        // Spoofing and flips are typically manipulative
+        return hasSpoofing || hasFlip;
+    }
+    bool HasAbsorptionPattern() const {
+        // Iceberg and wall break indicate absorption activity
+        return hasIceberg || hasWallBreak;
+    }
+
+    // Combined check: all DOM pattern types (Group 1 + Group 2 + Spatial)
+    bool HasAnyDomPatternComplete() const {
+        return HasAnyDomPattern() || HasSpatialPatterns();
+    }
+
     // Helper: Check if this is a warmup state (not a true error)
     bool IsWarmup() const {
         return errorReason == LiquidityErrorReason::WARMUP_DEPTH ||
@@ -741,6 +975,50 @@ struct Liq3Result {
     // Helper: Should we block execution?
     bool ShouldBlock() const {
         return recommendedAction == LiquidityAction::HARD_BLOCK;
+    }
+
+    // ========================================================================
+    // LOCATION CONTEXT (from ValueLocationEngine SSOT, Jan 2025)
+    // ========================================================================
+    // Provides auction location awareness for liquidity interpretation.
+    // Walls/voids at value edges are more significant than those at POC.
+    // Market state (1TF/2TF) affects expected consumption patterns.
+    // ========================================================================
+    LiquidityLocationContext locationContext;  // Full context for downstream
+    bool hasLocationContext = false;           // True if location context was provided
+
+    // Location-adjusted thresholds (computed in ApplyLocationContext)
+    double locationAdjustedVoidThreshold = 0.10;  // May be lowered at edges
+    double stressContextMultiplier = 1.0;         // May reduce stress penalty in 1TF
+    double depthContextMultiplier = 1.0;          // May boost depth rank in compression
+    double spreadContextMultiplier = 1.0;         // May reduce spread penalty in expansion
+    bool rotationExpected = false;                // True in 2TF inside value
+
+    // ========================================================================
+    // LOCATION-AWARE HELPERS
+    // ========================================================================
+    bool IsAtMeaningfulLevel() const {
+        return hasLocationContext && locationContext.IsAtMeaningfulLevel();
+    }
+
+    bool IsWallSignificant() const {
+        // Walls at value edges and session extremes are more significant
+        return IsAtMeaningfulLevel() && HasSpatialWalls();
+    }
+
+    bool IsVoidSignificant() const {
+        // Voids outside value indicate discovery/acceleration potential
+        return hasLocationContext && locationContext.outsideValue && HasSpatialVoids();
+    }
+
+    bool IsRotationContext() const {
+        // In 2TF inside value, rotation/absorption is expected behavior
+        return hasLocationContext && locationContext.is2TF && locationContext.insideValue;
+    }
+
+    bool IsTrendContext() const {
+        // In 1TF, sustained directional consumption is expected
+        return hasLocationContext && locationContext.is1TF;
     }
 };
 
@@ -1372,6 +1650,109 @@ public:
         }
 
         return snap;
+    }
+
+    // ========================================================================
+    // LOCATION CONTEXT APPLICATION (Internal Helper)
+    // ========================================================================
+    // Applies location context to liquidity result, adjusting thresholds
+    // and interpretation based on auction location per AMT principles.
+    // ========================================================================
+    void ApplyLocationContext(Liq3Result& result, const LiquidityLocationContext& locCtx) {
+        // Store location context in result for downstream consumers
+        result.locationContext = locCtx;
+        result.hasLocationContext = true;
+
+        if (!locCtx.isValid) {
+            return;  // Invalid context - no adjustments
+        }
+
+        // ====================================================================
+        // VOID THRESHOLD ADJUSTMENT
+        // ====================================================================
+        // At meaningful levels (value edges, session extremes, IB boundary):
+        // - Expect more liquidity consumption (aggressive activity)
+        // - Lower the VOID threshold (easier to classify as THIN instead of VOID)
+        // This reflects that depth gets absorbed at key levels naturally.
+        if (locCtx.IsAtMeaningfulLevel()) {
+            result.locationAdjustedVoidThreshold = 0.10 * 0.8;  // 8% instead of 10%
+        }
+
+        // ====================================================================
+        // MARKET STATE ADJUSTMENTS
+        // ====================================================================
+        if (locCtx.is1TF) {
+            // IMBALANCE (1TF): Expect sustained directional pressure
+            // High stress in trending context is NORMAL (directional consumption)
+            // Reduce stress penalty in composite LIQ interpretation
+            result.stressContextMultiplier = 0.8;  // 20% reduction in stress weight
+        }
+        else if (locCtx.is2TF && locCtx.insideValue) {
+            // BALANCE (2TF) inside value: Rotation expected
+            // Flag for downstream that absorption patterns are normal behavior
+            // Don't penalize "consumption" - it's rotational, not directional
+            result.rotationExpected = true;
+        }
+
+        // ====================================================================
+        // VOLATILITY REGIME ADJUSTMENTS
+        // ====================================================================
+        if (locCtx.isCompression) {
+            // COMPRESSION: Tighter spreads expected, lower depth normal
+            // Don't penalize thin depth - it's the regime, not a warning sign
+            result.depthContextMultiplier = 1.2;  // Boost depth rank interpretation
+        }
+        else if (locCtx.isExpansion) {
+            // EXPANSION/EVENT: Wider spreads normal, depth gets consumed
+            // Don't over-penalize wide spreads - expected in this regime
+            result.spreadContextMultiplier = 0.8;  // Reduce spread penalty weight
+        }
+    }
+
+    // ========================================================================
+    // LOCATION-AWARE COMPUTE (Main Entry Point for AMT-Aware Processing)
+    // ========================================================================
+    // Calls base Compute() then applies location context adjustments.
+    // This is the preferred method when ValueLocationResult is available.
+    //
+    // Pattern: Build LiquidityLocationContext from SSOT sources, then pass here.
+    //   auto locCtx = LiquidityLocationContext::BuildFromValueLocation(
+    //       st->lastValueLocationResult, daltonState, volRegime,
+    //       sessionHigh, sessionLow, ibHigh, ibLow, currentPrice, tickSize);
+    //   result = engine.ComputeWithLocation(..., locCtx);
+    // ========================================================================
+    template<typename GetBidLevel, typename GetAskLevel>
+    Liq3Result ComputeWithLocation(
+        double referencePrice,
+        double tickSize,
+        int maxLevels,
+        GetBidLevel getBidLevel,
+        GetAskLevel getAskLevel,
+        double askVolume,
+        double bidVolume,
+        double barDurationSec,
+        const LiquidityLocationContext& locCtx,  // Location context (SSOT-derived)
+        double spreadTicks = -1.0,
+        double consumedBidMass = -1.0,
+        double consumedAskMass = -1.0,
+        int64_t currentTimeMs = -1,
+        int64_t domTimestampMs = -1
+    ) {
+        // Call base Compute() first (all normal processing)
+        Liq3Result result = Compute(
+            referencePrice, tickSize, maxLevels,
+            getBidLevel, getAskLevel,
+            askVolume, bidVolume, barDurationSec,
+            spreadTicks, consumedBidMass, consumedAskMass,
+            currentTimeMs, domTimestampMs
+        );
+
+        // Apply location context adjustments if valid
+        if (locCtx.isValid) {
+            ApplyLocationContext(result, locCtx);
+        }
+
+        return result;
     }
 
     // ========================================================================
@@ -2107,6 +2488,111 @@ public:
     }
 
     // ========================================================================
+    // LOCATION-AWARE SPATIAL PROFILE (AMT-Adjusted Wall/Void Significance)
+    // ========================================================================
+    // Calls base ComputeSpatialProfile() then adjusts wall/void significance
+    // based on auction location per AMT principles:
+    //   - Walls at value edges (VAH/VAL) are more significant (1.5x)
+    //   - Walls at session extremes are more significant (1.5x)
+    //   - Walls inside value are less significant (0.7x)
+    //   - Voids outside value have higher acceleration risk (1.3x)
+    //
+    // Pattern: Build LiquidityLocationContext from SSOT sources, then pass here.
+    // ========================================================================
+    SpatialLiquidityProfile ComputeSpatialProfileWithLocation(
+        const std::vector<std::pair<double, double>>& bidLevels,
+        const std::vector<std::pair<double, double>>& askLevels,
+        double referencePrice,
+        double tickSize,
+        int barIndex,
+        const LiquidityLocationContext& locCtx
+    ) {
+        // ====================================================================
+        // COMPUTATION GATING: Skip when deep in balance rotation
+        // ====================================================================
+        // When enabled and conditions met, skip expensive spatial analysis.
+        // Deep in rotation = 2TF + inside value + not at meaningful level.
+        // In this context, walls/voids are transient staging, not signals.
+        // ====================================================================
+        if (config.enableSpatialGating && locCtx.isValid) {
+            const bool deepInRotation = locCtx.is2TF &&
+                                         locCtx.insideValue &&
+                                         !locCtx.atValueEdge &&
+                                         !locCtx.atSessionExtreme &&
+                                         !locCtx.atIBBoundary;
+            if (deepInRotation) {
+                SpatialLiquidityProfile skippedProfile;
+                skippedProfile.valid = false;
+                skippedProfile.skipped = true;
+                skippedProfile.skippedReason = "Rotation zone - spatial irrelevant";
+                skippedProfile.errorBar = barIndex;
+                return skippedProfile;
+            }
+        }
+
+        // Call base spatial profile computation
+        SpatialLiquidityProfile profile = ComputeSpatialProfile(
+            bidLevels, askLevels, referencePrice, tickSize, barIndex
+        );
+
+        if (!profile.valid || !locCtx.isValid) {
+            return profile;  // No adjustment if invalid
+        }
+
+        // ====================================================================
+        // WALL SIGNIFICANCE ADJUSTMENT
+        // ====================================================================
+        // Walls at meaningful levels (value edges, session extremes) are more
+        // significant because:
+        //   - They represent defended levels with institutional participation
+        //   - Rejection/acceptance at these levels has larger implications
+        //
+        // Walls inside value are less significant because:
+        //   - Rotation is expected, walls may just be temporary staging
+        //   - Don't over-weight normal balance area activity
+        // ====================================================================
+        const bool atMeaningfulLevel = locCtx.IsAtMeaningfulLevel();
+        const bool insideValueRotation = locCtx.is2TF && locCtx.insideValue && !locCtx.atValueEdge;
+
+        for (auto& wall : profile.walls) {
+            if (atMeaningfulLevel) {
+                // At value edge or session extreme: walls are more meaningful
+                wall.sigmaScore *= 1.5;
+            }
+            else if (insideValueRotation) {
+                // Deep inside value during rotation: walls are less meaningful
+                wall.sigmaScore *= 0.7;
+            }
+        }
+
+        // ====================================================================
+        // VOID ACCELERATION RISK ADJUSTMENT
+        // ====================================================================
+        // Voids outside value indicate discovery zones where price can
+        // accelerate rapidly. Increase their risk factor.
+        // ====================================================================
+        if (locCtx.outsideValue) {
+            // In discovery: voids = fast moves
+            profile.riskUp.hasVoidAcceleration = profile.riskUp.hasVoidAcceleration ||
+                                                  (profile.askVoidCount > 0);
+            profile.riskDown.hasVoidAcceleration = profile.riskDown.hasVoidAcceleration ||
+                                                    (profile.bidVoidCount > 0);
+
+            // Boost risk estimates for voids in discovery
+            if (profile.riskUp.voidsTraversed > 0) {
+                profile.riskUp.estimatedSlippageTicks *= 1.3;
+                profile.riskUp.isHighRisk = true;
+            }
+            if (profile.riskDown.voidsTraversed > 0) {
+                profile.riskDown.estimatedSlippageTicks *= 1.3;
+                profile.riskDown.isHighRisk = true;
+            }
+        }
+
+        return profile;
+    }
+
+    // ========================================================================
     // DOM TIME-SERIES PATTERN DETECTION (SSOT via Composition)
     // ========================================================================
     // LiquidityEngine OWNS the DOM history buffer and pattern detection.
@@ -2126,7 +2612,13 @@ public:
 
 private:
     DomHistoryBuffer domHistory_;        // SSOT for DOM time-series
-    DomEventLogState domLogState_;       // Throttled logging state
+    DomEventLogState domLogState_;       // Throttled logging state (Group 1)
+    DomPatternLogState domPatternLogState_; // Throttled logging state (Group 2)
+
+    // Spatial DOM time-series (per-price-level tracking)
+    SpatialDomHistoryBuffer spatialDomHistory_;        // Per-level DOM snapshots
+    EmpiricalBaseline spatialQuantityBaseline_;        // Baseline for spoofing/wall detection
+    SpatialDomPatternLogState spatialLogState_;        // Throttled logging state
 
 public:
     // ========================================================================
@@ -2226,6 +2718,73 @@ public:
     }
 
     // ========================================================================
+    // GROUP 2: STATIC DOM PATTERN DETECTION
+    // ========================================================================
+    // Detects BalanceDOMPattern and ImbalanceDOMPattern from DOM time-series.
+    // Must be called AFTER DetectDomPatterns() (Group 1) since it needs those results.
+    //
+    // Pattern types:
+    //   BalanceDOMPattern: STACKED_BIDS, STACKED_ASKS, ORDER_RELOADING, SPOOF_ORDER_FLIP
+    //   ImbalanceDOMPattern: CHASING_ORDERS_BUY, CHASING_ORDERS_SELL, BID_ASK_RATIO_EXTREME,
+    //                        ABSORPTION_FAILURE (composite)
+    // ========================================================================
+
+    // Detect Group 2 patterns from history buffer (requires Group 1 result)
+    DomPatternResult DetectGroup2Patterns(
+        const DomDetectionResult& group1Result,
+        int windowMs = DomEventConfig::DEFAULT_WINDOW_MS) const
+    {
+        auto window = domHistory_.GetWindow(windowMs);
+        DomEventFeatures features = ExtractFeatures(window, windowMs);
+        // Call free function from AMT_DomPatterns.h (not member DetectDomPatterns)
+        return ::AMT::DetectDomPatterns(domHistory_, features, group1Result, windowMs);
+    }
+
+    // Copy Group 2 pattern results to Liq3Result
+    void CopyGroup2Patterns(Liq3Result& snap, const DomPatternResult& result) const
+    {
+        snap.balancePatterns = result.balancePatterns;
+        snap.imbalancePatterns = result.imbalancePatterns;
+        snap.balanceHits = result.balanceHits;
+        snap.imbalanceHits = result.imbalanceHits;
+    }
+
+    // Full Group 2 detection + copy in one call
+    DomPatternResult DetectAndCopyGroup2Patterns(
+        Liq3Result& snap,
+        const DomDetectionResult& group1Result,
+        int windowMs = DomEventConfig::DEFAULT_WINDOW_MS)
+    {
+        DomPatternResult result = DetectGroup2Patterns(group1Result, windowMs);
+        CopyGroup2Patterns(snap, result);
+        return result;
+    }
+
+    // Check if Group 2 pattern detection should log (throttled)
+    bool ShouldLogGroup2Patterns(const DomPatternResult& result, int currentBar)
+    {
+        return domPatternLogState_.ShouldLog(result, currentBar);
+    }
+
+    // ========================================================================
+    // COMBINED: Detect Both Group 1 + Group 2 Patterns
+    // ========================================================================
+    // Convenience method to run both detection groups in sequence.
+    // Returns Group 1 result; Group 2 result is copied to snap.
+    DomDetectionResult DetectAndCopyAllDomPatterns(
+        Liq3Result& snap,
+        int windowMs = DomEventConfig::DEFAULT_WINDOW_MS)
+    {
+        // Group 1: Control patterns + Events
+        DomDetectionResult group1 = DetectAndCopyDomPatterns(snap, windowMs);
+
+        // Group 2: Balance + Imbalance patterns (requires Group 1)
+        DetectAndCopyGroup2Patterns(snap, group1, windowMs);
+
+        return group1;
+    }
+
+    // ========================================================================
     // Get DOM history buffer status
     // ========================================================================
     size_t GetDomHistorySize() const { return domHistory_.Size(); }
@@ -2238,7 +2797,230 @@ public:
     {
         domHistory_.Reset();
         domLogState_.Reset();
+        domPatternLogState_.Reset();
     }
+
+    // ========================================================================
+    // SPATIAL DOM TIME-SERIES - Per-price-level order book tracking
+    // ========================================================================
+    // Enables detection of:
+    //   - Spoofing/Pulling: Large orders that vanish before price reaches them
+    //   - Iceberg/Reloading: Levels that keep refilling (hidden liquidity)
+    //   - Wall Breaking: Large resting orders getting absorbed
+    //   - Flip Detection: Bid walls becoming ask walls (trapped traders)
+    // ========================================================================
+
+    // Push spatial DOM snapshot to history buffer
+    void PushSpatialDomSnapshot(const SpatialDomSnapshot& snapshot)
+    {
+        spatialDomHistory_.Push(snapshot);
+
+        // Update quantity baseline for spoofing/wall detection
+        for (const auto& level : snapshot.levels)
+        {
+            if (level.isValid && level.quantity > 0)
+            {
+                spatialQuantityBaseline_.Push(level.quantity);
+            }
+        }
+    }
+
+    // Get spatial DOM history buffer status
+    size_t GetSpatialDomHistorySize() const { return spatialDomHistory_.Size(); }
+    bool HasSpatialDomMinSamples() const { return spatialDomHistory_.HasMinSamples(); }
+
+    // Detect spatial DOM patterns
+    SpatialDomPatternResult DetectSpatialPatterns(
+        double currentPrice,
+        double tickSize,
+        int windowMs = SpatialDomConfig::DEFAULT_WINDOW_MS) const
+    {
+        // Get P80 and P90 thresholds from baseline
+        const double quantityP80 = spatialQuantityBaseline_.IsReady(10)
+            ? spatialQuantityBaseline_.PercentileRank(80) : 100.0;
+        const double quantityP90 = spatialQuantityBaseline_.IsReady(10)
+            ? spatialQuantityBaseline_.PercentileRank(90) : 200.0;
+
+        return ::AMT::DetectSpatialDomPatterns(
+            spatialDomHistory_, quantityP80, quantityP90, currentPrice, tickSize, windowMs);
+    }
+
+    // Copy spatial pattern results to Liq3Result
+    void CopySpatialPatterns(Liq3Result& snap, const SpatialDomPatternResult& result) const
+    {
+        snap.hasSpoofing = result.HasSpoofing();
+        snap.hasIceberg = result.HasIceberg();
+        snap.hasWallBreak = result.HasWallBreak();
+        snap.hasFlip = result.HasFlip();
+        snap.spoofingCount = static_cast<int>(result.spoofingHits.size());
+        snap.icebergCount = static_cast<int>(result.icebergHits.size());
+        snap.wallBreakCount = static_cast<int>(result.wallBreakHits.size());
+        snap.flipCount = static_cast<int>(result.flipHits.size());
+        snap.spatialPatternsEligible = result.wasEligible;
+
+        // Copy context-aware fields (Jan 2025)
+        snap.spatialContextValid = result.hasContext;
+        if (result.hasContext)
+        {
+            snap.maxSpatialSignificance = result.GetMaxSignificance();
+            snap.dominantInterpretation = result.GetDominantInterpretation();
+            snap.spatialValueZone = result.appliedContext.valueZone;  // SSOT from ValueLocationEngine
+            snap.spatialMarketState = result.appliedContext.marketState;
+        }
+        else
+        {
+            snap.maxSpatialSignificance = 0.0f;
+            snap.dominantInterpretation = PatternInterpretation::NOISE;
+            snap.spatialValueZone = ValueZone::UNKNOWN;
+            snap.spatialMarketState = DomMarketState::UNKNOWN;
+        }
+    }
+
+    // Detect and copy spatial patterns in one call
+    SpatialDomPatternResult DetectAndCopySpatialPatterns(
+        Liq3Result& snap,
+        double currentPrice,
+        double tickSize,
+        int windowMs = SpatialDomConfig::DEFAULT_WINDOW_MS)
+    {
+        auto result = DetectSpatialPatterns(currentPrice, tickSize, windowMs);
+        CopySpatialPatterns(snap, result);
+        return result;
+    }
+
+    // ========================================================================
+    // CONTEXT-AWARE SPATIAL DOM PATTERN DETECTION (Jan 2025)
+    // ========================================================================
+    // Patterns have different significance depending on auction location:
+    //   - At POC: Low significance (noise, normal rotation)
+    //   - At VAH/VAL: High significance (manipulation, breakout signals)
+    //   - In Discovery: Very high significance (strong conviction needed)
+    // Market state also affects interpretation:
+    //   - Balance: Patterns more likely to be noise/defensive
+    //   - Imbalance: Patterns more likely to be aggressive/directional
+    // ========================================================================
+
+    // Context-aware detect: Apply auction context to detected patterns
+    SpatialDomPatternResult DetectSpatialPatterns(
+        double currentPrice,
+        double tickSize,
+        const DomPatternContext& ctx,
+        int windowMs = SpatialDomConfig::DEFAULT_WINDOW_MS) const
+    {
+        const double quantityP80 = spatialQuantityBaseline_.IsReady(10)
+            ? spatialQuantityBaseline_.PercentileRank(80) : 100.0;
+        const double quantityP90 = spatialQuantityBaseline_.IsReady(10)
+            ? spatialQuantityBaseline_.PercentileRank(90) : 200.0;
+
+        return ::AMT::DetectSpatialDomPatterns(
+            spatialDomHistory_, quantityP80, quantityP90,
+            currentPrice, tickSize, ctx, windowMs);
+    }
+
+    // Context-aware detect and copy in one call
+    SpatialDomPatternResult DetectAndCopySpatialPatterns(
+        Liq3Result& snap,
+        double currentPrice,
+        double tickSize,
+        const DomPatternContext& ctx,
+        int windowMs = SpatialDomConfig::DEFAULT_WINDOW_MS)
+    {
+        auto result = DetectSpatialPatterns(currentPrice, tickSize, ctx, windowMs);
+        CopySpatialPatterns(snap, result);
+        return result;
+    }
+
+    // Build context from auction levels and market state
+    // Convenience helper to create DomPatternContext from common inputs
+    // PREFERRED: Build context from ValueLocationEngine output (SSOT-compliant)
+    // This uses the already-computed value location from ValueLocationEngine
+    static DomPatternContext BuildPatternContextFromValueLocation(
+        const ValueLocationResult& valLocResult,
+        AMTMarketState marketState,
+        bool valueMigratingHigher = false,
+        bool valueMigratingLower = false,
+        bool priceRising = false,
+        bool priceFalling = false)
+    {
+        const bool is1TF = (marketState == AMTMarketState::IMBALANCE);
+        return DomPatternContext::BuildFromValueLocation(
+            valLocResult,
+            is1TF,
+            valueMigratingHigher,
+            valueMigratingLower,
+            priceRising,
+            priceFalling);
+    }
+
+    // DEPRECATED: Build context from raw values (duplicates ValueLocationEngine computation)
+    // Use BuildPatternContextFromValueLocation() with ValueLocationEngine output instead.
+    static DomPatternContext BuildPatternContext(
+        double currentPrice,
+        double poc,
+        double vah,
+        double val,
+        double tickSize,
+        AMTMarketState marketState,
+        bool valueMigratingHigher = false,
+        bool valueMigratingLower = false,
+        bool isNearSessionExtreme = false,
+        double sessionHigh = 0.0,
+        double sessionLow = 0.0,
+        bool priceRising = false,
+        bool priceFalling = false)
+    {
+        const bool is1TF = (marketState == AMTMarketState::IMBALANCE);
+        return DomPatternContext::Build(
+            currentPrice, poc, vah, val,
+            sessionHigh, sessionLow, tickSize,
+            is1TF,
+            valueMigratingHigher,
+            valueMigratingLower,
+            priceRising,
+            priceFalling,
+            2.0,   // Default edge tolerance ticks
+            10.0); // Default discovery threshold ticks
+    }
+
+    // Check if should log spatial patterns (rate limiting)
+    bool ShouldLogSpatialPatterns(const SpatialDomPatternResult& result, int currentBar)
+    {
+        bool shouldLog = false;
+
+        if (result.HasSpoofing() && spatialLogState_.ShouldLogSpoofing(currentBar))
+        {
+            spatialLogState_.lastSpoofLogBar = currentBar;
+            shouldLog = true;
+        }
+        if (result.HasIceberg() && spatialLogState_.ShouldLogIceberg(currentBar))
+        {
+            spatialLogState_.lastIcebergLogBar = currentBar;
+            shouldLog = true;
+        }
+        if (result.HasWallBreak() && spatialLogState_.ShouldLogWallBreak(currentBar))
+        {
+            spatialLogState_.lastWallBreakLogBar = currentBar;
+            shouldLog = true;
+        }
+        if (result.HasFlip() && spatialLogState_.ShouldLogFlip(currentBar))
+        {
+            spatialLogState_.lastFlipLogBar = currentBar;
+            shouldLog = true;
+        }
+
+        return shouldLog;
+    }
+
+    // Reset spatial DOM history (call at session boundary)
+    void ResetSpatialDomHistory()
+    {
+        spatialDomHistory_.Reset();
+        spatialQuantityBaseline_.Reset(config.baselineWindow);
+        spatialLogState_.Reset();
+    }
+
+    // Get spatial log state reference (for external log formatting)
+    const SpatialDomPatternLogState& GetSpatialLogState() const { return spatialLogState_; }
 };
 
 } // namespace AMT

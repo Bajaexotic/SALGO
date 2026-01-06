@@ -182,6 +182,36 @@ inline DomPatternFeatures ExtractPatternFeatures(
 }
 
 // ============================================================================
+// HIT STRUCTS - Return types for static pattern detectors
+// ============================================================================
+
+struct BalanceDOMHit
+{
+    BalanceDOMPattern type = BalanceDOMPattern::STACKED_BIDS;
+    float strength01 = 0.0f;    // [0, 1] strength of the pattern
+    int windowMs = 0;           // Detection window used
+
+    // Sort by strength descending (strongest patterns first)
+    bool operator<(const BalanceDOMHit& other) const {
+        return strength01 > other.strength01;
+    }
+};
+
+struct ImbalanceDOMHit
+{
+    ImbalanceDOMPattern type = ImbalanceDOMPattern::CHASING_ORDERS_BUY;
+    float strength01 = 0.0f;    // [0, 1] strength of the pattern
+    int windowMs = 0;           // Detection window used
+    int anchorTick = 0;         // Price anchor in ticks (optional, used by BID_ASK_RATIO_EXTREME)
+    bool isComposite = false;   // True if composite pattern (e.g., ABSORPTION_FAILURE)
+
+    // Sort by strength descending (strongest patterns first)
+    bool operator<(const ImbalanceDOMHit& other) const {
+        return strength01 > other.strength01;
+    }
+};
+
+// ============================================================================
 // BALANCE DOM PATTERN DETECTORS
 // ============================================================================
 

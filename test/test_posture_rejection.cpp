@@ -124,36 +124,103 @@ bool test_vbp_allowed_by_posture() {
 }
 
 // ============================================================================
-// TEST: Structure zone rejected (createStructureZones=false)
+// TEST: Structure zones enabled (createStructureZones=true)
 // ============================================================================
-bool test_structure_zone_rejected() {
-    std::cout << "\n=== TEST: Structure zone rejected (track-only mode) ===" << std::endl;
+bool test_structure_zone_enabled() {
+    std::cout << "\n=== TEST: Structure zones enabled ===" << std::endl;
 
-    // Verify posture: structure tracking enabled but zone creation disabled
+    // Verify posture: structure tracking AND zone creation enabled
     TEST_ASSERT(g_zonePosture.enableStructure, "enableStructure should be true");
-    TEST_ASSERT(!g_zonePosture.createStructureZones, "createStructureZones should be false");
-    TEST_ASSERT(!g_zonePosture.IsZoneTypeAllowed(ZoneType::SESSION_HIGH),
-                "SESSION_HIGH should not be allowed");
+    TEST_ASSERT(g_zonePosture.createStructureZones, "createStructureZones should be true");
+    TEST_ASSERT(g_zonePosture.IsZoneTypeAllowed(ZoneType::SESSION_HIGH),
+                "SESSION_HIGH should be allowed");
+    TEST_ASSERT(g_zonePosture.IsZoneTypeAllowed(ZoneType::SESSION_LOW),
+                "SESSION_LOW should be allowed");
+    TEST_ASSERT(g_zonePosture.IsZoneTypeAllowed(ZoneType::IB_HIGH),
+                "IB_HIGH should be allowed");
+    TEST_ASSERT(g_zonePosture.IsZoneTypeAllowed(ZoneType::IB_LOW),
+                "IB_LOW should be allowed");
 
     // Create ZoneManager
     ZoneManager zm;
     zm.config.tickSize = 0.25;
 
-    // Attempt to create SESSION_HIGH (should be rejected)
+    // Create SESSION_HIGH (should succeed)
     SCDateTime time;
     time.SetToNow();
 
-    std::cout << "  Attempting: CreateZone(SESSION_HIGH, 6150.0)..." << std::endl;
+    std::cout << "  Creating: SESSION_HIGH at 6150.0..." << std::endl;
     auto result = zm.CreateZone(ZoneType::SESSION_HIGH, 6150.0, time, 0, true);
 
-    // Verify rejection
-    TEST_ASSERT(!result.ok, "SESSION_HIGH creation should fail");
-    TEST_ASSERT(result.failure == ZoneCreationFailure::POSTURE_DISALLOWED,
-                "Failure reason should be POSTURE_DISALLOWED");
+    // Verify creation succeeded
+    TEST_ASSERT(result.ok, "SESSION_HIGH creation should succeed");
+    TEST_ASSERT(result.zoneId >= 0, "Zone ID should be valid");
 
-    std::cout << "  [POSTURE-REJECT] type=SESSION_HIGH(12) failure=POSTURE_DISALLOWED" << std::endl;
+    std::cout << "  [STRUCTURE-ZONE] type=SESSION_HIGH created id=" << result.zoneId << std::endl;
 
-    TEST_PASSED("Structure zone rejected (track-only mode)");
+    // Verify zone exists and has correct type
+    ZoneRuntime* zone = zm.GetZone(result.zoneId);
+    TEST_ASSERT(zone != nullptr, "Zone should exist");
+    TEST_ASSERT(zone->type == ZoneType::SESSION_HIGH, "Zone type should be SESSION_HIGH");
+    TEST_ASSERT(std::abs(zone->GetAnchorPrice() - 6150.0) < 0.01, "Anchor price should be 6150.0");
+
+    TEST_PASSED("Structure zones enabled");
+}
+
+// ============================================================================
+// TEST: GLOBEX overnight zones enabled
+// ============================================================================
+bool test_globex_zones_enabled() {
+    std::cout << "\n=== TEST: GLOBEX overnight zones enabled ===" << std::endl;
+
+    // Verify posture: GLOBEX zones should be allowed
+    TEST_ASSERT(g_zonePosture.IsZoneTypeAllowed(ZoneType::GLOBEX_HIGH),
+                "GLOBEX_HIGH should be allowed");
+    TEST_ASSERT(g_zonePosture.IsZoneTypeAllowed(ZoneType::GLOBEX_LOW),
+                "GLOBEX_LOW should be allowed");
+
+    // Create ZoneManager
+    ZoneManager zm;
+    zm.config.tickSize = 0.25;
+
+    // Create GLOBEX_HIGH and GLOBEX_LOW (should succeed)
+    SCDateTime time;
+    time.SetToNow();
+
+    std::cout << "  Creating: GLOBEX_HIGH at 6155.0..." << std::endl;
+    auto resultHigh = zm.CreateZone(ZoneType::GLOBEX_HIGH, 6155.0, time, 0, true);
+    TEST_ASSERT(resultHigh.ok, "GLOBEX_HIGH creation should succeed");
+    TEST_ASSERT(resultHigh.zoneId >= 0, "Zone ID should be valid");
+    std::cout << "  [GLOBEX-ZONE] type=GLOBEX_HIGH created id=" << resultHigh.zoneId << std::endl;
+
+    std::cout << "  Creating: GLOBEX_LOW at 6085.0..." << std::endl;
+    auto resultLow = zm.CreateZone(ZoneType::GLOBEX_LOW, 6085.0, time, 0, true);
+    TEST_ASSERT(resultLow.ok, "GLOBEX_LOW creation should succeed");
+    TEST_ASSERT(resultLow.zoneId >= 0, "Zone ID should be valid");
+    std::cout << "  [GLOBEX-ZONE] type=GLOBEX_LOW created id=" << resultLow.zoneId << std::endl;
+
+    // Verify zones exist with correct types
+    ZoneRuntime* zoneHigh = zm.GetZone(resultHigh.zoneId);
+    TEST_ASSERT(zoneHigh != nullptr, "GLOBEX_HIGH zone should exist");
+    TEST_ASSERT(zoneHigh->type == ZoneType::GLOBEX_HIGH, "Zone type should be GLOBEX_HIGH");
+
+    ZoneRuntime* zoneLow = zm.GetZone(resultLow.zoneId);
+    TEST_ASSERT(zoneLow != nullptr, "GLOBEX_LOW zone should exist");
+    TEST_ASSERT(zoneLow->type == ZoneType::GLOBEX_LOW, "Zone type should be GLOBEX_LOW");
+
+    // Verify ZoneTypeToString works
+    TEST_ASSERT(std::string(ZoneTypeToString(ZoneType::GLOBEX_HIGH)) == "GLOBEX_HIGH",
+                "ZoneTypeToString should return 'GLOBEX_HIGH'");
+    TEST_ASSERT(std::string(ZoneTypeToString(ZoneType::GLOBEX_LOW)) == "GLOBEX_LOW",
+                "ZoneTypeToString should return 'GLOBEX_LOW'");
+
+    // Verify Bridge derivation
+    TEST_ASSERT(DeriveRoleFromType(ZoneType::GLOBEX_HIGH) == ZoneRole::RANGE_BOUNDARY,
+                "GLOBEX_HIGH role should be RANGE_BOUNDARY");
+    TEST_ASSERT(DeriveMechanismFromType(ZoneType::GLOBEX_HIGH) == AnchorMechanism::TIME_RANGE,
+                "GLOBEX_HIGH mechanism should be TIME_RANGE");
+
+    TEST_PASSED("GLOBEX overnight zones enabled");
 }
 
 // ============================================================================
@@ -386,7 +453,8 @@ int main() {
     // Run tests
     test_tpo_rejected_by_posture();
     test_vbp_allowed_by_posture();
-    test_structure_zone_rejected();
+    test_structure_zone_enabled();
+    test_globex_zones_enabled();
     test_zone_dump_no_tpo();
     test_prior_zones_with_vbp();
     test_posture_rejections_reset();
