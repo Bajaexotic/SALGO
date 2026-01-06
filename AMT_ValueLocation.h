@@ -313,8 +313,10 @@ struct ValueLocationResult {
     // =========================================================================
     // PRIMARY LOCATION (Q1: Where am I relative to value?)
     // =========================================================================
-    ValueLocation location = ValueLocation::INSIDE_VALUE;  // Existing enum (6 states)
-    ValueZone zone = ValueZone::UNKNOWN;                    // Fine-grained (9 states)
+    ValueZone zone = ValueZone::UNKNOWN;                    // Fine-grained (9 states) - SSOT
+
+    // DEPRECATED: Use zone and helper methods instead. Will be removed.
+    ValueLocation location = ValueLocation::INSIDE_VALUE;  // Coarse (6 states) - LEGACY
 
     // Distance metrics (in ticks, signed: + = above, - = below)
     double distFromPOCTicks = 0.0;
@@ -423,23 +425,25 @@ struct ValueLocationResult {
         return IsValueLocationHardError(errorReason);
     }
 
-    // Location queries
+    // Location queries - use ValueZone (SSOT) only
     bool IsInsideValue() const {
-        return IsReady() && (location == ValueLocation::INSIDE_VALUE ||
-                             location == ValueLocation::AT_POC ||
-                             zone == ValueZone::UPPER_VALUE ||
+        return IsReady() && (zone == ValueZone::UPPER_VALUE ||
                              zone == ValueZone::LOWER_VALUE ||
                              zone == ValueZone::AT_POC);
     }
     bool IsAboveValue() const {
-        return IsReady() && (location == ValueLocation::ABOVE_VALUE ||
-                             zone == ValueZone::FAR_ABOVE_VALUE ||
+        return IsReady() && (zone == ValueZone::FAR_ABOVE_VALUE ||
                              zone == ValueZone::NEAR_ABOVE_VALUE);
     }
     bool IsBelowValue() const {
-        return IsReady() && (location == ValueLocation::BELOW_VALUE ||
-                             zone == ValueZone::FAR_BELOW_VALUE ||
+        return IsReady() && (zone == ValueZone::FAR_BELOW_VALUE ||
                              zone == ValueZone::NEAR_BELOW_VALUE);
+    }
+    bool IsAtVAH() const {
+        return IsReady() && zone == ValueZone::AT_VAH;
+    }
+    bool IsAtVAL() const {
+        return IsReady() && zone == ValueZone::AT_VAL;
     }
     bool IsAtBoundary() const {
         return IsReady() &&
@@ -471,6 +475,26 @@ struct ValueLocationResult {
      */
     ValueAreaRegion GetValueAreaRegion() const {
         return ValueZoneToValueAreaRegion(zone);
+    }
+
+    /**
+     * Get coarse ValueLocation (6 states) from fine-grained ValueZone (9 states).
+     * Use this for backwards compatibility with code expecting ValueLocation.
+     * Prefer using helper methods (IsInsideValue, IsAtBoundary, etc.) for new code.
+     */
+    ValueLocation GetCoarseLocation() const {
+        switch (zone) {
+            case ValueZone::AT_POC:           return ValueLocation::AT_POC;
+            case ValueZone::AT_VAH:           return ValueLocation::AT_VAH;
+            case ValueZone::AT_VAL:           return ValueLocation::AT_VAL;
+            case ValueZone::UPPER_VALUE:
+            case ValueZone::LOWER_VALUE:      return ValueLocation::INSIDE_VALUE;
+            case ValueZone::FAR_ABOVE_VALUE:
+            case ValueZone::NEAR_ABOVE_VALUE: return ValueLocation::ABOVE_VALUE;
+            case ValueZone::FAR_BELOW_VALUE:
+            case ValueZone::NEAR_BELOW_VALUE: return ValueLocation::BELOW_VALUE;
+            default:                          return ValueLocation::INSIDE_VALUE;
+        }
     }
 
     // Strategy recommendations
