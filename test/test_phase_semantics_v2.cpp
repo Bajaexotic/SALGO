@@ -1,3 +1,6 @@
+// Define standalone test mode to exclude SC-dependent functions
+#define AMT_STANDALONE_TEST
+
 // ============================================================================
 // test_phase_semantics_v2.cpp
 // Tests for Phase System v2 semantic refinements:

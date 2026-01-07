@@ -1,3 +1,6 @@
+// Define standalone test mode to exclude SC-dependent functions
+#define AMT_STANDALONE_TEST
+
 // test_validation_comprehensive.cpp
 // Comprehensive tests for Phase 3 validation system
 // Compile: g++ -std=c++17 -I. -o test_validation_comprehensive.exe test_validation_comprehensive.cpp

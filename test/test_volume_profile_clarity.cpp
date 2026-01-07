@@ -1,3 +1,6 @@
+// Define standalone test mode to exclude SC-dependent functions
+#define AMT_STANDALONE_TEST
+
 // test_volume_profile_clarity.cpp - Verify volumeProfileClarity computation
 // Tests the clarity formula, validity handling, and edge cases
 #include "test_sierrachart_mock.h"

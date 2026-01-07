@@ -1,3 +1,6 @@
+// Define standalone test mode to exclude SC-dependent functions
+#define AMT_STANDALONE_TEST
+
 // ============================================================================
 // test_engagement_lifecycle.cpp
 // Unit tests for SSOT lifetime counters, engagement lifecycle, and coherence

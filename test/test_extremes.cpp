@@ -1,3 +1,6 @@
+// Define standalone test mode to exclude SC-dependent functions
+#define AMT_STANDALONE_TEST
+
 // test_extremes.cpp - Verify RollingDist and extreme detection logic
 #include <iostream>
 #include <cassert>

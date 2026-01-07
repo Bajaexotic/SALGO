@@ -1,3 +1,6 @@
+// Define standalone test mode to exclude SC-dependent functions
+#define AMT_STANDALONE_TEST
+
 // ============================================================================
 // test_session_phase.cpp
 // Boundary tests for SessionPhase enum and helper functions

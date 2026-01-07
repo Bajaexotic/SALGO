@@ -1,3 +1,6 @@
+// Define standalone test mode to exclude SC-dependent functions
+#define AMT_STANDALONE_TEST
+
 // test_tpo_acceptance.cpp - Verify tpoAcceptance computation
 // Tests the acceptance formula, validity handling, scoring integration, and edge cases
 #include "test_sierrachart_mock.h"

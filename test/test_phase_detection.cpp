@@ -1,3 +1,6 @@
+// Define standalone test mode to exclude SC-dependent functions
+#define AMT_STANDALONE_TEST
+
 // ============================================================================
 // test_phase_detection.cpp
 // Tests for phase detection logic fixes:

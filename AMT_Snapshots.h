@@ -573,6 +573,7 @@ struct EffortBucketDistribution {
     RollingDist synthetic_bar_range;      // Synthetic range: max(highs) - min(lows) over N bars
     RollingDist synthetic_range_velocity; // Synthetic velocity: synthetic_range / synthetic_duration
     RollingDist synthetic_efficiency;     // Kaufman ER: |net change| / path length [0-1]
+    RollingDist synthetic_vol_sec;        // Synthetic volume rate: mean(vol_sec) over N bars (for facilitation)
 
     // Session tracking
     int sessionsContributed = 0;     // How many sessions have pushed bars to this bucket
@@ -595,6 +596,7 @@ struct EffortBucketDistribution {
         synthetic_bar_range.reset(window / 5);
         synthetic_range_velocity.reset(window / 5);
         synthetic_efficiency.reset(window / 5);
+        synthetic_vol_sec.reset(window / 5);
         sessionsContributed = 0;
         totalBarsPushed = 0;
         expectedBarsPerSession = 0;

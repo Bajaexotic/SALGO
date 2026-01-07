@@ -1,3 +1,6 @@
+// Define standalone test mode to exclude SC-dependent functions
+#define AMT_STANDALONE_TEST
+
 // test_validation.cpp
 // Standalone test for Phase 3 validation logic
 // Compile: g++ -std=c++17 -DVALIDATE_ZONE_MIGRATION -I.. -o test_validation.exe test_validation.cpp

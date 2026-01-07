@@ -1,3 +1,6 @@
+// Define standalone test mode to exclude SC-dependent functions
+#define AMT_STANDALONE_TEST
+
 // ============================================================================
 // test_value_location.cpp - Unit Tests for ValueLocationEngine
 // ============================================================================

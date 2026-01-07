@@ -387,6 +387,11 @@ struct StudyState
     int       lastBarCloseStoredBar = -1;  // Track last bar where zone values stored to subgraphs
     bool      initialRecalcComplete = false;  // True after first full recalc finishes
 
+    // Bar period cache (for closed bar detection - avoid repeated API calls)
+    n_ACSIL::s_BarPeriod cachedBarPeriod;
+    bool barPeriodCached = false;
+    AMT::ClosedBarInfo lastClosedBarInfo;  // Most recent closed bar (computed once per iteration)
+
     // NOTE: Legacy BaselineEngine stats removed (Dec 2024)
     // Now using EffortBaselineStore, SessionDeltaBaseline, DOMWarmup below
     AMT::AuctionContext amtContext;
@@ -464,6 +469,11 @@ struct StudyState
     // Facilitation computation state (for facilitationKnown truthfulness)
     bool facilitationComputed = false;  // True when baseline stable enough for valid FACIL
     int facilSessionSamples = 0;        // Per-session sample count (reset at session boundary)
+
+    // Facilitation tracking with temporal persistence and synthetic mode
+    AMT::FacilitationTracker facilitationTracker;       // Hysteresis + persistence
+    AMT::FacilitationAggregator facilitationAggregator; // Synthetic bar aggregation (5-bar default)
+    bool useSyntheticFacilitation = true;               // Match VolatilityEngine synthetic mode
 
     // === NEW: Probe & Scenario Modules ===
     AuctionContextModule auctionCtxModule;
@@ -686,6 +696,8 @@ struct StudyState
         lastLoggedArbReason = -1;
         facilitationComputed = false;  // Reset facilitation state for warmup
         facilSessionSamples = 0;       // Reset per-session sample count
+        facilitationTracker.Reset();   // Reset hysteresis + persistence
+        facilitationAggregator.Reset(); // Reset synthetic bar aggregation
 
         // Reset AMT zone tracking (DRY: use atomic helper)
         amtZoneManager.ClearZonesOnly(0, SCDateTime(), AMT::UnresolvedReason::CHART_RESET);
@@ -3443,6 +3455,15 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
     // In AutoLoop mode, use the pre-loop isLiveBar and inLogWindow (already defined)
 #endif
 
+    // Cache bar period once per recalc (constant for chart lifetime)
+    if (!st->barPeriodCached) {
+        sc.GetBarPeriodParameters(st->cachedBarPeriod);
+        st->barPeriodCached = true;
+    }
+
+    // Compute closed bar info ONCE per iteration (SSOT for all closed bar reads)
+    st->lastClosedBarInfo = AMT::GetClosedBarInfo(sc, curBarIdx, st->cachedBarPeriod);
+
     // =========================================================================
     // ITEM 1.1: COLLECT OBSERVABLE SNAPSHOT
     // =========================================================================
@@ -5480,37 +5501,74 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
         const int bucketIdx = AMT::SessionPhaseToBucketIndex(curPhase);
 
         if (bucketIdx >= 0) {  // Tradeable phase
-            const auto& bucketDist = st->effortBaselines.Get(curPhase);
+            auto& bucketDist = st->effortBaselines.Get(curPhase);  // Non-const for synthetic push
 
             // Compute volume-per-second for current bar
             const double barIntervalSec = (sc.SecondsPerBar > 0) ? static_cast<double>(sc.SecondsPerBar) : 60.0;
             const double curVolSec = st->currentSnapshot.effort.totalVolume / barIntervalSec;
 
-            // Query percentiles from phase-specific baselines (use pre-computed curBarRangeTicks - DRY)
-            const AMT::PercentileResult volResult = bucketDist.vol_sec.TryPercentile(curVolSec);
+            // Push to synthetic aggregator (every bar)
+            const bool newSyntheticBar = st->facilitationAggregator.Push(curVolSec);
+
+            // When synthetic bar forms, push mean to synthetic_vol_sec baseline
+            if (newSyntheticBar && st->facilitationAggregator.IsReady()) {
+                const double syntheticVolSec = st->facilitationAggregator.GetSyntheticVolSec();
+                bucketDist.synthetic_vol_sec.push(syntheticVolSec);
+            }
+
+            // Choose volume source based on synthetic mode
+            double volPctile = 0.0;
+            bool volPctileValid = false;
+
+            if (st->useSyntheticFacilitation && st->facilitationAggregator.IsReady()) {
+                // Synthetic mode: use aggregated volume vs synthetic baseline
+                const double syntheticVolSec = st->facilitationAggregator.GetSyntheticVolSec();
+                const AMT::PercentileResult synthResult = bucketDist.synthetic_vol_sec.TryPercentile(syntheticVolSec);
+                if (synthResult.valid) {
+                    volPctile = synthResult.value;
+                    volPctileValid = true;
+                }
+                else {
+                    // Fall back to raw if synthetic baseline not ready
+                    const AMT::PercentileResult rawResult = bucketDist.vol_sec.TryPercentile(curVolSec);
+                    if (rawResult.valid) {
+                        volPctile = rawResult.value;
+                        volPctileValid = true;
+                    }
+                }
+            }
+            else {
+                // Raw mode: use per-bar volume vs raw baseline
+                const AMT::PercentileResult rawResult = bucketDist.vol_sec.TryPercentile(curVolSec);
+                if (rawResult.valid) {
+                    volPctile = rawResult.value;
+                    volPctileValid = true;
+                }
+            }
+
+            // Query range percentile from phase-specific baseline
             const AMT::PercentileResult rangeResult = bucketDist.bar_range.TryPercentile(curBarRangeTicks);
 
-            if (volResult.valid && rangeResult.valid) {
-                const double volPctile = volResult.value;
+            if (volPctileValid && rangeResult.valid) {
                 const double rangePctile = rangeResult.value;
 
-                // Classify facilitation based on effort/result relationship
+                // Classify raw facilitation based on effort/result relationship
+                AMT::AuctionFacilitation rawFacilitation = AMT::AuctionFacilitation::EFFICIENT;
                 if (volPctile <= 10.0 && rangePctile <= 10.0) {
                     // Very low effort AND very low range = auction stalling
-                    st->amtContext.facilitation = AMT::AuctionFacilitation::FAILED;
+                    rawFacilitation = AMT::AuctionFacilitation::FAILED;
                 }
                 else if (volPctile >= 75.0 && rangePctile <= 25.0) {
                     // High effort with low result = labored auction
-                    st->amtContext.facilitation = AMT::AuctionFacilitation::LABORED;
+                    rawFacilitation = AMT::AuctionFacilitation::LABORED;
                 }
                 else if (volPctile <= 25.0 && rangePctile >= 75.0) {
                     // Low effort with high range = inefficient (gap/vacuum)
-                    st->amtContext.facilitation = AMT::AuctionFacilitation::INEFFICIENT;
+                    rawFacilitation = AMT::AuctionFacilitation::INEFFICIENT;
                 }
-                else {
-                    // Normal facilitation
-                    st->amtContext.facilitation = AMT::AuctionFacilitation::EFFICIENT;
-                }
+
+                // Apply FacilitationTracker hysteresis for regime-level stability
+                st->amtContext.facilitation = st->facilitationTracker.Update(rawFacilitation);
                 st->facilitationComputed = true;
             }
             else {
@@ -8693,7 +8751,8 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                 st->logManager.LogToSC(LogCategory::AMT, msg, false);
 
                 // Volume summary - CLOSED bar only (session volume on SessionDelta line)
-                const int closedBar = (curBarIdx > 0) ? (curBarIdx - 1) : 0;
+                // Use SSOT: lastClosedBarInfo properly handles last bar at market close
+                const int closedBar = st->lastClosedBarInfo.IsValid() ? st->lastClosedBarInfo.index : 0;
                 const double closedBarVol = sc.Volume[closedBar];
                 const double closedBarAskVol = sc.AskVolume[closedBar];
                 const double closedBarBidVol = sc.BidVolume[closedBar];

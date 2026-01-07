@@ -1,3 +1,6 @@
+// Define standalone test mode to exclude SC-dependent functions
+#define AMT_STANDALONE_TEST
+
 // ============================================================================
 // test_zone_hysteresis.cpp
 // Unit tests for zone hysteresis, sticky behavior, and transition tracking

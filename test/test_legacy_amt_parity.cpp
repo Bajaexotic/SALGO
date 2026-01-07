@@ -1,3 +1,6 @@
+// Define standalone test mode to exclude SC-dependent functions
+#define AMT_STANDALONE_TEST
+
 // test_legacy_amt_parity.cpp
 // Simulates legacy and AMT zone engagement logic side-by-side
 // Verifies they produce identical engagement episodes

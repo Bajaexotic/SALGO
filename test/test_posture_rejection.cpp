@@ -1,3 +1,6 @@
+// Define standalone test mode to exclude SC-dependent functions
+#define AMT_STANDALONE_TEST
+
 // ============================================================================
 // test_posture_rejection.cpp
 // Tests defense-in-depth posture gating inside CreateZoneExplicit()
