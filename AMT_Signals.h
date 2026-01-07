@@ -93,8 +93,8 @@ public:
         // 4. Store volume conviction (clamped to [0, 2])
         result.volumeConviction = (std::max)(0.0, (std::min)(2.0, volumeConviction));
 
-        // 5. Determine Location
-        result.location = DetermineLocation(price, poc, vah, val, tickSize);
+        // 5. Determine Zone (9-state ValueZone)
+        result.zone = DetermineZone(price, poc, vah, val, tickSize);
 
         // 6. Determine Intent (value-relative direction) - internal
         result.intent_ = DetermineIntent(price, prevPrice, poc, tickSize);
@@ -153,8 +153,8 @@ public:
         // 4. Store volume conviction (clamped to [0, 2])
         result.volumeConviction = (std::max)(0.0, (std::min)(2.0, volumeConviction));
 
-        // 5. Derive coarse location from SSOT zone
-        result.location = valLocResult.GetCoarseLocation();
+        // 5. Store zone from SSOT (ValueLocationEngine)
+        result.zone = valLocResult.zone;
 
         // 6. Determine Intent using SSOT POC distance
         const double poc = price - (valLocResult.distFromPOCTicks * tickSize);
@@ -172,7 +172,7 @@ public:
 private:
     Config config_;
 
-    ValueLocation DetermineLocation(
+    ValueZone DetermineZone(
         double price,
         double poc,
         double vah,
@@ -185,27 +185,30 @@ private:
 
         // Check POC first (highest priority for AT_POC)
         if (distFromPOC <= config_.pocToleranceTicks) {
-            return ValueLocation::AT_POC;
+            return ValueZone::AT_POC;
         }
 
         // Check boundaries
         if (std::abs(distFromVAH) <= config_.vaBoundaryTicks) {
-            return ValueLocation::AT_VAH;
+            return ValueZone::AT_VAH;
         }
         if (std::abs(distFromVAL) <= config_.vaBoundaryTicks) {
-            return ValueLocation::AT_VAL;
+            return ValueZone::AT_VAL;
         }
 
-        // Check outside value
+        // Check outside value (use NEAR_ variants for deprecated method)
         if (price > vah) {
-            return ValueLocation::ABOVE_VALUE;
+            return ValueZone::NEAR_ABOVE_VALUE;
         }
         if (price < val) {
-            return ValueLocation::BELOW_VALUE;
+            return ValueZone::NEAR_BELOW_VALUE;
         }
 
-        // Inside value area
-        return ValueLocation::INSIDE_VALUE;
+        // Inside value area (use upper half by default for deprecated method)
+        if (price >= poc) {
+            return ValueZone::UPPER_VALUE;
+        }
+        return ValueZone::LOWER_VALUE;
     }
 
     ValueIntent DetermineIntent(
@@ -280,44 +283,24 @@ private:
 // ============================================================================
 // AMT STATE TRACKER
 // ============================================================================
-// Maintains BALANCE/IMBALANCE state using a leaky accumulator.
+// Tracks BALANCE/IMBALANCE state from DaltonEngine (SSOT).
 //
-// The accumulator tracks "imbalance strength":
-//   - INITIATIVE activity adds to strength (moving away from value)
-//   - RESPONSIVE activity subtracts from strength (returning to value)
-//   - Each bar applies decay (information ages out)
+// DaltonEngine determines state via 1TF/2TF pattern detection:
+//   - 1TF (One-Time Framing) = IMBALANCE (one side in control)
+//   - 2TF (Two-Time Framing) = BALANCE (both sides active)
 //
-// State flips are strength-modulated:
-//   - Higher strength required to flip from BALANCE to IMBALANCE
-//   - Lower strength threshold to flip back to BALANCE (hysteresis)
+// This tracker:
+//   - Receives state from DaltonEngine (does not compute it)
+//   - Tracks consecutive bars in state for transition detection
+//   - Populates StateEvidence for downstream consumers
 // ============================================================================
 
 class AMTStateTracker {
 public:
-    struct Config {
-        double decayRate = 0.95;              // Per-bar decay multiplier
-        double gainInitiative = 0.15;         // Gain per initiative bar
-        double gainResponsive = 0.10;         // Gain per responsive bar
-        double balanceToImbalanceThreshold = 0.60;  // Base threshold to flip to IMBALANCE
-        double imbalanceToBalanceThreshold = 0.40;  // Base threshold to flip to BALANCE
-
-        // Location modifiers: outside value amplifies initiative signal
-        double outsideValueMultiplier = 1.5;
-        double atBoundaryMultiplier = 1.2;
-
-        // Location bias: being outside value is itself evidence of imbalance
-        // This small positive bias prevents decay to 0 during consolidation outside VA
-        double outsideValueBias = 0.05;
-
-        Config() = default;
-    };
-
-    AMTStateTracker() : config_(), currentState_(AMTMarketState::UNKNOWN),
-        imbalanceStrength_(0.5), barsInState_(0), previousState_(AMTMarketState::UNKNOWN) {}
-    explicit AMTStateTracker(const Config& cfg)
-        : config_(cfg)
-        , currentState_(AMTMarketState::UNKNOWN)
-        , imbalanceStrength_(0.5)  // Start neutral
+    AMTStateTracker() : currentState_(AMTMarketState::UNKNOWN),
+        barsInState_(0), previousState_(AMTMarketState::UNKNOWN) {}
+    explicit AMTStateTracker(int /*unused*/)
+        : currentState_(AMTMarketState::UNKNOWN)
         , barsInState_(0)
         , previousState_(AMTMarketState::UNKNOWN)
     {}
@@ -329,12 +312,9 @@ public:
      * Activity classification determines WHO is in control (INITIATIVE/RESPONSIVE),
      * not WHAT the state is.
      *
-     * The strength accumulator now tracks "confirmation" rather than determining state.
-     *
      * @param activity    This bar's activity classification (determines WHO)
      * @param currentBar  Current bar index (for transition logging)
      * @param daltonState The authoritative state from DaltonEngine (1TF/2TF derived)
-     *                    If UNKNOWN, falls back to accumulator-based state (legacy mode)
      * @param daltonPhase The authoritative phase from DaltonState.DeriveCurrentPhase()
      *                    If UNKNOWN, StateEvidence.DerivePhase() will compute locally
      * @return            Updated StateEvidence with current state and phase
@@ -346,60 +326,18 @@ public:
 
         if (!activity.valid) {
             evidence.currentState = AMTMarketState::UNKNOWN;
-            evidence.stateStrength = imbalanceStrength_;
             return evidence;
         }
 
         // Store previous state for transition detection
         previousState_ = currentState_;
 
-        // 1. Apply decay to existing strength
-        imbalanceStrength_ *= config_.decayRate;
+        // Use Dalton's 1TF/2TF state (SSOT)
+        const AMTMarketState newState = daltonState;
 
-        // 2. Compute contribution based on activity type, location, and volume conviction
-        // Per Dalton: Volume confirms conviction
-        // - VOLUME_VACUUM (low percentile) → volumeConviction near 0 → contribution minimized
-        // - High volume (high percentile) → volumeConviction > 1 → contribution amplified
-        double contribution = 0.0;
-        const double locationMultiplier = GetLocationMultiplier(activity.location);
-        const double volumeWeight = activity.volumeConviction;  // 0.0-2.0, 1.0 = normal
-
-        if (activity.activityType == AMTActivityType::INITIATIVE) {
-            contribution = config_.gainInitiative * locationMultiplier * volumeWeight;
-        }
-        else if (activity.activityType == AMTActivityType::RESPONSIVE) {
-            contribution = -config_.gainResponsive * locationMultiplier * volumeWeight;
-        }
-        // NEUTRAL contributes 0
-
-        // 3. Location bias: Being OUTSIDE value is itself evidence of imbalance
-        // Add a small positive bias when price is outside the value area
-        // This prevents strength from decaying to 0 just because we're consolidating
-        // Note: Location bias is NOT volume-weighted (structural, not activity-based)
-        if (activity.location == ValueLocation::ABOVE_VALUE ||
-            activity.location == ValueLocation::BELOW_VALUE) {
-            contribution += config_.outsideValueBias;
-        }
-
-        // 4. Update strength (clamp to [0, 1])
-        // NOTE: Strength is now a "confirmation metric", not the state determinant
-        imbalanceStrength_ += contribution;
-        imbalanceStrength_ = (std::max)(0.0, (std::min)(1.0, imbalanceStrength_));
-
-        // 5. Determine state: Dalton (1TF/2TF) is SSOT, accumulator is fallback
-        AMTMarketState newState;
-        if (daltonState != AMTMarketState::UNKNOWN) {
-            // SSOT: Use Dalton's 1TF/2TF derived state
-            newState = daltonState;
-        } else {
-            // Fallback: Use accumulator-based state (legacy mode or warmup)
-            newState = DetermineState();
-        }
-
-        // 6. Update state tracking
+        // Update state tracking
         if (newState != currentState_) {
             evidence.previousState = currentState_;
-            evidence.strengthAtTransition = imbalanceStrength_;
             evidence.barAtTransition = currentBar;
             currentState_ = newState;
             barsInState_ = 1;
@@ -409,14 +347,13 @@ public:
             barsInState_++;
         }
 
-        // 7. Populate evidence
+        // Populate evidence
         evidence.currentState = currentState_;
-        evidence.stateStrength = imbalanceStrength_;
         evidence.barsInState = barsInState_;
         evidence.activity = activity;
-        evidence.location = activity.location;
+        evidence.location = activity.zone;
 
-        // 8. Store derived phase (SSOT: Dalton, fallback: local derivation)
+        // Store derived phase (SSOT: Dalton, fallback: local derivation)
         evidence.derivedPhase = daltonPhase;
 
         return evidence;
@@ -424,57 +361,19 @@ public:
 
     // Getters
     AMTMarketState GetCurrentState() const { return currentState_; }
-    double GetStrength() const { return imbalanceStrength_; }
     int GetBarsInState() const { return barsInState_; }
 
     // Reset for new session
     void Reset() {
         currentState_ = AMTMarketState::UNKNOWN;
-        imbalanceStrength_ = 0.5;
         barsInState_ = 0;
         previousState_ = AMTMarketState::UNKNOWN;
     }
 
 private:
-    Config config_;
     AMTMarketState currentState_;
-    double imbalanceStrength_;
     int barsInState_;
     AMTMarketState previousState_;
-
-    double GetLocationMultiplier(ValueLocation location) const {
-        switch (location) {
-            case ValueLocation::ABOVE_VALUE:
-            case ValueLocation::BELOW_VALUE:
-                return config_.outsideValueMultiplier;
-
-            case ValueLocation::AT_VAH:
-            case ValueLocation::AT_VAL:
-                return config_.atBoundaryMultiplier;
-
-            default:
-                return 1.0;
-        }
-    }
-
-    AMTMarketState DetermineState() const {
-        // Hysteresis: different thresholds for each direction
-        if (currentState_ == AMTMarketState::BALANCE ||
-            currentState_ == AMTMarketState::UNKNOWN) {
-            // Currently in BALANCE - need higher strength to flip to IMBALANCE
-            if (imbalanceStrength_ >= config_.balanceToImbalanceThreshold) {
-                return AMTMarketState::IMBALANCE;
-            }
-            return AMTMarketState::BALANCE;
-        }
-        else {
-            // Currently in IMBALANCE - need lower strength to flip back to BALANCE
-            if (imbalanceStrength_ <= config_.imbalanceToBalanceThreshold) {
-                return AMTMarketState::BALANCE;
-            }
-            return AMTMarketState::IMBALANCE;
-        }
-    }
 };
 
 // ============================================================================
@@ -844,7 +743,6 @@ class AMTSignalEngine {
 public:
     struct Config {
         ActivityClassifier::Config activityConfig;
-        AMTStateTracker::Config stateConfig;
         SinglePrintDetector::Config singlePrintConfig;
         ExcessDetector::Config excessConfig;
 
@@ -860,7 +758,7 @@ public:
 
     explicit AMTSignalEngine(const Config& cfg)
         : activityClassifier_(cfg.activityConfig)
-        , stateTracker_(cfg.stateConfig)
+        , stateTracker_()
         , singlePrintDetector_(cfg.singlePrintConfig)
         , excessDetector_(cfg.excessConfig)
     {}

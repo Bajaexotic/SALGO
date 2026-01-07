@@ -865,13 +865,13 @@ struct DualSessionPeaksValleys
 // ============================================================================
 // Tracks the opening range for shape confirmation gates.
 // - RTH: Initial Balance (first 60 minutes, 9:30-10:30)
-// - Globex: Session Open Range (first 30 minutes after session start)
+// - Globex: Opening Range (first 90 minutes - needs more time due to lower volume)
 // ============================================================================
 
 struct OpeningRangeTracker {
     // === SESSION CONFIGURATION ===
-    bool isRTH = true;                    // RTH uses IB (60 min), Globex uses SOR (30 min)
-    int freezeAfterMinutes = 60;          // 60 for RTH IB, 30 for Globex SOR
+    bool isRTH = true;                    // RTH uses IB (60 min), Globex uses 90 min
+    int freezeAfterMinutes = 60;          // 60 for RTH IB, 90 for Globex
     int failedAuctionWindow = 30;         // 30 min for RTH, 60 min for Globex
 
     // === OPENING RANGE STATE ===
@@ -898,7 +898,7 @@ struct OpeningRangeTracker {
     // Reset for new session with session-specific parameters
     void Reset(bool isRthSession) {
         isRTH = isRthSession;
-        freezeAfterMinutes = isRthSession ? 60 : 30;    // RTH=60 (IB), GBX=30 (SOR)
+        freezeAfterMinutes = isRthSession ? 60 : 90;    // RTH=60 (IB), GBX=90 (needs more time due to lower volume)
         failedAuctionWindow = isRthSession ? 30 : 60;   // RTH=30, GBX=60 (slower market)
 
         rangeHigh = 0.0;
@@ -2282,7 +2282,7 @@ struct SessionVolumeProfile
         // =====================================================================
 
         // GATE 1: Opening range completion check
-        const int requiredMinutes = isRTH ? 60 : 45;  // RTH=IB(60), GBX=SOR(45)
+        const int requiredMinutes = isRTH ? 60 : 90;  // RTH=IB(60), GBX=90 (lower volume needs more time)
         result.openingRangeComplete = (sessionMinutes >= requiredMinutes);
 
         // Copy opening range data to result

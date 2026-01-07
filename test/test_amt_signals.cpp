@@ -3,14 +3,18 @@
 // Unit tests for AMT Signal Processing (AMT_Signals.h)
 // ============================================================================
 
+#define _USE_MATH_DEFINES
 #include <iostream>
 #include <cmath>
 #include <cassert>
 #include <vector>
 
+// Mock header (defines SIERRACHART_H internally to prevent real header)
+#include "test_sierrachart_mock.h"
+
 // Include the header under test (from Sierra Chart ACS_Source)
-#include "amt_core.h"
-#include "AMT_Signals.h"
+#include "../amt_core.h"
+#include "../AMT_Signals.h"
 
 using namespace AMT;
 
@@ -49,7 +53,7 @@ void test_activity_classifier_intent() {
         double price = 6105.00;      // 20 ticks from POC (closer)
         auto result = classifier.Classify(price, prevPrice, poc, vah, val, 0.0, tickSize);
         TEST_ASSERT(result.valid, "Result should be valid");
-        TEST_ASSERT(result.intent == ValueIntent::TOWARD_VALUE,
+        TEST_ASSERT(result.intent_ == ValueIntent::TOWARD_VALUE,
             "Moving from 6108 to 6105 should be TOWARD_VALUE (closer to POC at 6100)");
     }
 
@@ -58,7 +62,7 @@ void test_activity_classifier_intent() {
         double prevPrice = 6102.00;  // 8 ticks from POC
         double price = 6108.00;      // 32 ticks from POC (farther)
         auto result = classifier.Classify(price, prevPrice, poc, vah, val, 0.0, tickSize);
-        TEST_ASSERT(result.intent == ValueIntent::AWAY_FROM_VALUE,
+        TEST_ASSERT(result.intent_ == ValueIntent::AWAY_FROM_VALUE,
             "Moving from 6102 to 6108 should be AWAY_FROM_VALUE (farther from POC)");
     }
 
@@ -67,7 +71,7 @@ void test_activity_classifier_intent() {
         double price = 6100.25;  // 1 tick from POC
         double prevPrice = 6100.00;
         auto result = classifier.Classify(price, prevPrice, poc, vah, val, 0.0, tickSize);
-        TEST_ASSERT(result.intent == ValueIntent::AT_VALUE,
+        TEST_ASSERT(result.intent_ == ValueIntent::AT_VALUE,
             "Price at 6100.25 (1 tick from POC) should be AT_VALUE");
     }
 }
@@ -87,7 +91,7 @@ void test_activity_classifier_participation() {
         double price = 6105.00;  // Price went up
         double deltaPct = 0.30;  // Positive delta (buyers winning)
         auto result = classifier.Classify(price, prevPrice, poc, vah, val, deltaPct, tickSize);
-        TEST_ASSERT(result.participation == ParticipationMode::AGGRESSIVE,
+        TEST_ASSERT(result.participation_ == ParticipationMode::AGGRESSIVE,
             "Price up + positive delta should be AGGRESSIVE");
     }
 
@@ -97,7 +101,7 @@ void test_activity_classifier_participation() {
         double price = 6105.00;  // Price went up
         double deltaPct = -0.30; // Negative delta (sellers absorbing)
         auto result = classifier.Classify(price, prevPrice, poc, vah, val, deltaPct, tickSize);
-        TEST_ASSERT(result.participation == ParticipationMode::ABSORPTIVE,
+        TEST_ASSERT(result.participation_ == ParticipationMode::ABSORPTIVE,
             "Price up + negative delta should be ABSORPTIVE (absorption)");
     }
 
@@ -107,7 +111,7 @@ void test_activity_classifier_participation() {
         double price = 6100.00;  // Price went down
         double deltaPct = -0.30; // Negative delta (sellers winning)
         auto result = classifier.Classify(price, prevPrice, poc, vah, val, deltaPct, tickSize);
-        TEST_ASSERT(result.participation == ParticipationMode::AGGRESSIVE,
+        TEST_ASSERT(result.participation_ == ParticipationMode::AGGRESSIVE,
             "Price down + negative delta should be AGGRESSIVE");
     }
 
@@ -117,7 +121,7 @@ void test_activity_classifier_participation() {
         double price = 6105.00;
         double deltaPct = 0.05;  // Near-neutral delta
         auto result = classifier.Classify(price, prevPrice, poc, vah, val, deltaPct, tickSize);
-        TEST_ASSERT(result.participation == ParticipationMode::BALANCED,
+        TEST_ASSERT(result.participation_ == ParticipationMode::BALANCED,
             "Neutral delta should be BALANCED");
     }
 }
@@ -176,7 +180,7 @@ void test_activity_classifier_activity_type() {
 }
 
 void test_activity_classifier_location() {
-    TEST_SECTION("ActivityClassifier - Location Detection");
+    TEST_SECTION("ActivityClassifier - Zone Detection (9-state ValueZone)");
 
     ActivityClassifier classifier;
     const double tickSize = 0.25;
@@ -184,24 +188,24 @@ void test_activity_classifier_location() {
     const double vah = 6110.00;
     const double val = 6090.00;
 
-    // Test locations
+    // Test zones using 9-state ValueZone enum
     auto r1 = classifier.Classify(6100.25, 6100.00, poc, vah, val, 0.0, tickSize);
-    TEST_ASSERT(r1.location == ValueLocation::AT_POC, "6100.25 should be AT_POC");
+    TEST_ASSERT(r1.zone == ValueZone::AT_POC, "6100.25 should be AT_POC");
 
     auto r2 = classifier.Classify(6110.25, 6110.00, poc, vah, val, 0.0, tickSize);
-    TEST_ASSERT(r2.location == ValueLocation::AT_VAH, "6110.25 should be AT_VAH");
+    TEST_ASSERT(r2.zone == ValueZone::AT_VAH, "6110.25 should be AT_VAH");
 
     auto r3 = classifier.Classify(6089.75, 6090.00, poc, vah, val, 0.0, tickSize);
-    TEST_ASSERT(r3.location == ValueLocation::AT_VAL, "6089.75 should be AT_VAL");
+    TEST_ASSERT(r3.zone == ValueZone::AT_VAL, "6089.75 should be AT_VAL");
 
     auto r4 = classifier.Classify(6120.00, 6115.00, poc, vah, val, 0.0, tickSize);
-    TEST_ASSERT(r4.location == ValueLocation::ABOVE_VALUE, "6120 should be ABOVE_VALUE");
+    TEST_ASSERT(IsAboveValue(r4.zone), "6120 should be above value (NEAR_ABOVE or FAR_ABOVE)");
 
     auto r5 = classifier.Classify(6080.00, 6085.00, poc, vah, val, 0.0, tickSize);
-    TEST_ASSERT(r5.location == ValueLocation::BELOW_VALUE, "6080 should be BELOW_VALUE");
+    TEST_ASSERT(IsBelowValue(r5.zone), "6080 should be below value (NEAR_BELOW or FAR_BELOW)");
 
     auto r6 = classifier.Classify(6105.00, 6103.00, poc, vah, val, 0.0, tickSize);
-    TEST_ASSERT(r6.location == ValueLocation::INSIDE_VALUE, "6105 (between VAL and VAH) should be INSIDE_VALUE");
+    TEST_ASSERT(IsInsideValue(r6.zone), "6105 (between VAL and VAH) should be inside value (UPPER or LOWER)");
 }
 
 // ============================================================================
@@ -253,46 +257,8 @@ void test_state_tracker_basic() {
         "After sustained responsive bars, state should return to BALANCE");
 }
 
-void test_state_tracker_strength_decay() {
-    TEST_SECTION("AMTStateTracker - Strength Decay");
-
-    AMTStateTracker tracker;
-    ActivityClassifier classifier;
-    const double tickSize = 0.25;
-    const double poc = 6100.00;
-    const double vah = 6110.00;
-    const double val = 6090.00;
-
-    // Feed initiative bars to build strength
-    double price = 6115.00;
-    double prevPrice = 6105.00;
-    double deltaPct = 0.40;
-
-    for (int i = 0; i < 5; ++i) {
-        auto activity = classifier.Classify(price, prevPrice, poc, vah, val, deltaPct, tickSize);
-        tracker.Update(activity, i);
-        prevPrice = price;
-        price += 2.0;
-    }
-
-    double strengthAfterInitiative = tracker.GetStrength();
-    TEST_ASSERT(strengthAfterInitiative > 0.5,
-        "Strength should be above 0.5 after initiative bars");
-
-    // Now feed neutral bars (at POC, balanced)
-    price = 6100.00;
-    prevPrice = 6100.25;
-    deltaPct = 0.0;
-
-    for (int i = 5; i < 20; ++i) {
-        auto activity = classifier.Classify(price, prevPrice, poc, vah, val, deltaPct, tickSize);
-        tracker.Update(activity, i);
-    }
-
-    double strengthAfterDecay = tracker.GetStrength();
-    TEST_ASSERT(strengthAfterDecay < strengthAfterInitiative,
-        "Strength should decay over neutral bars");
-}
+// NOTE: test_state_tracker_strength_decay() removed - strength accumulator no longer exists.
+// State is now determined by Dalton's 1TF/2TF pattern detection, not a leaky accumulator.
 
 void test_state_tracker_transitions() {
     TEST_SECTION("AMTStateTracker - Transition Detection");
@@ -550,14 +516,12 @@ void test_state_evidence_reset() {
 
     StateEvidence evidence;
     evidence.currentState = AMTMarketState::IMBALANCE;
-    evidence.stateStrength = 0.75;
     evidence.barsInState = 10;
     evidence.singlePrintZonePresent = true;
 
     evidence.Reset();
 
     TEST_ASSERT(evidence.currentState == AMTMarketState::UNKNOWN, "State should reset to UNKNOWN");
-    TEST_ASSERT(evidence.stateStrength == 0.0, "Strength should reset to 0");
     TEST_ASSERT(evidence.barsInState == 0, "Bars in state should reset to 0");
     TEST_ASSERT(!evidence.singlePrintZonePresent, "Single print flag should reset to false");
 }
@@ -599,7 +563,7 @@ int main() {
 
     // State Tracker tests
     test_state_tracker_basic();
-    test_state_tracker_strength_decay();
+    // test_state_tracker_strength_decay() removed - strength accumulator no longer exists
     test_state_tracker_transitions();
 
     // Single Print Detector tests

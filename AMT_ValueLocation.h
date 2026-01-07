@@ -15,7 +15,7 @@
 //   - DELEGATE, DON'T DUPLICATE: Aggregates existing SSOT data
 //   - Uses ZoneManager.GetStrongestZoneAtPrice() for nearest zone
 //   - Uses StructureTracker for session/IB extremes
-//   - Uses existing ValueLocation, ValueMigration, LevelType enums
+//   - Uses existing ValueZone (9-state), ValueMigration, LevelType enums
 //   - Phase-aware context (GLOBEX != RTH)
 //   - NO-FALLBACK contract: explicit validity at every decision point
 //   - ZERO Sierra Chart dependencies (testable standalone)
@@ -36,87 +36,9 @@
 namespace AMT {
 
 // ============================================================================
-// VALUE ZONE (Fine-Grained Location Classification)
+// NOTE: ValueZone, ValueZoneToString(), and ValueZoneToValueAreaRegion()
+// are defined in amt_core.h (SSOT location for all core enums)
 // ============================================================================
-// Extends the existing ValueLocation enum with finer granularity.
-// ValueLocation has 6 states; ValueZone has 9 for more precise gating.
-// ============================================================================
-
-enum class ValueZone : int {
-    UNKNOWN = 0,
-
-    // Outside Value (high side)
-    FAR_ABOVE_VALUE = 1,      // > VAH + extensionThreshold (extended breakout)
-    NEAR_ABOVE_VALUE = 2,     // VAH < price <= VAH + extensionThreshold (testing)
-
-    // At Boundaries
-    AT_VAH = 3,               // Within tolerance of VAH
-    AT_POC = 4,               // Within tolerance of POC
-    AT_VAL = 5,               // Within tolerance of VAL
-
-    // Inside Value
-    UPPER_VALUE = 6,          // VAH > price > POC (upper half of VA)
-    LOWER_VALUE = 7,          // POC > price > VAL (lower half of VA)
-
-    // Outside Value (low side)
-    NEAR_BELOW_VALUE = 8,     // VAL - extensionThreshold <= price < VAL (testing)
-    FAR_BELOW_VALUE = 9       // price < VAL - extensionThreshold (extended breakdown)
-};
-
-inline const char* ValueZoneToString(ValueZone zone) {
-    switch (zone) {
-        case ValueZone::UNKNOWN:          return "UNKNOWN";
-        case ValueZone::FAR_ABOVE_VALUE:  return "FAR_ABOVE";
-        case ValueZone::NEAR_ABOVE_VALUE: return "NEAR_ABOVE";
-        case ValueZone::AT_VAH:           return "AT_VAH";
-        case ValueZone::UPPER_VALUE:      return "UPPER_VALUE";
-        case ValueZone::AT_POC:           return "AT_POC";
-        case ValueZone::LOWER_VALUE:      return "LOWER_VALUE";
-        case ValueZone::AT_VAL:           return "AT_VAL";
-        case ValueZone::NEAR_BELOW_VALUE: return "NEAR_BELOW";
-        case ValueZone::FAR_BELOW_VALUE:  return "FAR_BELOW";
-        default:                          return "?";
-    }
-}
-
-/**
- * Map ValueZone (9 states) to ValueAreaRegion (5 states)
- *
- * SSOT: Use this instead of CalculateVARegion() when you have a ValueLocationResult.
- *
- * Mapping:
- * - FAR_ABOVE, NEAR_ABOVE → OUTSIDE_ABOVE
- * - AT_VAH, UPPER_VALUE   → UPPER_VA
- * - AT_POC                → CORE_VA
- * - AT_VAL, LOWER_VALUE   → LOWER_VA
- * - FAR_BELOW, NEAR_BELOW → OUTSIDE_BELOW
- */
-inline ValueAreaRegion ValueZoneToValueAreaRegion(ValueZone zone) {
-    switch (zone) {
-        case ValueZone::FAR_ABOVE_VALUE:
-        case ValueZone::NEAR_ABOVE_VALUE:
-            return ValueAreaRegion::OUTSIDE_ABOVE;
-
-        case ValueZone::AT_VAH:
-        case ValueZone::UPPER_VALUE:
-            return ValueAreaRegion::UPPER_VA;
-
-        case ValueZone::AT_POC:
-        case ValueZone::UNKNOWN:  // Default to CORE (safe fallback)
-            return ValueAreaRegion::CORE_VA;
-
-        case ValueZone::AT_VAL:
-        case ValueZone::LOWER_VALUE:
-            return ValueAreaRegion::LOWER_VA;
-
-        case ValueZone::FAR_BELOW_VALUE:
-        case ValueZone::NEAR_BELOW_VALUE:
-            return ValueAreaRegion::OUTSIDE_BELOW;
-
-        default:
-            return ValueAreaRegion::CORE_VA;
-    }
-}
 
 // ============================================================================
 // VA OVERLAP STATE (Balance vs Separation)
@@ -228,13 +150,8 @@ struct ValueLocationConfig {
     int referenceApproachingTicks = 12;   // "Approaching" threshold
     int maxReferenceLevels = 12;          // Max levels to track in nearby list
 
-    // =========================================================================
-    // STRATEGY GATING DEFAULTS
-    // =========================================================================
-    double fadeMultiplierAtPOC = 0.5;           // Reduce fade confidence at POC
-    double fadeMultiplierAtBoundary = 1.2;      // Boost fade at VAH/VAL (balance)
-    double breakoutMultiplierAtBoundary = 0.6;  // Reduce breakout at boundary (balance)
-    double trendMultiplierFarOutside = 1.0;     // Trend following far outside value
+    // NOTE: Strategy gating config REMOVED (Jan 2025)
+    // Policy decisions belong in decision/arbitration layer, not location SSOT.
 };
 
 // ============================================================================
@@ -260,50 +177,11 @@ struct ReferenceLevelProximity {
 };
 
 // ============================================================================
-// STRATEGY GATING
+// NOTE: StrategyGating REMOVED (Jan 2025)
+// Policy decisions (ShouldFade, ShouldBreakout) belong in a decision/arbitration
+// layer that consumes all engine outputs, NOT in the location SSOT.
+// ValueLocationEngine outputs descriptive primitives only.
 // ============================================================================
-// Actionable recommendations based on location + structure.
-// ============================================================================
-
-struct StrategyGating {
-    // =========================================================================
-    // PRIMARY RECOMMENDATIONS
-    // =========================================================================
-    bool allowMeanReversion = true;       // Fade strategies OK
-    bool allowBreakout = true;            // Breakout strategies OK
-    bool allowTrend = true;               // Trend-following OK
-    bool requireHighConfidence = false;   // Need stronger signal
-
-    // =========================================================================
-    // LOCATION-BASED MULTIPLIERS
-    // =========================================================================
-    double fadeConfidenceMultiplier = 1.0;     // For mean reversion
-    double breakoutConfidenceMultiplier = 1.0; // For breakouts
-    double trendConfidenceMultiplier = 1.0;    // For trend-following
-
-    // =========================================================================
-    // SUGGESTED BEHAVIORS
-    // =========================================================================
-    bool preferLongSide = false;          // Location favors longs
-    bool preferShortSide = false;         // Location favors shorts
-    bool isNeutralZone = true;            // At POC = neutral
-
-    // =========================================================================
-    // CONTEXT WARNINGS
-    // =========================================================================
-    bool atStructuralExtreme = false;     // At session high/low
-    bool atReferenceDensity = false;      // Multiple levels nearby (confluence)
-    bool inLowLiquidityZone = false;      // Near LVN (potential gap)
-
-    // Descriptive recommendation string
-    const char* GetRecommendation() const {
-        if (atStructuralExtreme) return "EXTREME-CAUTION";
-        if (!allowMeanReversion && !allowBreakout) return "NO-TRADE";
-        if (allowMeanReversion && fadeConfidenceMultiplier >= 1.0) return "FADE-FAVORABLE";
-        if (allowBreakout && breakoutConfidenceMultiplier >= 1.0) return "BREAKOUT-FAVORABLE";
-        return "NEUTRAL";
-    }
-};
 
 // ============================================================================
 // VALUE LOCATION RESULT (Per-Bar Output)
@@ -314,9 +192,6 @@ struct ValueLocationResult {
     // PRIMARY LOCATION (Q1: Where am I relative to value?)
     // =========================================================================
     ValueZone zone = ValueZone::UNKNOWN;                    // Fine-grained (9 states) - SSOT
-
-    // DEPRECATED: Use zone and helper methods instead. Will be removed.
-    ValueLocation location = ValueLocation::INSIDE_VALUE;  // Coarse (6 states) - LEGACY
 
     // Distance metrics (in ticks, signed: + = above, - = below)
     double distFromPOCTicks = 0.0;
@@ -374,25 +249,26 @@ struct ValueLocationResult {
     double distToPriorVAHTicks = 0.0;
     double distToPriorVALTicks = 0.0;
 
-    // HVN/LVN context
-    bool atHVN = false;                   // Near High Volume Node
-    bool atLVN = false;                   // Near Low Volume Node
-    int nearbyHVNs = 0;
-    int nearbyLVNs = 0;
+    // =========================================================================
+    // HVN/LVN DISTANCE PRIMITIVES (measurable, not just booleans)
+    // =========================================================================
+    double nearestHVNDistTicks = 0.0;     // Signed: + = HVN above price, - = below
+    bool nearestHVNValid = false;         // True if at least one HVN exists
+    double nearestLVNDistTicks = 0.0;     // Signed: + = LVN above price, - = below
+    bool nearestLVNValid = false;         // True if at least one LVN exists
+    int nearbyHVNCount = 0;               // Count within referenceApproachingTicks
+    int nearbyLVNCount = 0;               // Count within referenceApproachingTicks
 
     // =========================================================================
-    // STRATEGY GATING (Q5: How does location gate strategies?)
+    // NOTE: StrategyGating REMOVED (Jan 2025)
+    // Policy decisions belong in decision/arbitration layer, not location SSOT.
     // =========================================================================
-    StrategyGating gating;
 
     // =========================================================================
-    // HYSTERESIS STATE
+    // NOTE: Hysteresis state fields REMOVED from result (Jan 2025)
+    // Engine owns hysteresis state (confirmedZone, candidateZone, etc.)
+    // Result contains only per-bar facts and events.
     // =========================================================================
-    ValueZone confirmedZone = ValueZone::UNKNOWN;
-    ValueZone candidateZone = ValueZone::UNKNOWN;
-    int confirmationBars = 0;
-    int barsInZone = 0;
-    bool isTransitioning = false;
 
     // =========================================================================
     // EVENTS (Only true on transition bars)
@@ -407,8 +283,8 @@ struct ValueLocationResult {
     // VALIDITY / ERROR
     // =========================================================================
     ValueLocationErrorReason errorReason = ValueLocationErrorReason::NONE;
-    SessionPhase phase = SessionPhase::UNKNOWN;
     int errorBar = -1;
+    // NOTE: phase field REMOVED (Jan 2025) - use sessionPhase (single SSOT)
 
     // =========================================================================
     // ACCESSORS
@@ -477,45 +353,31 @@ struct ValueLocationResult {
         return ValueZoneToValueAreaRegion(zone);
     }
 
-    /**
-     * Get coarse ValueLocation (6 states) from fine-grained ValueZone (9 states).
-     * Use this for backwards compatibility with code expecting ValueLocation.
-     * Prefer using helper methods (IsInsideValue, IsAtBoundary, etc.) for new code.
-     */
-    ValueLocation GetCoarseLocation() const {
-        switch (zone) {
-            case ValueZone::AT_POC:           return ValueLocation::AT_POC;
-            case ValueZone::AT_VAH:           return ValueLocation::AT_VAH;
-            case ValueZone::AT_VAL:           return ValueLocation::AT_VAL;
-            case ValueZone::UPPER_VALUE:
-            case ValueZone::LOWER_VALUE:      return ValueLocation::INSIDE_VALUE;
-            case ValueZone::FAR_ABOVE_VALUE:
-            case ValueZone::NEAR_ABOVE_VALUE: return ValueLocation::ABOVE_VALUE;
-            case ValueZone::FAR_BELOW_VALUE:
-            case ValueZone::NEAR_BELOW_VALUE: return ValueLocation::BELOW_VALUE;
-            default:                          return ValueLocation::INSIDE_VALUE;
-        }
+    // =========================================================================
+    // HVN/LVN DERIVED QUERIES (convenience, based on distance primitives)
+    // =========================================================================
+    bool IsAtHVN(int toleranceTicks = 4) const {
+        return nearestHVNValid && std::abs(nearestHVNDistTicks) <= toleranceTicks;
+    }
+    bool IsAtLVN(int toleranceTicks = 4) const {
+        return nearestLVNValid && std::abs(nearestLVNDistTicks) <= toleranceTicks;
+    }
+    bool IsNearHVN(int approachingTicks = 12) const {
+        return nearestHVNValid && std::abs(nearestHVNDistTicks) <= approachingTicks;
+    }
+    bool IsNearLVN(int approachingTicks = 12) const {
+        return nearestLVNValid && std::abs(nearestLVNDistTicks) <= approachingTicks;
     }
 
-    // Strategy recommendations
-    bool ShouldFade() const {
-        return gating.allowMeanReversion &&
-               IsAtBoundary() &&
-               IsBalanceStructure();
-    }
-    bool ShouldBreakout() const {
-        return gating.allowBreakout &&
-               IsOutsideValue() &&
-               !IsBalanceStructure();
-    }
+    // NOTE: ShouldFade(), ShouldBreakout() REMOVED (Jan 2025)
+    // Policy decisions belong in decision/arbitration layer, not location SSOT.
 
     // Format for logging
     std::string FormatForLog() const {
         char buf[512];
         snprintf(buf, sizeof(buf),
-            "ZONE=%s LOC=%s | POC_T=%+.1f VAH_T=%+.1f VAL_T=%+.1f | VA_PCT=%.1f",
+            "ZONE=%s | POC_T=%+.1f VAH_T=%+.1f VAL_T=%+.1f | VA_PCT=%.1f",
             ValueZoneToString(zone),
-            ValueLocationToString(location),
             distFromPOCTicks, distFromVAHTicks, distFromVALTicks,
             vaPercentile);
         return std::string(buf);
@@ -544,24 +406,17 @@ struct ValueLocationResult {
     std::string FormatReferencesForLog() const {
         char buf[256];
         snprintf(buf, sizeof(buf),
-            "NEAR=%s(%.1ft) HVN=%d LVN=%d | WITHIN_5T=%d WITHIN_10T=%d",
+            "NEAR=%s(%.1ft) | HVN_T=%+.1f(%s) LVN_T=%+.1f(%s) | CNT: HVN=%d LVN=%d | WITHIN_5T=%d",
             LevelTypeToString(nearestLevelType),
             nearestLevelDistance,
-            nearbyHVNs, nearbyLVNs,
-            levelsWithin5Ticks, levelsWithin10Ticks);
+            nearestHVNDistTicks, nearestHVNValid ? "Y" : "N",
+            nearestLVNDistTicks, nearestLVNValid ? "Y" : "N",
+            nearbyHVNCount, nearbyLVNCount,
+            levelsWithin5Ticks);
         return std::string(buf);
     }
 
-    std::string FormatGatingForLog() const {
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-            "FADE=%s BREAK=%s TREND=%s | SIDE=%s",
-            gating.allowMeanReversion ? "OK" : "NO",
-            gating.allowBreakout ? "OK" : "NO",
-            gating.allowTrend ? "OK" : "NO",
-            gating.preferLongSide ? "LONG" : (gating.preferShortSide ? "SHORT" : "NEUTRAL"));
-        return std::string(buf);
-    }
+    // NOTE: FormatGatingForLog() REMOVED (Jan 2025) - gating removed from SSOT
 };
 
 // ============================================================================
@@ -652,16 +507,13 @@ private:
     ValueZone DetermineZone(double price, double poc, double vah,
                             double val, double tickSize) const;
 
-    // Map ValueZone to existing ValueLocation
-    ValueLocation ZoneToLocation(ValueZone zone) const;
-
     // Compute VA overlap state and percentage
     void ComputeVAOverlap(ValueLocationResult& result,
                           double vah, double val,
                           double priorVAH, double priorVAL,
                           double tickSize) const;
 
-    // Build reference level list (sorted by distance)
+    // Build reference level list (sorted by distance) + populate HVN/LVN distances
     void BuildReferenceLevels(ValueLocationResult& result,
                               double price, double tickSize,
                               double poc, double vah, double val,
@@ -671,11 +523,10 @@ private:
                               const std::vector<double>* hvnLevels,
                               const std::vector<double>* lvnLevels) const;
 
-    // Compute strategy gating based on location + structure
-    StrategyGating ComputeGating(const ValueLocationResult& result,
-                                 AMTMarketState marketState) const;
+    // NOTE: ComputeGating() REMOVED (Jan 2025)
+    // Policy decisions belong in decision/arbitration layer, not location SSOT.
 
-    // Apply hysteresis to zone transitions
+    // Apply hysteresis to zone transitions (engine state only, not copied to result)
     void UpdateHysteresis(ValueLocationResult& result, ValueZone rawZone);
 
     // Detect events (entries, exits, crossings)
@@ -731,28 +582,6 @@ inline ValueZone ValueLocationEngine::DetermineZone(
         return ValueZone::UPPER_VALUE;
     }
     return ValueZone::LOWER_VALUE;
-}
-
-inline ValueLocation ValueLocationEngine::ZoneToLocation(ValueZone zone) const {
-    switch (zone) {
-        case ValueZone::AT_POC:
-            return ValueLocation::AT_POC;
-        case ValueZone::AT_VAH:
-            return ValueLocation::AT_VAH;
-        case ValueZone::AT_VAL:
-            return ValueLocation::AT_VAL;
-        case ValueZone::UPPER_VALUE:
-        case ValueZone::LOWER_VALUE:
-            return ValueLocation::INSIDE_VALUE;
-        case ValueZone::FAR_ABOVE_VALUE:
-        case ValueZone::NEAR_ABOVE_VALUE:
-            return ValueLocation::ABOVE_VALUE;
-        case ValueZone::FAR_BELOW_VALUE:
-        case ValueZone::NEAR_BELOW_VALUE:
-            return ValueLocation::BELOW_VALUE;
-        default:
-            return ValueLocation::INSIDE_VALUE;
-    }
 }
 
 inline void ValueLocationEngine::ComputeVAOverlap(
@@ -837,10 +666,18 @@ inline void ValueLocationEngine::BuildReferenceLevels(
     result.nearbyLevels.clear();
     result.levelsWithin5Ticks = 0;
     result.levelsWithin10Ticks = 0;
-    result.nearbyHVNs = 0;
-    result.nearbyLVNs = 0;
-    result.atHVN = false;
-    result.atLVN = false;
+
+    // HVN/LVN distance primitives - initialize
+    result.nearestHVNDistTicks = 0.0;
+    result.nearestHVNValid = false;
+    result.nearestLVNDistTicks = 0.0;
+    result.nearestLVNValid = false;
+    result.nearbyHVNCount = 0;
+    result.nearbyLVNCount = 0;
+
+    // Track nearest HVN/LVN for distance primitives
+    double nearestHVNAbsDist = 1e9;
+    double nearestLVNAbsDist = 1e9;
 
     auto addLevel = [&](LevelType type, double levelPrice) {
         if (levelPrice <= 0.0) return;
@@ -903,17 +740,24 @@ inline void ValueLocationEngine::BuildReferenceLevels(
         result.distToIBLowTicks = (price - ibLow) / tickSize;
     }
 
-    // HVN/LVN levels
+    // HVN/LVN levels - populate distance primitives
     if (hvnLevels) {
         for (double hvnPrice : *hvnLevels) {
             if (hvnPrice > 0.0) {
                 addLevel(LevelType::HVN, hvnPrice);
-                double dist = std::abs((price - hvnPrice) / tickSize);
-                if (dist <= config.hvnLvnToleranceTicks) {
-                    result.atHVN = true;
+                double signedDist = (price - hvnPrice) / tickSize;  // + = price above HVN
+                double absDist = std::abs(signedDist);
+
+                // Track nearest HVN
+                if (absDist < nearestHVNAbsDist) {
+                    nearestHVNAbsDist = absDist;
+                    result.nearestHVNDistTicks = signedDist;
+                    result.nearestHVNValid = true;
                 }
-                if (dist <= config.referenceApproachingTicks) {
-                    result.nearbyHVNs++;
+
+                // Count nearby
+                if (absDist <= config.referenceApproachingTicks) {
+                    result.nearbyHVNCount++;
                 }
             }
         }
@@ -922,12 +766,19 @@ inline void ValueLocationEngine::BuildReferenceLevels(
         for (double lvnPrice : *lvnLevels) {
             if (lvnPrice > 0.0) {
                 addLevel(LevelType::LVN, lvnPrice);
-                double dist = std::abs((price - lvnPrice) / tickSize);
-                if (dist <= config.hvnLvnToleranceTicks) {
-                    result.atLVN = true;
+                double signedDist = (price - lvnPrice) / tickSize;  // + = price above LVN
+                double absDist = std::abs(signedDist);
+
+                // Track nearest LVN
+                if (absDist < nearestLVNAbsDist) {
+                    nearestLVNAbsDist = absDist;
+                    result.nearestLVNDistTicks = signedDist;
+                    result.nearestLVNValid = true;
                 }
-                if (dist <= config.referenceApproachingTicks) {
-                    result.nearbyLVNs++;
+
+                // Count nearby
+                if (absDist <= config.referenceApproachingTicks) {
+                    result.nearbyLVNCount++;
                 }
             }
         }
@@ -948,97 +799,14 @@ inline void ValueLocationEngine::BuildReferenceLevels(
     }
 }
 
-inline StrategyGating ValueLocationEngine::ComputeGating(
-    const ValueLocationResult& result,
-    AMTMarketState marketState) const
-{
-    StrategyGating gating;
-
-    // Default multipliers
-    gating.fadeConfidenceMultiplier = 1.0;
-    gating.breakoutConfidenceMultiplier = 1.0;
-    gating.trendConfidenceMultiplier = 1.0;
-
-    // Zone-based adjustments
-    switch (result.zone) {
-        case ValueZone::AT_POC:
-            // POC = neutral, reduce directional confidence
-            gating.fadeConfidenceMultiplier = config.fadeMultiplierAtPOC;
-            gating.breakoutConfidenceMultiplier = 0.5;
-            gating.isNeutralZone = true;
-            break;
-
-        case ValueZone::AT_VAH:
-        case ValueZone::AT_VAL:
-            // Boundary behavior depends on structure
-            if (result.IsBalanceStructure()) {
-                // Balance: fade the boundary
-                gating.fadeConfidenceMultiplier = config.fadeMultiplierAtBoundary;
-                gating.breakoutConfidenceMultiplier = config.breakoutMultiplierAtBoundary;
-                gating.preferShortSide = (result.zone == ValueZone::AT_VAH);
-                gating.preferLongSide = (result.zone == ValueZone::AT_VAL);
-            } else {
-                // Trend: follow the breakout
-                gating.fadeConfidenceMultiplier = 0.6;
-                gating.breakoutConfidenceMultiplier = 1.2;
-            }
-            gating.isNeutralZone = false;
-            break;
-
-        case ValueZone::FAR_ABOVE_VALUE:
-        case ValueZone::FAR_BELOW_VALUE:
-            // Extended outside value - trend following
-            gating.fadeConfidenceMultiplier = 0.4;
-            gating.trendConfidenceMultiplier = config.trendMultiplierFarOutside;
-            gating.isNeutralZone = false;
-            gating.preferLongSide = (result.zone == ValueZone::FAR_ABOVE_VALUE);
-            gating.preferShortSide = (result.zone == ValueZone::FAR_BELOW_VALUE);
-            break;
-
-        case ValueZone::NEAR_ABOVE_VALUE:
-        case ValueZone::NEAR_BELOW_VALUE:
-            // Testing outside value - wait for confirmation
-            gating.requireHighConfidence = true;
-            gating.isNeutralZone = false;
-            break;
-
-        default:
-            // Inside value
-            gating.isNeutralZone = false;
-            break;
-    }
-
-    // Market state integration (1TF vs 2TF from Dalton)
-    if (marketState == AMTMarketState::IMBALANCE) {
-        // Trending - boost trend following, reduce fades
-        gating.fadeConfidenceMultiplier *= 0.7;
-        gating.trendConfidenceMultiplier *= 1.2;
-    } else if (marketState == AMTMarketState::BALANCE) {
-        // Rotational - boost fades at extremes
-        gating.fadeConfidenceMultiplier *= 1.1;
-        gating.breakoutConfidenceMultiplier *= 0.8;
-    }
-
-    // Context warnings
-    gating.atStructuralExtreme = (std::abs(result.distToSessionHighTicks) <= 2 ||
-                                   std::abs(result.distToSessionLowTicks) <= 2);
-    gating.atReferenceDensity = (result.levelsWithin5Ticks >= 3);
-    gating.inLowLiquidityZone = result.atLVN;
-
-    // Determine if strategies are allowed
-    gating.allowMeanReversion = !result.IsFarOutside() &&
-                                 !gating.atStructuralExtreme;
-    gating.allowBreakout = !result.IsAtPOC();
-    gating.allowTrend = result.IsOutsideValue() ||
-                        marketState == AMTMarketState::IMBALANCE;
-
-    return gating;
-}
+// NOTE: ComputeGating() REMOVED (Jan 2025)
+// Policy decisions belong in decision/arbitration layer, not location SSOT.
 
 inline void ValueLocationEngine::UpdateHysteresis(
     ValueLocationResult& result, ValueZone rawZone)
 {
-    result.isTransitioning = false;
+    // NOTE: Hysteresis state stays in ENGINE, not copied to result (Jan 2025 refactor)
+    // Result only gets the zoneChanged EVENT flag
 
     if (rawZone == confirmedZone) {
         // Still in same zone
@@ -1053,22 +821,17 @@ inline void ValueLocationEngine::UpdateHysteresis(
             // Confirmed transition
             confirmedZone = candidateZone;
             barsInConfirmedZone = 0;
-            result.zoneChanged = true;
+            result.zoneChanged = true;  // Event flag - this bar confirmed a zone change
         }
-        result.isTransitioning = true;
     }
     else if (rawZone != confirmedZone && rawZone != candidateZone) {
         // New candidate detected
         candidateZone = rawZone;
         candidateConfirmationBars = 1;
-        result.isTransitioning = true;
     }
 
-    // Populate result hysteresis fields
-    result.confirmedZone = confirmedZone;
-    result.candidateZone = candidateZone;
-    result.confirmationBars = candidateConfirmationBars;
-    result.barsInZone = barsInConfirmedZone;
+    // NOTE: confirmedZone, candidateZone, confirmationBars, barsInZone, isTransitioning
+    // are ENGINE state - not copied to result. Query engine directly if needed.
 }
 
 inline void ValueLocationEngine::DetectEvents(
@@ -1121,11 +884,10 @@ inline ValueLocationResult ValueLocationEngine::Compute(
     const ZoneManager& zm,
     const std::vector<double>* hvnLevels,
     const std::vector<double>* lvnLevels,
-    AMTMarketState marketState)
+    AMTMarketState /* marketState - no longer used, gating removed */)
 {
     ValueLocationResult result;
-    result.phase = currentPhase;
-    result.sessionPhase = currentPhase;
+    result.sessionPhase = currentPhase;  // Single SSOT for phase
     sessionBars++;
 
     // =========================================================================
@@ -1157,10 +919,9 @@ inline ValueLocationResult ValueLocationEngine::Compute(
     // LOCATION DETERMINATION
     // =========================================================================
 
-    // Determine fine-grained zone
+    // Determine fine-grained zone (9-state SSOT)
     ValueZone rawZone = DetermineZone(close, poc, vah, val, tickSize);
     result.zone = rawZone;
-    result.location = ZoneToLocation(rawZone);
 
     // Distance metrics
     result.distFromPOCTicks = (close - poc) / tickSize;
@@ -1225,10 +986,9 @@ inline ValueLocationResult ValueLocationEngine::Compute(
                          hvnLevels, lvnLevels);
 
     // =========================================================================
-    // STRATEGY GATING
+    // NOTE: Strategy gating REMOVED (Jan 2025)
+    // Policy decisions belong in decision/arbitration layer, not location SSOT.
     // =========================================================================
-
-    result.gating = ComputeGating(result, marketState);
 
     // =========================================================================
     // HYSTERESIS

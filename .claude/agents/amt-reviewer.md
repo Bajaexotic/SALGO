@@ -35,7 +35,7 @@ Reference: `.claude/rules/architecture.md`
 - [ ] No duplicate storage of SSOT-owned data
 - [ ] Session phase via `st->SyncSessionPhase()` or `phaseCoordinator`
 - [ ] Zone anchors from `SessionManager`, not calculated values
-- [ ] Market state from `DaltonEngine.phase`
+- [ ] Market state from `DaltonEngine.marketState`
 
 ### 2. NO-FALLBACK Pattern
 

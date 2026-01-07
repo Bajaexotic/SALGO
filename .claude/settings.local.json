@@ -33,7 +33,17 @@
       "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"Start-Process -FilePath ''cmd.exe'' -ArgumentList ''/c E:\\\\SierraChart\\\\ACS_Source\\\\test\\\\compile_location.bat'' -Wait -NoNewWindow\")",
       "Bash(powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"E:\\\\SierraChart\\\\ACS_Source\\\\test\\\\test_liquidity_location.exe\")",
       "Bash(C:/msys64/usr/bin/bash.exe -l -c \"cd /e/SierraChart/ACS_Source/test && export TMPDIR=/tmp && rm -f test_liquidity_location.exe && /mingw64/bin/g++.exe -std=c++17 -I.. -o test_liquidity_location.exe test_liquidity_location.cpp 2>&1 && ./test_liquidity_location.exe\")",
-      "Bash(C:/msys64/usr/bin/bash.exe -l -c \"cd /e/SierraChart/ACS_Source/test && export TMPDIR=/tmp && rm -f test_ssot_invariants.exe && /mingw64/bin/g++.exe -std=c++17 -I.. -o test_ssot_invariants.exe test_ssot_invariants.cpp 2>&1 && ./test_ssot_invariants.exe\")"
+      "Bash(C:/msys64/usr/bin/bash.exe -l -c \"cd /e/SierraChart/ACS_Source/test && export TMPDIR=/tmp && rm -f test_ssot_invariants.exe && /mingw64/bin/g++.exe -std=c++17 -I.. -o test_ssot_invariants.exe test_ssot_invariants.cpp 2>&1 && ./test_ssot_invariants.exe\")",
+      "Bash(./test_imbalance_engine.exe:*)",
+      "Bash(git -C \"E:/SierraChart/ACS_Source\" status AMT_VolumeAcceptance.h)",
+      "Bash(dir:*)",
+      "Bash(git -C \"E:/SierraChart/ACS_Source\" diff HEAD -- AMT_Dalton.h)",
+      "Bash(git -C \"E:/SierraChart/ACS_Source\" status)",
+      "Bash(git -C \"E:/SierraChart/ACS_Source\" diff --stat)",
+      "Bash(git -C \"E:/SierraChart/ACS_Source\" log --oneline -5)",
+      "Bash(git -C \"E:/SierraChart/ACS_Source\" diff AMT_Signals.h)",
+      "Bash(git -C:*)",
+      "Bash(git -C \"E:/SierraChart/ACS_Source\" status --short)"
     ]
   }
 }

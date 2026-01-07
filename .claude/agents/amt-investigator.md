@@ -167,7 +167,7 @@ Symptom: Engines disagree on market state
 
 Investigation:
 1. Check SSOT ownership - who owns market state?
-   → DaltonEngine.phase is SSOT
+   → DaltonEngine.marketState is SSOT
 
 2. Check consumer reads:
    → VolatilityEngine reads from: ???
@@ -177,7 +177,7 @@ Investigation:
 3. Find inconsistency:
    → One engine reading from stale cache
 
-4. Fix: All read from DaltonEngine.phase
+4. Fix: All read from DaltonEngine.marketState
 ```
 
 ### Session Boundary Race

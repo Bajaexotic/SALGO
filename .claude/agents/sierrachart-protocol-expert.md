@@ -67,7 +67,7 @@ You are an expert SierraChart ACSIL developer with deep mastery of the AMT (Auct
    | Session Phase | phaseCoordinator | StudyState |
    | Session Extremes | StructureTracker | ZoneManager.structure |
    | Zone Anchors | VbP Study | sessionVolumeProfile.session_* |
-   | Market State | DaltonEngine | lastDaltonState.phase |
+   | Market State | DaltonEngine | lastDaltonState.marketState |
    | Liquidity | LiquidityEngine | lastLiqSnap |
    | Volatility | VolatilityEngine | lastVolResult |
    | Imbalance | ImbalanceEngine | lastImbalanceResult |

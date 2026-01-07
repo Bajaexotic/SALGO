@@ -36,7 +36,7 @@
 | `AMT_TuningTelemetry.h` | Advisory friction/volatility tuning telemetry (observational only) |
 | `AMT_Updates.h` | CreateZonesFromProfile, InitializeZoneSessionState, zone updates |
 | `AMT_Volatility.h` | VolatilityEngine: regime classification (COMPRESSION/NORMAL/EXPANSION/EVENT) with hysteresis |
-| `AMT_ValueLocation.h` | **ValueLocationEngine**: value-relative location, VA overlap, reference levels, strategy gating |
+| `AMT_ValueLocation.h` | **ValueLocationEngine**: value-relative location, VA overlap, reference levels (descriptive primitives only) |
 | `AMT_VolumeAcceptance.h` | **VolumeAcceptanceEngine**: acceptance/rejection detection, value migration, volume intensity |
 | `AMT_VolumePatterns.h` | Deterministic volume profile pattern detection from structure |
 | `AMT_VolumeProfile.h` | SessionVolumeProfile - VbP study integration |
@@ -106,19 +106,18 @@ amt_core.h
 | `VolumeAcceptanceEngine` | AMT_VolumeAcceptance.h (acceptance/rejection detection, phase-aware via EffortBaselineStore) |
 | `VolumeAcceptanceResult` | AMT_VolumeAcceptance.h (per-bar output: state, migration, intensity, confirmation) |
 | `AcceptanceState` | AMT_VolumeAcceptance.h (enum: UNKNOWN, TESTING, ACCEPTED, REJECTED) |
-| `ValueMigrationState` | AMT_VolumeAcceptance.h (enum: UNKNOWN, UNCHANGED, MIGRATING_HIGHER/LOWER, ROTATING) |
+| `ValueMigration` | amt_core.h (enum: UNKNOWN, OVERLAPPING, HIGHER, LOWER, INSIDE, UNCHANGED, ROTATING) |
 | `VolumeIntensity` | AMT_VolumeAcceptance.h (enum: UNKNOWN, VERY_LOW, LOW, NORMAL, HIGH, VERY_HIGH) |
 | `ConfirmationRequirement` | AMT_VolumeAcceptance.h (confirmation multiplier and requirements for downstream) |
 | `POCMigrationTracker` | AMT_VolumeAcceptance.h (tracks POC position for value migration detection) |
 | `ValueAreaTracker` | AMT_VolumeAcceptance.h (tracks VA expansion/contraction/overlap) |
 | `ValueLocationEngine` | AMT_ValueLocation.h (value-relative location classification with hysteresis) |
-| `ValueLocationResult` | AMT_ValueLocation.h (per-bar output: zone, structure, references, gating) |
+| `ValueLocationResult` | AMT_ValueLocation.h (per-bar output: zone, structure, references, events) |
 | `ValueZone` | AMT_ValueLocation.h (enum: FAR_ABOVE/NEAR_ABOVE/AT_VAH/UPPER/AT_POC/LOWER/AT_VAL/NEAR_BELOW/FAR_BELOW) |
 | `VAOverlapState` | AMT_ValueLocation.h (enum: SEPARATED_ABOVE/BELOW, OVERLAPPING, CONTAINED, EXPANDING) |
 | `ReferenceLevelProximity` | AMT_ValueLocation.h (distance to reference levels with proximity flags) |
-| `StrategyGating` | AMT_ValueLocation.h (actionable recommendations: fade/breakout/trend multipliers) |
 | `DaltonEngine` | AMT_Dalton.h (SSOT: 1TF/2TF, IB, day type, session bridge) |
-| `DaltonState` | AMT_Dalton.h (per-bar output: phase, timeframe, IB, extension, opening type) |
+| `DaltonState` | AMT_Dalton.h (per-bar output: marketState, timeframe, IB, extension, opening type) |
 | `SessionBridge` | AMT_Dalton.h (SSOT: overnight context, gap, prior RTH for GLOBEX→RTH transition) |
 | `OvernightSession` | AMT_Dalton.h (GLOBEX extremes, mini-IB, overnight pattern) |
 | `OvernightInventory` | AMT_Dalton.h (net position from overnight: NET_LONG/NET_SHORT/NEUTRAL, score) |
@@ -147,27 +146,31 @@ amt_core.h
 ValueLocationEngine (SSOT)
          │
          ▼
-    ValueZone (9 states) ─────────────────────────────────────────┐
-         │                                                         │
-         ├──► ValueLocation (6 states) ← ZoneToLocation() mapping  │
-         │         └──► DaltonState.location                       │
-         │         └──► ActivityClassification.location            │
-         │                                                         │
-         ├──► ValueZoneSimple (5 states) ← MapValueZoneToSimple()  │
-         │         └──► DeltaLocationContext.zone                  │
-         │                                                         │
-         └──► ValueZone (direct) ─────────────────────────────────┘
-                   └──► DomPatternContext.valueZone
-                   └──► Liq3Result.spatialValueZone
+    ValueZone (9 states) ──────────────────────────────────────────┐
+         │                                                          │
+         ├──► DaltonState.location (ValueZone)                      │
+         ├──► ActivityClassification.zone (ValueZone)               │
+         ├──► StateEvidence.location (ValueZone)                    │
+         ├──► DeltaLocationContext.zone (ValueZone)                 │
+         ├──► DomPatternContext.valueZone (ValueZone)               │
+         └──► Liq3Result.spatialValueZone (ValueZone)               │
+                                                                    │
+Helper Functions (amt_core.h) ──────────────────────────────────────┘
+  • IsAtBoundary(zone) - AT_VAH or AT_VAL
+  • IsAtPOC(zone) - AT_POC
+  • IsInsideValue(zone) - UPPER_VALUE, LOWER_VALUE, AT_POC
+  • IsAboveValue(zone) - FAR_ABOVE_VALUE, NEAR_ABOVE_VALUE
+  • IsBelowValue(zone) - FAR_BELOW_VALUE, NEAR_BELOW_VALUE
+  • IsOutsideValue(zone) - Above or Below value
 ```
 
-### Enum Granularities
+### Enum Definition
 
 | Enum | States | Purpose |
 |------|--------|---------|
-| `ValueZone` | 9 | Fine-grained SSOT (FAR_ABOVE, NEAR_ABOVE, AT_VAH, UPPER, AT_POC, LOWER, AT_VAL, NEAR_BELOW, FAR_BELOW) |
-| `ValueLocation` | 6 | Coarse classification for high-level decisions (INSIDE, ABOVE, BELOW, AT_POC, AT_VAH, AT_VAL) |
-| `ValueZoneSimple` | 5 | Delta-specific simplification (IN_VALUE, AT_VALUE_EDGE, OUTSIDE_VALUE, IN_DISCOVERY) |
+| `ValueZone` | 9 | SSOT for value-relative location (FAR_ABOVE, NEAR_ABOVE, AT_VAH, UPPER, AT_POC, LOWER, AT_VAL, NEAR_BELOW, FAR_BELOW) |
+
+**DELETED (Jan 2025):** `ValueLocation` (6-state) and `ValueZoneSimple` (5-state) have been removed. All consumers now use `ValueZone` directly with helper functions for coarse checks.
 
 ### SSOT Consumer Pattern
 
@@ -178,6 +181,11 @@ All consumers MUST use `BuildFromValueLocation()` or equivalent SSOT-consuming m
 auto locCtx = DeltaLocationContext::BuildFromValueLocation(st->lastValueLocationResult);
 auto domCtx = DomPatternContext::BuildFromValueLocation(st->lastValueLocationResult, ...);
 auto activity = classifier.ClassifyFromValueLocation(st->lastValueLocationResult, ...);
+
+// Use helpers for coarse checks instead of deleted 6-state enum
+if (IsAboveValue(activity.zone)) { /* outside value, above */ }
+if (IsInsideValue(activity.zone)) { /* inside value area */ }
+if (IsAtBoundary(activity.zone)) { /* at VAH or VAL */ }
 
 // DEPRECATED: Computes own location (bypasses SSOT)
 auto locCtx = DeltaLocationContext::Build(price, poc, vah, val, ...);  // [[deprecated]]

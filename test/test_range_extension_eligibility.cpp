@@ -11,7 +11,12 @@
 // Minimal type stubs for standalone testing
 enum class AMTMarketState { UNKNOWN = 0, BALANCE, IMBALANCE };
 enum class AMTActivityType { NEUTRAL = 0, INITIATIVE, RESPONSIVE };
-enum class ValueLocation { INSIDE_VALUE = 0, AT_POC, AT_VAH, AT_VAL, ABOVE_VALUE, BELOW_VALUE };
+// Use 9-state ValueZone (matches production code)
+enum class ValueZone {
+    UNKNOWN = -1,
+    FAR_BELOW_VALUE = 0, NEAR_BELOW_VALUE, AT_VAL, LOWER_VALUE,
+    AT_POC, UPPER_VALUE, AT_VAH, NEAR_ABOVE_VALUE, FAR_ABOVE_VALUE
+};
 enum class RangeExtensionType { NONE = 0, BUYING, SELLING, BOTH };
 enum class CurrentPhase {
     UNKNOWN = 0,
@@ -24,16 +29,21 @@ enum class CurrentPhase {
     FAILED_AUCTION = 7
 };
 
+// Helper functions for 9-state ValueZone
+bool IsAtBoundary(ValueZone z) {
+    return z == ValueZone::AT_VAH || z == ValueZone::AT_VAL;
+}
+
 // Phase derivation logic (from DaltonState.DeriveCurrentPhase)
 CurrentPhase DeriveCurrentPhase(
     AMTMarketState phase,
-    ValueLocation location,
+    ValueZone zone,
     AMTActivityType activity,
     RangeExtensionType extension
 ) {
     // BALANCE state
     if (phase == AMTMarketState::BALANCE) {
-        if (location == ValueLocation::AT_VAH || location == ValueLocation::AT_VAL) {
+        if (IsAtBoundary(zone)) {
             return CurrentPhase::TESTING_BOUNDARY;
         }
         return CurrentPhase::ROTATION;
@@ -42,8 +52,7 @@ CurrentPhase DeriveCurrentPhase(
     // IMBALANCE state
     if (phase == AMTMarketState::IMBALANCE) {
         // At boundary with responsive = rejection
-        if ((location == ValueLocation::AT_VAH || location == ValueLocation::AT_VAL) &&
-            activity == AMTActivityType::RESPONSIVE) {
+        if (IsAtBoundary(zone) && activity == AMTActivityType::RESPONSIVE) {
             return CurrentPhase::FAILED_AUCTION;
         }
 
@@ -111,7 +120,7 @@ struct Scenario {
     AMTMarketState state;
     RangeExtensionType extension;
     AMTActivityType activity;
-    ValueLocation location;
+    ValueZone zone;
     CurrentPhase expected;
 };
 
@@ -123,33 +132,33 @@ int main() {
         // SHOULD produce RANGE_EXTENSION
         {"IMBALANCE + IB_BREAK + INITIATIVE = RANGE_EXTENSION",
          AMTMarketState::IMBALANCE, RangeExtensionType::BUYING,
-         AMTActivityType::INITIATIVE, ValueLocation::ABOVE_VALUE,
+         AMTActivityType::INITIATIVE, ValueZone::NEAR_ABOVE_VALUE,
          CurrentPhase::RANGE_EXTENSION},
 
         {"IMBALANCE + SELLING + INITIATIVE = RANGE_EXTENSION",
          AMTMarketState::IMBALANCE, RangeExtensionType::SELLING,
-         AMTActivityType::INITIATIVE, ValueLocation::BELOW_VALUE,
+         AMTActivityType::INITIATIVE, ValueZone::NEAR_BELOW_VALUE,
          CurrentPhase::RANGE_EXTENSION},
 
         // SHOULD NOT produce RANGE_EXTENSION (gate failures)
         {"GATE 1 FAIL: BALANCE + IB_BREAK + INITIATIVE = ROTATION (not EXT)",
          AMTMarketState::BALANCE, RangeExtensionType::BUYING,
-         AMTActivityType::INITIATIVE, ValueLocation::ABOVE_VALUE,
+         AMTActivityType::INITIATIVE, ValueZone::NEAR_ABOVE_VALUE,
          CurrentPhase::ROTATION},
 
         {"GATE 2 FAIL: IMBALANCE + NO_BREAK + INITIATIVE = DRIVING (not EXT)",
          AMTMarketState::IMBALANCE, RangeExtensionType::NONE,
-         AMTActivityType::INITIATIVE, ValueLocation::ABOVE_VALUE,
+         AMTActivityType::INITIATIVE, ValueZone::NEAR_ABOVE_VALUE,
          CurrentPhase::DRIVING_UP},
 
         {"GATE 3 FAIL: IMBALANCE + IB_BREAK + RESPONSIVE = PULLBACK (not EXT)",
          AMTMarketState::IMBALANCE, RangeExtensionType::BUYING,
-         AMTActivityType::RESPONSIVE, ValueLocation::ABOVE_VALUE,
+         AMTActivityType::RESPONSIVE, ValueZone::NEAR_ABOVE_VALUE,
          CurrentPhase::PULLBACK},
 
         {"ALL GATES FAIL: BALANCE + NO_BREAK + NEUTRAL = ROTATION",
          AMTMarketState::BALANCE, RangeExtensionType::NONE,
-         AMTActivityType::NEUTRAL, ValueLocation::INSIDE_VALUE,
+         AMTActivityType::NEUTRAL, ValueZone::UPPER_VALUE,
          CurrentPhase::ROTATION},
     };
 
@@ -162,7 +171,7 @@ int main() {
     printf("  Gate 3: activity == INITIATIVE (delta aligned with price)\n\n");
 
     for (const auto& s : scenarios) {
-        CurrentPhase result = DeriveCurrentPhase(s.state, s.location, s.activity, s.extension);
+        CurrentPhase result = DeriveCurrentPhase(s.state, s.zone, s.activity, s.extension);
 
         bool gate1 = (s.state == AMTMarketState::IMBALANCE);
         bool gate2 = (s.extension != RangeExtensionType::NONE);

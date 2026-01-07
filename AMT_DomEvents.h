@@ -1130,7 +1130,7 @@ struct DomPatternContext
         if (!valLocResult.IsReady()) return ctx;
 
         // Use SSOT values directly
-        ctx.valueZone = valLocResult.confirmedZone;  // Hysteresis-confirmed zone
+        ctx.valueZone = valLocResult.zone;  // Hysteresis-confirmed zone from SSOT
         ctx.distanceFromPOCTicks = valLocResult.distFromPOCTicks;
         ctx.distanceFromVAHTicks = valLocResult.distFromVAHTicks;
         ctx.distanceFromVALTicks = valLocResult.distFromVALTicks;

@@ -96,6 +96,19 @@ struct LiquidityConfig {
     // balance rotation (2TF + inside value + not at edges). In this context,
     // walls/voids are less meaningful and computation can be saved.
     bool enableSpatialGating = false;  // Default OFF (always compute)
+
+    // ========================================================================
+    // EXTREME LIQUIDITY DETECTION (Jan 2025)
+    // ========================================================================
+    // Percentile-based extreme detection for safety-critical gating.
+    // Either extreme stress OR extreme low depth triggers extreme flag.
+    //
+    // EXTREME: Stress >= P95 OR Depth <= P5 - rare, dangerous conditions
+    // SHOCK: Stress >= P99 OR Depth <= P1 - exceptional, crisis conditions
+    double extremeStressThreshold = 95.0;   // Stress >= P95 = extreme demand pressure
+    double extremeDepthThreshold = 5.0;     // Depth <= P5 = extreme thin (inverted)
+    double shockStressThreshold = 99.0;     // Stress >= P99 = shock demand pressure
+    double shockDepthThreshold = 1.0;       // Depth <= P1 = shock thin (inverted)
 };
 
 // ============================================================================
@@ -188,7 +201,7 @@ struct LiquidityLocationContext {
         }
 
         // Extract from SSOT (NO recomputation of location)
-        ctx.zone = valLocResult.confirmedZone;
+        ctx.zone = valLocResult.zone;
         ctx.atValueEdge = (ctx.zone == ValueZone::AT_VAH || ctx.zone == ValueZone::AT_VAL);
         ctx.insideValue = valLocResult.IsInsideValue();
         ctx.outsideValue = (ctx.zone == ValueZone::FAR_ABOVE_VALUE || ctx.zone == ValueZone::FAR_BELOW_VALUE);
@@ -978,6 +991,32 @@ struct Liq3Result {
     }
 
     // ========================================================================
+    // EXTREME LIQUIDITY DETECTION (Jan 2025)
+    // ========================================================================
+    // Percentile-based extreme detection for safety-critical gating.
+    // Either extreme stress OR extreme low depth triggers the flags.
+    //
+    // Use cases:
+    //   - EXTREME: Stress >= P95 OR Depth <= P5 (rare, reduce position)
+    //   - SHOCK: Stress >= P99 OR Depth <= P1 (crisis, consider blocking)
+    //
+    // Why OR not AND:
+    //   Either condition alone is dangerous for execution:
+    //   - Depth collapse with moderate stress = slippage risk
+    //   - Stress spike with moderate depth = consumption risk
+    // ========================================================================
+    bool isExtremeLiquidity = false;    // Stress >= P95 OR Depth <= P5
+    bool isLiquidityShock = false;      // Stress >= P99 OR Depth <= P1
+
+    // Diagnostic: which component triggered the extreme flag
+    bool extremeFromStress = false;     // Stress component triggered extreme
+    bool extremeFromDepth = false;      // Depth component triggered extreme
+
+    // Helpers
+    bool IsExtremeLiquidity() const { return liqValid && isExtremeLiquidity; }
+    bool IsLiquidityShock() const { return liqValid && isLiquidityShock; }
+
+    // ========================================================================
     // LOCATION CONTEXT (from ValueLocationEngine SSOT, Jan 2025)
     // ========================================================================
     // Provides auction location awareness for liquidity interpretation.
@@ -1590,6 +1629,30 @@ public:
             else {
                 snap.liqState = LiquidityState::LIQ_NORMAL;
             }
+        }
+
+        // --------------------------------------------------------------------
+        // Step 8b: Set Extreme Liquidity Flags (Jan 2025)
+        // --------------------------------------------------------------------
+        // Combined OR logic: Either extreme stress OR extreme thin depth is dangerous
+        // Stress is normal scale (higher = worse), Depth is inverted (lower = worse)
+        // Config thresholds are in percentile units (0-100), ranks are 0-1
+        // --------------------------------------------------------------------
+        if (snap.depthRankValid && snap.stressRankValid) {
+            const double stressThresholdNorm = config.extremeStressThreshold / 100.0;
+            const double depthThresholdNorm = config.extremeDepthThreshold / 100.0;
+            const double shockStressNorm = config.shockStressThreshold / 100.0;
+            const double shockDepthNorm = config.shockDepthThreshold / 100.0;
+
+            // Extreme: Stress >= P95 OR Depth <= P5
+            snap.extremeFromStress = (snap.stressRank >= stressThresholdNorm);
+            snap.extremeFromDepth = (snap.depthRank <= depthThresholdNorm);
+            snap.isExtremeLiquidity = snap.extremeFromStress || snap.extremeFromDepth;
+
+            // Shock: Stress >= P99 OR Depth <= P1
+            const bool shockStress = (snap.stressRank >= shockStressNorm);
+            const bool shockDepth = (snap.depthRank <= shockDepthNorm);
+            snap.isLiquidityShock = shockStress || shockDepth;
         }
 
         // --------------------------------------------------------------------

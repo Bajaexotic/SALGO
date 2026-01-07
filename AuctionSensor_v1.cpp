@@ -4034,7 +4034,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
         const AMT::StructureTracker& structure = st->amtZoneManager.structure;
         const AMT::LiquidityLocationContext liqLocCtx = AMT::LiquidityLocationContext::BuildFromValueLocation(
             st->lastValueLocationResult,                           // SSOT: ValueLocationEngine (prev bar)
-            st->lastDaltonState.phase,                            // SSOT: DaltonEngine market state
+            st->lastDaltonState.marketState,                            // SSOT: DaltonEngine market state
             st->lastVolResult.regime,                             // SSOT: VolatilityEngine (prev bar)
             structure.GetSessionHigh(), structure.GetSessionLow(), // SSOT: StructureTracker
             structure.GetIBHigh(), structure.GetIBLow(),          // SSOT: StructureTracker (frozen after IB)
@@ -4625,7 +4625,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                 ? st->lastVolResult.regime : AMT::VolatilityRegime::UNKNOWN;
 
             // Dalton context (optional)
-            const AMT::AMTMarketState daltonState = st->lastDaltonState.phase;
+            const AMT::AMTMarketState daltonState = st->lastDaltonState.marketState;
             const bool is1TF = (st->lastDaltonState.timeframe == AMT::TimeframePattern::ONE_TIME_FRAMING_UP ||
                                st->lastDaltonState.timeframe == AMT::TimeframePattern::ONE_TIME_FRAMING_DOWN);
 
@@ -4998,7 +4998,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                         curBarIdx,
                         AMT::AcceptanceStateToString(curState),
                         AMT::VolumeIntensityToShortString(st->lastVolumeResult.intensity),
-                        AMT::ValueMigrationStateToString(st->lastVolumeResult.migration),
+                        AMT::ValueMigrationToString(st->lastVolumeResult.migration),
                         st->lastVolumeResult.acceptanceScore,
                         st->lastVolumeResult.rejectionScore,
                         st->lastVolumeResult.confirmationMultiplier);
@@ -5049,7 +5049,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
 
             // Log-on-change for zone transitions (rate-limited)
             if (isLiveBar && st->lastValueLocationResult.IsReady()) {
-                const AMT::ValueZone curZone = st->lastValueLocationResult.confirmedZone;
+                const AMT::ValueZone curZone = st->lastValueLocationResult.zone;
                 const bool zoneChanged = (curZone != st->lastLoggedValueZone);
                 const bool eventOccurred = st->lastValueLocationResult.zoneChanged ||
                                           st->lastValueLocationResult.enteredValue ||
@@ -5074,12 +5074,8 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                         valRef.Format("[VAL-REF] %s",
                             st->lastValueLocationResult.FormatReferencesForLog().c_str());
                         sc.AddMessageToLog(valRef, 0);
-
-                        SCString valGate;
-                        valGate.Format("[VAL-GATE] %s | rec=%s",
-                            st->lastValueLocationResult.FormatGatingForLog().c_str(),
-                            st->lastValueLocationResult.gating.GetRecommendation());
-                        sc.AddMessageToLog(valGate, 0);
+                        // NOTE: StrategyGating removed from ValueLocationResult (Jan 2025)
+                        // Policy decisions belong in decision/arbitration layer, not location SSOT
                     }
 
                     st->lastLoggedValueZone = curZone;
@@ -5408,7 +5404,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
 
                     // Build auction context from ValueLocationEngine (SSOT) for context-aware pattern interpretation
                     // Context adjusts significance based on WHERE in the auction patterns occur
-                    const AMT::AMTMarketState marketState = st->lastDaltonState.phase;
+                    const AMT::AMTMarketState marketState = st->lastDaltonState.marketState;
 
                     // Get value migration from DaltonEngine
                     const bool valueMigratingHigher = (st->lastDaltonState.valueMigration == AMT::ValueMigration::HIGHER);
@@ -7201,9 +7197,9 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
 
                         // SSOT Invariants: Validate DaltonEngine output
 #if AMT_SSOT_ASSERTIONS
-                        AMT_SSOT_ASSERT(st->lastDaltonState.phase == AMT::AMTMarketState::BALANCE ||
-                                        st->lastDaltonState.phase == AMT::AMTMarketState::IMBALANCE ||
-                                        st->lastDaltonState.phase == AMT::AMTMarketState::UNKNOWN,
+                        AMT_SSOT_ASSERT(st->lastDaltonState.marketState == AMT::AMTMarketState::BALANCE ||
+                                        st->lastDaltonState.marketState == AMT::AMTMarketState::IMBALANCE ||
+                                        st->lastDaltonState.marketState == AMT::AMTMarketState::UNKNOWN,
                                         "DALTON phase is valid enum");
                         if (st->lastDaltonState.ibFrozen && st->lastDaltonState.ibHigh > 0.0) {
                             AMT_SSOT_ASSERT(st->lastDaltonState.ibHigh > st->lastDaltonState.ibLow,
@@ -7355,7 +7351,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                         st->lastDaltonState.bias = st->lastDaltonState.DeriveTradingBias();
 
                         // Extract the authoritative state, phase, reason, bias, volume from Dalton
-                        daltonState = st->lastDaltonState.phase;
+                        daltonState = st->lastDaltonState.marketState;
                         daltonPhase = st->lastDaltonState.DeriveCurrentPhase();
                         daltonReason = st->lastDaltonState.DerivePhaseReason();
                         daltonBias = st->lastDaltonState.bias;
@@ -7370,7 +7366,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                                 "IB: %.2f-%.2f ext=%s ratio=%.1f | rot=%d day=%s",
                                 currentBar,
                                 AMT::TimeframePatternToString(ds.timeframe),
-                                AMT::AMTMarketStateToString(ds.phase),
+                                AMT::AMTMarketStateToString(ds.marketState),
                                 AMT::AMTActivityTypeToString(ds.activity),
                                 ds.ibLow, ds.ibHigh,
                                 AMT::RangeExtensionTypeToString(ds.extension),
@@ -8232,16 +8228,15 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                 st->logManager.LogToSC(LogCategory::AMT, msg, false);
 
                 // AMT Signal Engine state line
-                // Shows: state + strength + location + activity + phase + excess + single prints
+                // Shows: state + location + activity + phase + excess + single prints
                 // Per AMT: phase is derived from signals, not separately detected
                 {
                     const AMT::StateEvidence& ev = st->lastStateEvidence;
                     const int spCount = static_cast<int>(st->singlePrintZones.size());
                     const AMT::CurrentPhase derivedPhase = ev.DerivePhase();
-                    msg.Format("AMT: %s str=%.2f | loc=%s act=%s | phase=%s | ex=%s | SP=%d",
+                    msg.Format("AMT: %s | loc=%s act=%s | phase=%s | ex=%s | SP=%d",
                         AMT::AMTMarketStateToString(ev.currentState),
-                        ev.stateStrength,
-                        AMT::ValueLocationToString(ev.location),
+                        AMT::ValueZoneToString(ev.location),
                         AMT::AMTActivityTypeToString(ev.activity.activityType),
                         AMT::CurrentPhaseToString(derivedPhase),
                         AMT::ExcessTypeToString(ev.excessDetected),
@@ -8389,7 +8384,7 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                         msg.Format("VOLACC: %s/%s migr=%s | pct=%.0f acc=%.2f rej=%.2f | mult=%.2f%s",
                             AMT::AcceptanceStateToShortString(vol.confirmedState),
                             AMT::VolumeIntensityToShortString(vol.intensity),
-                            AMT::ValueMigrationStateToString(vol.migration),
+                            AMT::ValueMigrationToString(vol.migration),
                             vol.volumePercentile,
                             vol.acceptanceScore,
                             vol.rejectionScore,
@@ -8817,11 +8812,11 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
                     }
                 }
 
-                // Market state (from AMTSignalEngine - leaky accumulator based)
+                // Market state (from DaltonEngine 1TF/2TF via AMTSignalEngine)
                 const AMT::StateEvidence& stateEv = st->lastStateEvidence;
                 const char* stateStr = AMT::AMTMarketStateToString(stateEv.currentState);
-                msg.Format("Market State: %s str=%.2f bars=%d",
-                    stateStr, stateEv.stateStrength, stateEv.barsInState);
+                msg.Format("Market State: %s bars=%d",
+                    stateStr, stateEv.barsInState);
                 st->logManager.LogToSC(LogCategory::AMT, msg, false);
 
                 // HVN/LVN metrics
@@ -9706,13 +9701,13 @@ SCSFExport scsf_AuctionSensor_v1(SCStudyInterfaceRef sc)
     // ========================================================================
     // RAW STATE FROM DALTON ENGINE (SSOT)
     // ========================================================================
-    // SSOT UNIFICATION (Dec 2024): DaltonEngine.phase is the SINGLE authoritative
+    // SSOT UNIFICATION (Dec 2024): DaltonEngine.marketState is the SINGLE authoritative
     // source for Balance/Imbalance. It incorporates:
     //   - 1TF/2TF pattern detection (rotation tracker)
     //   - Extreme delta persistence validation (bar + session)
     // The legacy rawState computation (isTrending || isExtremeDelta) is removed.
     // confirmedState uses 5-bar hysteresis via MarketStateBucket (unchanged).
-    const AMT::AMTMarketState rawState = st->lastDaltonState.phase;
+    const AMT::AMTMarketState rawState = st->lastDaltonState.marketState;
 
     // M0: Log-on-change arbitration decision (only in log window)
     // Enhanced with persistence-validated extreme delta decomposition

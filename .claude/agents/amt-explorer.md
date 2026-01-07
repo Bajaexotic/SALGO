@@ -26,7 +26,7 @@ E:\SierraChart\ACS_Source\
 |------|------------|------|
 | Session Phase | `phaseCoordinator` | AMT_Session.h |
 | POC/VAH/VAL | `SessionManager` | AMT_Session.h |
-| Market State | `DaltonEngine.phase` | AMT_Analytics.h |
+| Market State | `DaltonEngine.marketState` | AMT_Analytics.h |
 | Current Phase | `DaltonState.DeriveCurrentPhase()` | AMT_Analytics.h |
 | Liquidity | `LiquidityEngine` → `lastLiqSnap` | AMT_Liquidity.h |
 | Volatility | `VolatilityEngine` → `lastVolResult` | AMT_Volatility.h |

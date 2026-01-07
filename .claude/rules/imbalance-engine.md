@@ -92,6 +92,41 @@ if (result.IsHighQualitySignal()) {
 
 ---
 
+## Extreme Imbalance Detection (Jan 2025)
+
+| Level | Threshold | Meaning |
+|-------|-----------|---------|
+| `EXTREME` | >= P95 diagonal percentile | Exceptional pressure, high conviction |
+| `SHOCK` | >= P99 diagonal percentile | Capitulation or institutional sweep |
+
+**Data source:** `diagonalPercentile` (magnitude of diagonal delta vs baseline).
+
+```cpp
+// Check for extreme conditions
+if (result.IsShock()) {
+    // P99+ diagonal delta - capitulation or institutional sweep
+    // May indicate exhaustion or start of strong move
+}
+else if (result.IsExtreme()) {
+    // P95+ diagonal delta - exceptional pressure
+    // Increase conviction for continuation signals
+}
+
+// Access raw flags
+if (result.isExtremeImbalance || result.isShockImbalance) {
+    // Factor into downstream decisions
+}
+```
+
+### Configuration
+
+```cpp
+double extremeImbalanceThreshold = 95.0; // >= P95 = extreme
+double shockImbalanceThreshold = 99.0;   // >= P99 = shock
+```
+
+---
+
 ## NO-FALLBACK Contract
 
 - `result.IsReady()` must be true before using type/direction/conviction

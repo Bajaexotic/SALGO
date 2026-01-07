@@ -104,7 +104,7 @@ struct ArbitrationInput {
     // DALTON STATE (SSOT for Balance/Imbalance - Dec 2024)
     // ========================================================================
     // When provided, this overrides the legacy rawState computation.
-    // DaltonEngine.phase incorporates both 1TF/2TF AND extreme delta.
+    // DaltonEngine.marketState incorporates both 1TF/2TF AND extreme delta.
     AMT::AMTMarketState daltonState = AMT::AMTMarketState::UNKNOWN;
     bool daltonStateValid = false;       // True when DaltonEngine result is available
 };
@@ -221,10 +221,10 @@ inline ArbitrationResult EvaluateArbitrationLadder(const ArbitrationInput& in) {
     out.pocProx = in.pocValid ? static_cast<int>(in.pocProximity) : -1;
 
     // ========================================================================
-    // RAW STATE DERIVATION (SSOT: DaltonEngine.phase)
+    // RAW STATE DERIVATION (SSOT: DaltonEngine.marketState)
     // ========================================================================
     // SSOT UNIFICATION (Dec 2024): When daltonState is provided, use it directly.
-    // DaltonEngine.phase already incorporates both 1TF/2TF AND extreme delta.
+    // DaltonEngine.marketState already incorporates both 1TF/2TF AND extreme delta.
     // Legacy computation (isDirectional || isExtremeDelta) is only used when
     // daltonState is unavailable (backward compatibility for existing tests).
     if (in.daltonStateValid && in.daltonState != AMT::AMTMarketState::UNKNOWN) {

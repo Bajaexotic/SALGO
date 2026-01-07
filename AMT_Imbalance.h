@@ -460,6 +460,13 @@ struct ImbalanceResult {
     double deltaPercentile = 0.0;        // Delta intensity (for climax)
 
     // ========================================================================
+    // EXTREME IMBALANCE DETECTION (Jan 2025)
+    // ========================================================================
+    // diagonalPercentile >= P95 = extreme, >= P99 = shock
+    bool isExtremeImbalance = false;     // Diagonal delta magnitude >= P95
+    bool isShockImbalance = false;       // Diagonal delta magnitude >= P99 (capitulation/sweep)
+
+    // ========================================================================
     // POOR HIGH/LOW (Weak Auction Ends)
     // ========================================================================
     bool poorHighDetected = false;       // No excess, no strong bid absorption
@@ -594,6 +601,17 @@ struct ImbalanceResult {
     bool IsVoidAccelerated() const { return voidAcceleratesBullish || voidAcceleratesBearish; }
     bool IsSpatiallyFavorable() const { return convictionAdjustment > 0.0; }
     bool IsSpatiallyUnfavorable() const { return convictionAdjustment < -0.1; }
+
+    // Extreme imbalance helpers (Jan 2025)
+    // Is diagonal delta magnitude >= P95? Indicates exceptional pressure
+    bool IsExtreme() const {
+        return IsReady() && isExtremeImbalance;
+    }
+
+    // Is diagonal delta magnitude >= P99? Indicates capitulation or institutional sweep
+    bool IsShock() const {
+        return IsReady() && isShockImbalance;
+    }
 };
 
 // ============================================================================
@@ -642,6 +660,13 @@ struct ImbalanceConfig {
     double climaxVolumeThreshold = 90.0;  // Volume percentile (>= P90 = extreme)
     double climaxDeltaThreshold = 85.0;   // Delta percentile (>= P85 = extreme)
     double extremeProximityTicks = 4.0;   // Within N ticks of session extreme
+
+    // ========================================================================
+    // EXTREME IMBALANCE DETECTION (Jan 2025)
+    // ========================================================================
+    // Diagonal delta magnitude at P95+/P99+ indicates exceptional pressure
+    double extremeImbalanceThreshold = 95.0; // >= P95 = extreme diagonal imbalance
+    double shockImbalanceThreshold = 99.0;   // >= P99 = shock (capitulation/sweep)
 
     // ========================================================================
     // POOR HIGH/LOW DETECTION
@@ -1372,6 +1397,10 @@ private:
                     // SSOT Invariant: Percentiles must be in [0, 100]
                     AMT_SSOT_ASSERT_RANGE(pctile.value, 0.0, 100.0, "IMB diagonalPercentile");
                     result.diagonalPercentile = pctile.value;
+
+                    // Set extreme/shock flags based on diagonal percentile (Jan 2025)
+                    result.isExtremeImbalance = (pctile.value >= config.extremeImbalanceThreshold);
+                    result.isShockImbalance = (pctile.value >= config.shockImbalanceThreshold);
                 }
             }
 

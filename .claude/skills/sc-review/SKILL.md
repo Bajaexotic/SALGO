@@ -30,7 +30,7 @@ Reference `.claude/rules/` for authoritative documentation:
 - [ ] **Session Phase**: Use `st->SyncSessionPhase()` helper, not manual 3-line sync
 - [ ] **Zone Anchors**: VbP study is SSOT for POC/VAH/VAL, not calculated values
 - [ ] **Session Extremes**: `StructureTracker` owns high/low, use `zm.GetSessionHigh/Low()`
-- [ ] **Market State**: `DaltonEngine.phase` is SSOT, not accumulator-based state
+- [ ] **Market State**: `DaltonEngine.marketState` is SSOT, not accumulator-based state
 - [ ] **CurrentPhase**: `DaltonState.DeriveCurrentPhase()` is SSOT
 - [ ] **Liquidity**: `lastLiqSnap` is SSOT, not staging locations
 - [ ] **Zone Clearing**: Use `zm.ClearZonesOnly()` atomic helper

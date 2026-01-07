@@ -83,11 +83,10 @@ if (diagLevel >= 1) {
     // Log disagreements
     if (!stateMatch || !activityMatch) {
         SCString shadowMsg;
-        shadowMsg.Format("[SHADOW] Bar %d | OLD: state=%s aggr=%s | NEW: state=%s act=%s str=%.2f | MATCH: state=%d act=%d",
+        shadowMsg.Format("[SHADOW] Bar %d | OLD: state=%s aggr=%s | NEW: state=%s act=%s | MATCH: state=%d act=%d",
             currentBar,
             AMT::to_string(oldState), AMT::to_string(oldAggression),
             AMT::AMTMarketStateToString(newState), AMT::AMTActivityTypeToString(newActivity),
-            st->lastStateEvidence.stateStrength,
             stateMatch ? 1 : 0, activityMatch ? 1 : 0);
         st->logManager.LogInfo(currentBar, shadowMsg.GetChars(), LogCategory::AMT);
     }

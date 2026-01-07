@@ -1023,7 +1023,7 @@ inline bool ValidateVolumeDistribution(
  * @return Confidence multiplier [0.3, 1.0]
  *
  * RTH: IB = 60 min, full confidence at 180+ min
- * Globex: SOR = 30 min, full confidence at 300+ min (longer session)
+ * Globex: Opening range = 90 min (lower volume), full confidence at 300+ min
  */
 inline double GetTimeConfidenceMultiplier(int sessionMinutes, bool isRTH) {
     if (isRTH) {
@@ -1033,9 +1033,9 @@ inline double GetTimeConfidenceMultiplier(int sessionMinutes, bool isRTH) {
         if (sessionMinutes < 180) return 0.85; // Mid-session
         return 1.0;  // Late session - shape well established
     } else {
-        // Globex - longer development times
-        if (sessionMinutes < 45) return 0.3;   // SOR forming
-        if (sessionMinutes < 90) return 0.5;   // SOR complete
+        // Globex - longer development times due to lower volume
+        if (sessionMinutes < 90) return 0.3;   // Opening range forming
+        if (sessionMinutes < 120) return 0.5;  // Opening range just complete
         if (sessionMinutes < 180) return 0.7;  // Developing
         if (sessionMinutes < 300) return 0.85; // Established
         return 1.0;  // Mature overnight profile

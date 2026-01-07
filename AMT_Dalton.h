@@ -1055,9 +1055,9 @@ struct SpikeContext {
 
 struct DaltonState {
     // ========================================================================
-    // PRIMARY MARKET PHASE (derived from timeframe pattern)
+    // PRIMARY MARKET STATE (derived from timeframe pattern)
     // ========================================================================
-    AMTMarketState phase = AMTMarketState::UNKNOWN;  // BALANCE or IMBALANCE
+    AMTMarketState marketState = AMTMarketState::UNKNOWN;  // BALANCE or IMBALANCE
 
     // ========================================================================
     // TIMEFRAME PATTERN (detection mechanism)
@@ -1107,9 +1107,9 @@ struct DaltonState {
     bool directionalCoherence = false;   // Session delta sign matches bar delta direction
 
     // ========================================================================
-    // VALUE CONTEXT
+    // VALUE CONTEXT (SSOT: 9-state ValueZone)
     // ========================================================================
-    ValueLocation location = ValueLocation::INSIDE_VALUE;
+    ValueZone location = ValueZone::UNKNOWN;
     double distFromPOCTicks = 0.0;
 
     // ========================================================================
@@ -1216,7 +1216,7 @@ struct DaltonState {
     void DerivePhase() {
         // Check for extreme delta first (early detection)
         if (isExtremeDelta) {
-            phase = AMTMarketState::IMBALANCE;
+            marketState = AMTMarketState::IMBALANCE;
             return;
         }
 
@@ -1224,13 +1224,13 @@ struct DaltonState {
         switch (timeframe) {
             case TimeframePattern::ONE_TIME_FRAMING_UP:
             case TimeframePattern::ONE_TIME_FRAMING_DOWN:
-                phase = AMTMarketState::IMBALANCE;
+                marketState = AMTMarketState::IMBALANCE;
                 break;
             case TimeframePattern::TWO_TIME_FRAMING:
-                phase = AMTMarketState::BALANCE;
+                marketState = AMTMarketState::BALANCE;
                 break;
             default:
-                phase = AMTMarketState::UNKNOWN;
+                marketState = AMTMarketState::UNKNOWN;
                 break;
         }
     }
@@ -1306,9 +1306,9 @@ struct DaltonState {
         // =====================================================================
         // PRIORITY 3: BALANCE states (2TF - both sides active)
         // =====================================================================
-        if (phase == AMTMarketState::BALANCE) {
+        if (marketState == AMTMarketState::BALANCE) {
             // At boundary = probing the edge (testing for breakout/rejection)
-            if (location == ValueLocation::AT_VAH || location == ValueLocation::AT_VAL) {
+            if (IsAtBoundary(location)) {
                 return CurrentPhase::TESTING_BOUNDARY;
             }
             // Inside value = rotation (two-sided trade, mean reversion)
@@ -1318,11 +1318,11 @@ struct DaltonState {
         // =====================================================================
         // PRIORITY 4: IMBALANCE states (1TF - one side in control)
         // =====================================================================
-        if (phase == AMTMarketState::IMBALANCE) {
+        if (marketState == AMTMarketState::IMBALANCE) {
             // At boundary with responsive activity = rejection (failed breakout)
             // Per Dalton: Price at boundary during imbalance showing responsive
             // activity indicates the breakout attempt is being rejected
-            if ((location == ValueLocation::AT_VAH || location == ValueLocation::AT_VAL) &&
+            if (IsAtBoundary(location) &&
                 activity == AMTActivityType::RESPONSIVE) {
                 return CurrentPhase::FAILED_AUCTION;
             }
@@ -1474,9 +1474,8 @@ struct DaltonState {
         // PRIORITY 4: INTRADAY STATE (Balance/Imbalance + Volume)
         // =====================================================================
         // BALANCE = fade extremes (reversion)
-        if (phase == AMTMarketState::BALANCE) {
-            if (location == ValueLocation::AT_VAH ||
-                location == ValueLocation::AT_VAL) {
+        if (marketState == AMTMarketState::BALANCE) {
+            if (IsAtBoundary(location)) {
                 // At boundary - fade if volume weak, wait if strong
                 if (volumeConf == VolumeConfirmation::WEAK) {
                     return TradingBias::FADE;
@@ -1495,7 +1494,7 @@ struct DaltonState {
         }
 
         // IMBALANCE = follow if volume AND acceptance confirm
-        if (phase == AMTMarketState::IMBALANCE) {
+        if (marketState == AMTMarketState::IMBALANCE) {
             if (volumeConf == VolumeConfirmation::STRONG) {
                 // Strong volume - but is the move accepted?
                 if (acceptance >= DaltonAcceptance::INITIAL_ACCEPTANCE) {
@@ -1549,9 +1548,9 @@ struct DaltonState {
         if (atHVN) return PhaseReason::AT_HVN;
 
         // Priority 4: Value area location
-        if (location == ValueLocation::AT_POC) return PhaseReason::AT_POC;
-        if (location == ValueLocation::AT_VAH) return PhaseReason::AT_VAH;
-        if (location == ValueLocation::AT_VAL) return PhaseReason::AT_VAL;
+        if (IsAtPOC(location)) return PhaseReason::AT_POC;
+        if (location == ValueZone::AT_VAH) return PhaseReason::AT_VAH;
+        if (location == ValueZone::AT_VAL) return PhaseReason::AT_VAL;
 
         // Priority 5: Activity type
         if (activity == AMTActivityType::RESPONSIVE) return PhaseReason::RESPONSIVE;
@@ -1563,9 +1562,8 @@ struct DaltonState {
         if (timeframe == TimeframePattern::TWO_TIME_FRAMING) return PhaseReason::TWO_TF;
 
         // Priority 7: Inside/outside value
-        if (location == ValueLocation::INSIDE_VALUE) return PhaseReason::INSIDE_VALUE;
-        if (location == ValueLocation::ABOVE_VALUE ||
-            location == ValueLocation::BELOW_VALUE) return PhaseReason::OUTSIDE_VALUE;
+        if (IsInsideValue(location)) return PhaseReason::INSIDE_VALUE;
+        if (IsOutsideValue(location)) return PhaseReason::OUTSIDE_VALUE;
 
         return PhaseReason::NONE;
     }
@@ -1716,7 +1714,7 @@ public:
 #pragma warning(pop)
 #endif
         state.activity = activity.activityType;
-        state.location = activity.location;
+        state.location = activity.zone;
         state.distFromPOCTicks = activity.priceVsPOC;
 
         // 6. Classify Dalton day type (RTH only)
@@ -1823,7 +1821,7 @@ public:
         auto activity = activityClassifier_.ClassifyFromValueLocation(
             valLocResult, close, prevClose, deltaPct);
         state.activity = activity.activityType;
-        state.location = activity.location;
+        state.location = activity.zone;
         state.distFromPOCTicks = activity.priceVsPOC;
 
         // 6. Classify Dalton day type (RTH only)

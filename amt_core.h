@@ -607,16 +607,20 @@ inline const char* DaltonAcceptanceToString(DaltonAcceptance s) {
 }
 
 // ============================================================================
-// VALUE MIGRATION (Multi-Day VA Relationship)
+// VALUE MIGRATION (Multi-Day VA Relationship + Intraday POC/VA Dynamics)
 // ============================================================================
-// Tracks movement of Value Area relative to prior day.
+// Unified enum tracking both:
+// 1. Movement of Value Area relative to prior day (multi-day structure)
+// 2. POC/VA dynamics within a session (intraday migration)
 // Critical for distinguishing trend days from balance days.
 enum class ValueMigration : int {
     UNKNOWN = 0,
-    OVERLAPPING = 1,  // Balance/Consolidation - reversion strategies dominate
-    HIGHER = 2,       // Uptrend developing - buy pullbacks to prior VAH
-    LOWER = 3,        // Downtrend developing - sell rallies to prior VAL
-    INSIDE = 4        // Contraction - volatility expansion imminent
+    OVERLAPPING = 1,  // Balance/Consolidation - VAs overlap, reversion strategies dominate
+    HIGHER = 2,       // Value migrating higher - buy pullbacks to prior VAH
+    LOWER = 3,        // Value migrating lower - sell rallies to prior VAL
+    INSIDE = 4,       // Contraction - current VA inside prior, volatility expansion imminent
+    UNCHANGED = 5,    // POC/VA stable, no migration detected
+    ROTATING = 6      // VA expanding both directions (balance day developing)
 };
 
 inline const char* ValueMigrationToString(ValueMigration m) {
@@ -626,6 +630,8 @@ inline const char* ValueMigrationToString(ValueMigration m) {
         case ValueMigration::HIGHER:      return "HIGHER";
         case ValueMigration::LOWER:       return "LOWER";
         case ValueMigration::INSIDE:      return "INSIDE";
+        case ValueMigration::UNCHANGED:   return "UNCHANGED";
+        case ValueMigration::ROTATING:    return "ROTATING";
         default:                          return "?";
     }
 }
@@ -1079,6 +1085,116 @@ enum class ValueAreaRegion : int {
     OUTSIDE_BELOW = 5   // Price < VAL (excess low)
 };
 
+// ============================================================================
+// VALUE ZONE (Fine-Grained Location Classification) - SSOT
+// ============================================================================
+// ValueZone is the Single Source of Truth for price-relative-to-value location.
+// 9 states provide precise gating for strategy decisions.
+// ============================================================================
+
+enum class ValueZone : int {
+    UNKNOWN = 0,
+
+    // Outside Value (high side)
+    FAR_ABOVE_VALUE = 1,      // > VAH + extensionThreshold (extended breakout)
+    NEAR_ABOVE_VALUE = 2,     // VAH < price <= VAH + extensionThreshold (testing)
+
+    // At Boundaries
+    AT_VAH = 3,               // Within tolerance of VAH
+    AT_POC = 4,               // Within tolerance of POC
+    AT_VAL = 5,               // Within tolerance of VAL
+
+    // Inside Value
+    UPPER_VALUE = 6,          // VAH > price > POC (upper half of VA)
+    LOWER_VALUE = 7,          // POC > price > VAL (lower half of VA)
+
+    // Outside Value (low side)
+    NEAR_BELOW_VALUE = 8,     // VAL - extensionThreshold <= price < VAL (testing)
+    FAR_BELOW_VALUE = 9       // price < VAL - extensionThreshold (extended breakdown)
+};
+
+inline const char* ValueZoneToString(ValueZone zone) {
+    switch (zone) {
+        case ValueZone::UNKNOWN:          return "UNKNOWN";
+        case ValueZone::FAR_ABOVE_VALUE:  return "FAR_ABOVE";
+        case ValueZone::NEAR_ABOVE_VALUE: return "NEAR_ABOVE";
+        case ValueZone::AT_VAH:           return "AT_VAH";
+        case ValueZone::UPPER_VALUE:      return "UPPER_VALUE";
+        case ValueZone::AT_POC:           return "AT_POC";
+        case ValueZone::LOWER_VALUE:      return "LOWER_VALUE";
+        case ValueZone::AT_VAL:           return "AT_VAL";
+        case ValueZone::NEAR_BELOW_VALUE: return "NEAR_BELOW";
+        case ValueZone::FAR_BELOW_VALUE:  return "FAR_BELOW";
+        default:                          return "?";
+    }
+}
+
+// ============================================================================
+// ValueZone Helper Functions (Standalone - use when no ValueLocationResult)
+// ============================================================================
+
+/** True if zone is AT_VAH or AT_VAL */
+inline bool IsAtBoundary(ValueZone zone) {
+    return zone == ValueZone::AT_VAH || zone == ValueZone::AT_VAL;
+}
+
+/** True if zone is AT_POC */
+inline bool IsAtPOC(ValueZone zone) {
+    return zone == ValueZone::AT_POC;
+}
+
+/** True if inside value area (UPPER_VALUE, LOWER_VALUE, or AT_POC) */
+inline bool IsInsideValue(ValueZone zone) {
+    return zone == ValueZone::UPPER_VALUE ||
+           zone == ValueZone::LOWER_VALUE ||
+           zone == ValueZone::AT_POC;
+}
+
+/** True if above value area (FAR_ABOVE or NEAR_ABOVE) */
+inline bool IsAboveValue(ValueZone zone) {
+    return zone == ValueZone::FAR_ABOVE_VALUE ||
+           zone == ValueZone::NEAR_ABOVE_VALUE;
+}
+
+/** True if below value area (FAR_BELOW or NEAR_BELOW) */
+inline bool IsBelowValue(ValueZone zone) {
+    return zone == ValueZone::FAR_BELOW_VALUE ||
+           zone == ValueZone::NEAR_BELOW_VALUE;
+}
+
+/** True if outside value area (above or below) */
+inline bool IsOutsideValue(ValueZone zone) {
+    return IsAboveValue(zone) || IsBelowValue(zone);
+}
+
+/** Map ValueZone (9 states) to ValueAreaRegion (5 states) */
+inline ValueAreaRegion ValueZoneToValueAreaRegion(ValueZone zone) {
+    switch (zone) {
+        case ValueZone::FAR_ABOVE_VALUE:
+        case ValueZone::NEAR_ABOVE_VALUE:
+            return ValueAreaRegion::OUTSIDE_ABOVE;
+
+        case ValueZone::AT_VAH:
+        case ValueZone::UPPER_VALUE:
+            return ValueAreaRegion::UPPER_VA;
+
+        case ValueZone::AT_POC:
+        case ValueZone::UNKNOWN:  // Default to CORE (safe fallback)
+            return ValueAreaRegion::CORE_VA;
+
+        case ValueZone::AT_VAL:
+        case ValueZone::LOWER_VALUE:
+            return ValueAreaRegion::LOWER_VA;
+
+        case ValueZone::FAR_BELOW_VALUE:
+        case ValueZone::NEAR_BELOW_VALUE:
+            return ValueAreaRegion::OUTSIDE_BELOW;
+
+        default:
+            return ValueAreaRegion::CORE_VA;
+    }
+}
+
 /**
  * ZoneStrength: Strength tier based on touches and age
  */
@@ -1528,7 +1644,7 @@ inline const char* SessionPhaseToString(SessionPhase phase) {
  *   - 2TF = BALANCE (both sides active, rotation)
  *
  * Data flow:
- *   DaltonEngine.ProcessBar() → DaltonState.phase → StateEvidence.currentState
+ *   DaltonEngine.ProcessBar() → DaltonState.marketState → StateEvidence.currentState
  *
  * BALANCE:   Horizontal development, two-sided trade, 2TF, ~80% of time
  * IMBALANCE: Vertical development, one-sided conviction, 1TF, ~20% of time
@@ -1651,30 +1767,9 @@ inline AggressionType MapAMTActivityToLegacy(AMTActivityType activity) {
     }
 }
 
-/**
- * ValueLocation: Price position relative to value area (POC-centric)
- * Used for location-gated inference - location is PRIMARY gate, not weighted input.
- */
-enum class ValueLocation : int {
-    INSIDE_VALUE = 0,   // VAL <= price <= VAH (within value area)
-    ABOVE_VALUE = 1,    // price > VAH (excess high territory)
-    BELOW_VALUE = 2,    // price < VAL (excess low territory)
-    AT_VAH = 3,         // At upper boundary (testing)
-    AT_VAL = 4,         // At lower boundary (testing)
-    AT_POC = 5          // At value center (equilibrium)
-};
-
-inline const char* ValueLocationToString(ValueLocation loc) {
-    switch (loc) {
-        case ValueLocation::INSIDE_VALUE: return "INSIDE_VA";
-        case ValueLocation::ABOVE_VALUE:  return "ABOVE_VA";
-        case ValueLocation::BELOW_VALUE:  return "BELOW_VA";
-        case ValueLocation::AT_VAH:       return "AT_VAH";
-        case ValueLocation::AT_VAL:       return "AT_VAL";
-        case ValueLocation::AT_POC:       return "AT_POC";
-        default:                          return "INVALID";
-    }
-}
+// ValueLocation enum REMOVED (Dec 2024) - Use ValueZone (9-state) instead.
+// ValueZone provides FAR/NEAR granularity for directional context.
+// See helpers: IsInsideValue(), IsAboveValue(), IsBelowValue(), IsAtBoundary()
 
 /**
  * ExcessType: Type of auction failure/excess at extremes
@@ -1704,7 +1799,7 @@ inline const char* ExcessTypeToString(ExcessType type) {
 // ============================================================================
 // Per Auction Market Theory, phase is DERIVED from primary signals:
 //   - AMTMarketState: BALANCE = rotation, IMBALANCE = trending
-//   - ValueLocation: WHERE is price relative to value?
+//   - ValueZone: WHERE is price relative to value? (SSOT)
 //   - AMTActivityType: WHO is in control?
 //   - ExcessType: Is there rejection at extremes?
 //   - rangeExtended: Is price at session extreme?
@@ -1732,7 +1827,7 @@ inline const char* ExcessTypeToString(ExcessType type) {
  *   - In IMBALANCE + responsive: Rejection (failed breakout attempt)
  *
  * @param state         Current AMTMarketState (BALANCE/IMBALANCE)
- * @param location      Current ValueLocation
+ * @param zone          Current ValueZone (SSOT for value-relative location)
  * @param activity      Current AMTActivityType
  * @param excess        Current ExcessType
  * @param rangeExtended True if price is at session extreme
@@ -1740,7 +1835,7 @@ inline const char* ExcessTypeToString(ExcessType type) {
  */
 inline CurrentPhase DeriveCurrentPhase(
     AMTMarketState state,
-    ValueLocation location,
+    ValueZone zone,
     AMTActivityType activity,
     ExcessType excess,
     bool rangeExtended
@@ -1757,7 +1852,7 @@ inline CurrentPhase DeriveCurrentPhase(
     // =========================================================================
     if (state == AMTMarketState::BALANCE) {
         // At boundary = probing the edge (testing for breakout/rejection)
-        if (location == ValueLocation::AT_VAH || location == ValueLocation::AT_VAL) {
+        if (IsAtBoundary(zone)) {
             return CurrentPhase::TESTING_BOUNDARY;
         }
         // Inside value = rotation (two-sided trade, mean reversion)
@@ -1771,8 +1866,7 @@ inline CurrentPhase DeriveCurrentPhase(
         // At boundary with responsive activity = rejection (failed breakout)
         // Per Dalton: Price at boundary during imbalance showing responsive
         // activity indicates the breakout attempt is being rejected
-        if ((location == ValueLocation::AT_VAH || location == ValueLocation::AT_VAL) &&
-            activity == AMTActivityType::RESPONSIVE) {
+        if (IsAtBoundary(zone) && activity == AMTActivityType::RESPONSIVE) {
             return CurrentPhase::FAILED_AUCTION;
         }
 
@@ -1805,7 +1899,7 @@ inline CurrentPhase DeriveCurrentPhase(
  *
  * PRIMARY AMT SIGNALS (these are the outputs that matter):
  *   - activityType: INITIATIVE / RESPONSIVE / NEUTRAL
- *   - location: WHERE is price relative to value area?
+ *   - zone: WHERE is price relative to value area? (SSOT: ValueZone)
  *
  * INTERNAL (used in computation, not primary signals):
  *   - intent_: Direction relative to POC (input to activityType)
@@ -1821,7 +1915,7 @@ struct ActivityClassification {
     // PRIMARY AMT SIGNALS
     // ========================================================================
     AMTActivityType activityType = AMTActivityType::NEUTRAL;
-    ValueLocation location = ValueLocation::INSIDE_VALUE;
+    ValueZone zone = ValueZone::AT_POC;  // SSOT for value-relative location
 
     // Derived metrics (observable)
     double priceVsPOC = 0.0;         // Price distance from POC (signed, ticks)
@@ -1862,12 +1956,10 @@ struct ActivityClassification {
         }
     }
 
-    // Check if activity is consistent with location
+    // Check if activity is consistent with location (uses ValueZone helpers)
     bool IsLocationConsistent() const {
-        const bool outsideValue = (location == ValueLocation::ABOVE_VALUE ||
-                                   location == ValueLocation::BELOW_VALUE);
-        const bool atBoundary = (location == ValueLocation::AT_VAH ||
-                                 location == ValueLocation::AT_VAL);
+        const bool outsideValue = AMT::IsOutsideValue(zone);
+        const bool atBoundary = AMT::IsAtBoundary(zone);
 
         // Initiative is expected outside value or at boundary
         if (activityType == AMTActivityType::INITIATIVE) {
@@ -1877,14 +1969,13 @@ struct ActivityClassification {
         if (activityType == AMTActivityType::RESPONSIVE) {
             return !outsideValue || intent_ == ValueIntent::TOWARD_VALUE;
         }
-        // Neutral is expected at POC
-        return location == ValueLocation::AT_POC || location == ValueLocation::INSIDE_VALUE;
+        // Neutral is expected at POC or inside value
+        return AMT::IsAtPOC(zone) || AMT::IsInsideValue(zone);
     }
 
     // Helper to check if price is outside value area
     bool IsOutsideValue() const {
-        return location == ValueLocation::ABOVE_VALUE ||
-               location == ValueLocation::BELOW_VALUE;
+        return AMT::IsOutsideValue(zone);
     }
 };
 
@@ -1967,9 +2058,8 @@ struct RejectionSignals {
  * Supports location-gated inference and diagnostic logging
  */
 struct StateEvidence {
-    // Current state and strength (SSOT: DaltonEngine via 1TF/2TF)
+    // Current state (SSOT: DaltonEngine via 1TF/2TF)
     AMTMarketState currentState = AMTMarketState::UNKNOWN;
-    double stateStrength = 0.0;      // Confirmation metric (0-1), not state determinant
     int barsInState = 0;             // Consecutive bars in current state
 
     // Derived phase (SSOT: DaltonState.DeriveCurrentPhase())
@@ -1979,8 +2069,8 @@ struct StateEvidence {
     // Activity classification this bar (determines WHO is in control)
     ActivityClassification activity;
 
-    // Location context
-    ValueLocation location = ValueLocation::INSIDE_VALUE;
+    // Location context (SSOT: 9-state ValueZone)
+    ValueZone location = ValueZone::UNKNOWN;
     double distFromPOCTicks = 0.0;   // Signed distance from POC
     double distFromVAHTicks = 0.0;   // Distance from VAH (positive = above)
     double distFromVALTicks = 0.0;   // Distance from VAL (positive = above)
@@ -2005,7 +2095,6 @@ struct StateEvidence {
 
     // Transition info (for logging on state change)
     AMTMarketState previousState = AMTMarketState::UNKNOWN;
-    double strengthAtTransition = 0.0;
     int barAtTransition = 0;
 
     // Check if this is a state transition
@@ -2031,7 +2120,7 @@ struct StateEvidence {
         // Fallback: Local derivation (warmup/legacy mode)
         return DeriveCurrentPhase(
             currentState,
-            activity.location,
+            activity.zone,  // ValueZone from ActivityClassification (SSOT)
             activity.activityType,
             excessDetected,
             rangeExtended
@@ -2040,11 +2129,10 @@ struct StateEvidence {
 
     void Reset() {
         currentState = AMTMarketState::UNKNOWN;
-        stateStrength = 0.0;
         barsInState = 0;
         derivedPhase = CurrentPhase::UNKNOWN;
         activity = ActivityClassification();
-        location = ValueLocation::INSIDE_VALUE;
+        location = ValueZone::UNKNOWN;
         distFromPOCTicks = 0.0;
         distFromVAHTicks = 0.0;
         distFromVALTicks = 0.0;
@@ -2061,7 +2149,6 @@ struct StateEvidence {
         rangeExtended = false;
         ibBroken = false;
         previousState = AMTMarketState::UNKNOWN;
-        strengthAtTransition = 0.0;
         barAtTransition = 0;
     }
 };

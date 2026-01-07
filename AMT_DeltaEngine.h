@@ -454,7 +454,7 @@ struct DeltaLocationContext {
         }
 
         // Copy zone directly from SSOT (full 9-state, no mapping)
-        ctx.zone = valLocResult.confirmedZone;
+        ctx.zone = valLocResult.zone;
 
         // Copy distances from SSOT
         ctx.distanceFromPOCTicks = valLocResult.distFromPOCTicks;
@@ -473,9 +473,9 @@ struct DeltaLocationContext {
 
         // Structure context from SSOT (ValueLocationResult has session/IB tick distances)
         ctx.isAboveSessionHigh = valLocResult.distToSessionHighTicks > 0 &&
-                                 valLocResult.confirmedZone == ValueZone::FAR_ABOVE_VALUE;
+                                 valLocResult.zone == ValueZone::FAR_ABOVE_VALUE;
         ctx.isBelowSessionLow = valLocResult.distToSessionLowTicks < 0 &&
-                                valLocResult.confirmedZone == ValueZone::FAR_BELOW_VALUE;
+                                valLocResult.zone == ValueZone::FAR_BELOW_VALUE;
 
         // IB extreme detection from SSOT tick distances
         ctx.isAtIBExtreme = (std::abs(valLocResult.distToIBHighTicks) <= edgeToleranceTicks) ||
@@ -723,7 +723,8 @@ struct DeltaResult {
     // Individual checks
     bool isThinTape = false;            // Volume below threshold
     bool isHighChop = false;            // Frequent reversals
-    bool isExhaustion = false;          // Extreme one-sidedness
+    bool isExhaustion = false;          // Extreme one-sidedness (P95+)
+    bool isShockDelta = false;          // Shock level delta (P99+) - capitulation/sweep
     bool isGlobexSession = false;       // Lower liquidity session
 
     // =========================================================================
@@ -979,6 +980,11 @@ struct DeltaResult {
     bool IsExtremeResponsive() const {
         return isExtremeDelta && !directionalCoherence;
     }
+
+    // Is this a shock-level delta (P99+)? Indicates capitulation or institutional sweep
+    bool IsShock() const {
+        return IsReady() && isShockDelta;
+    }
 };
 
 // ============================================================================
@@ -1015,6 +1021,7 @@ struct DeltaConfig {
     // =========================================================================
     double thinTapeVolumePctile = 10.0;       // Below P10 = thin tape
     double exhaustionDeltaPctile = 95.0;      // Above P95 = exhaustion risk
+    double shockDeltaPctile = 99.0;           // Above P99 = shock (capitulation/sweep)
     int highChopReversalsThreshold = 4;       // 4+ reversals in lookback = chop
 
     // =========================================================================
@@ -1612,6 +1619,7 @@ public:
         result.isThinTape = result.volumePctile < config.thinTapeVolumePctile;
         result.isHighChop = history_.IsHighChop(config.highChopReversalsThreshold);
         result.isExhaustion = result.barDeltaPctile > config.exhaustionDeltaPctile;
+        result.isShockDelta = result.barDeltaPctile > config.shockDeltaPctile;
         result.isGlobexSession = (currentPhase_ == SessionPhase::GLOBEX);
 
         // Warning flags bitmask
@@ -1619,6 +1627,7 @@ public:
         if (result.isHighChop) result.warningFlags |= (1 << 1);
         if (result.isExhaustion) result.warningFlags |= (1 << 2);
         if (result.isGlobexSession) result.warningFlags |= (1 << 3);
+        if (result.isShockDelta) result.warningFlags |= (1 << 4);
 
         // =====================================================================
         // TRADING CONSTRAINTS

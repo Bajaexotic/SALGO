@@ -9,15 +9,29 @@
 // Minimal type stubs
 enum class AMTMarketState { UNKNOWN = 0, BALANCE, IMBALANCE };
 enum class AMTActivityType { NEUTRAL = 0, INITIATIVE, RESPONSIVE };
-enum class ValueLocation { INSIDE_VALUE = 0, AT_POC, AT_VAH, AT_VAL, ABOVE_VALUE, BELOW_VALUE };
+// Use 9-state ValueZone (matches production code)
+enum class ValueZone {
+    UNKNOWN = -1,
+    FAR_BELOW_VALUE = 0, NEAR_BELOW_VALUE, AT_VAL, LOWER_VALUE,
+    AT_POC, UPPER_VALUE, AT_VAH, NEAR_ABOVE_VALUE, FAR_ABOVE_VALUE
+};
 enum class RangeExtensionType { NONE = 0, BUYING, SELLING, BOTH };
 enum class CurrentPhase {
     UNKNOWN = 0, ROTATION = 1, TESTING_BOUNDARY = 2, DRIVING_UP = 3,
     DRIVING_DOWN = 4, RANGE_EXTENSION = 5, PULLBACK = 6, FAILED_AUCTION = 7
 };
 
-// Location classification (from AMT_Signals.h)
-ValueLocation DetermineLocation(
+// Helper functions for 9-state ValueZone
+bool IsAtBoundary(ValueZone z) {
+    return z == ValueZone::AT_VAH || z == ValueZone::AT_VAL;
+}
+bool IsOutsideValue(ValueZone z) {
+    return z == ValueZone::FAR_ABOVE_VALUE || z == ValueZone::NEAR_ABOVE_VALUE ||
+           z == ValueZone::FAR_BELOW_VALUE || z == ValueZone::NEAR_BELOW_VALUE;
+}
+
+// Location classification using 9-state ValueZone
+ValueZone DetermineZone(
     double price, double poc, double vah, double val,
     double tickSize, int pocToleranceTicks, int vaBoundaryTicks
 ) {
@@ -25,27 +39,28 @@ ValueLocation DetermineLocation(
     const double distFromVAH = (price - vah) / tickSize;
     const double distFromVAL = (price - val) / tickSize;
 
-    if (distFromPOC <= pocToleranceTicks) return ValueLocation::AT_POC;
-    if (std::abs(distFromVAH) <= vaBoundaryTicks) return ValueLocation::AT_VAH;
-    if (std::abs(distFromVAL) <= vaBoundaryTicks) return ValueLocation::AT_VAL;
-    if (price > vah) return ValueLocation::ABOVE_VALUE;
-    if (price < val) return ValueLocation::BELOW_VALUE;
-    return ValueLocation::INSIDE_VALUE;
+    if (distFromPOC <= pocToleranceTicks) return ValueZone::AT_POC;
+    if (std::abs(distFromVAH) <= vaBoundaryTicks) return ValueZone::AT_VAH;
+    if (std::abs(distFromVAL) <= vaBoundaryTicks) return ValueZone::AT_VAL;
+    if (price > vah) return ValueZone::NEAR_ABOVE_VALUE;  // Use NEAR_ for deprecated method
+    if (price < val) return ValueZone::NEAR_BELOW_VALUE;
+    // Inside value - determine upper vs lower
+    if (price >= poc) return ValueZone::UPPER_VALUE;
+    return ValueZone::LOWER_VALUE;
 }
 
 // Phase derivation (simplified)
 CurrentPhase DerivePhase(
-    AMTMarketState state, ValueLocation location,
+    AMTMarketState state, ValueZone zone,
     AMTActivityType activity, RangeExtensionType extension
 ) {
     if (state == AMTMarketState::BALANCE) {
-        if (location == ValueLocation::AT_VAH || location == ValueLocation::AT_VAL)
+        if (IsAtBoundary(zone))
             return CurrentPhase::TESTING_BOUNDARY;
         return CurrentPhase::ROTATION;
     }
     if (state == AMTMarketState::IMBALANCE) {
-        if ((location == ValueLocation::AT_VAH || location == ValueLocation::AT_VAL) &&
-            activity == AMTActivityType::RESPONSIVE)
+        if (IsAtBoundary(zone) && activity == AMTActivityType::RESPONSIVE)
             return CurrentPhase::FAILED_AUCTION;
         if (extension != RangeExtensionType::NONE &&
             activity == AMTActivityType::INITIATIVE)
@@ -57,16 +72,19 @@ CurrentPhase DerivePhase(
     return CurrentPhase::UNKNOWN;
 }
 
-const char* LocationToString(ValueLocation l) {
-    switch (l) {
-        case ValueLocation::INSIDE_VALUE: return "INSIDE";
-        case ValueLocation::AT_POC: return "AT_POC";
-        case ValueLocation::AT_VAH: return "AT_VAH";
-        case ValueLocation::AT_VAL: return "AT_VAL";
-        case ValueLocation::ABOVE_VALUE: return "ABOVE";
-        case ValueLocation::BELOW_VALUE: return "BELOW";
+const char* ZoneToString(ValueZone z) {
+    switch (z) {
+        case ValueZone::UPPER_VALUE:
+        case ValueZone::LOWER_VALUE: return "INSIDE";
+        case ValueZone::AT_POC: return "AT_POC";
+        case ValueZone::AT_VAH: return "AT_VAH";
+        case ValueZone::AT_VAL: return "AT_VAL";
+        case ValueZone::NEAR_ABOVE_VALUE:
+        case ValueZone::FAR_ABOVE_VALUE: return "ABOVE";
+        case ValueZone::NEAR_BELOW_VALUE:
+        case ValueZone::FAR_BELOW_VALUE: return "BELOW";
+        default: return "?";
     }
-    return "?";
 }
 
 const char* PhaseToString(CurrentPhase p) {
@@ -114,13 +132,13 @@ int main() {
         int insideValue = 0;
 
         printf("\nPrice walk from VAH-4 to VAH+8 ticks:\n");
-        printf("Price     | Location    | State=BAL Phase | State=IMB+EXT Phase\n");
+        printf("Price     | Zone        | State=BAL Phase | State=IMB+EXT Phase\n");
         printf("----------|-------------|-----------------|--------------------\n");
 
         for (int offset = -4; offset <= 8; offset++) {
             double price = vah + (offset * tickSize);
-            ValueLocation loc = DetermineLocation(price, poc, vah, val, tickSize,
-                                                   pocTolerance, vaBoundaryTicks);
+            ValueZone zone = DetermineZone(price, poc, vah, val, tickSize,
+                                           pocTolerance, vaBoundaryTicks);
 
             // Determine if IB is broken at this price
             RangeExtensionType ext = (price > ibHigh) ?
@@ -128,23 +146,23 @@ int main() {
 
             // Phase in BALANCE state
             CurrentPhase phaseBalance = DerivePhase(
-                AMTMarketState::BALANCE, loc,
+                AMTMarketState::BALANCE, zone,
                 AMTActivityType::INITIATIVE, ext);
 
             // Phase in IMBALANCE state with extension
             CurrentPhase phaseImbalance = DerivePhase(
-                AMTMarketState::IMBALANCE, loc,
+                AMTMarketState::IMBALANCE, zone,
                 AMTActivityType::INITIATIVE, ext);
 
             printf("%.2f   | %-11s | %-15s | %-18s %s\n",
-                   price, LocationToString(loc),
+                   price, ZoneToString(zone),
                    PhaseToString(phaseBalance),
                    PhaseToString(phaseImbalance),
                    (phaseImbalance == CurrentPhase::RANGE_EXTENSION) ? "<-- EXT!" : "");
 
-            if (loc == ValueLocation::AT_VAH || loc == ValueLocation::AT_VAL)
+            if (IsAtBoundary(zone))
                 atBoundary++;
-            else if (loc == ValueLocation::ABOVE_VALUE || loc == ValueLocation::BELOW_VALUE)
+            else if (IsOutsideValue(zone))
                 aboveValue++;
             else
                 insideValue++;
@@ -184,7 +202,7 @@ int main() {
     printf("   - state=IMBALANCE (1TF pattern)\n");
     printf("   - extension!=NONE (IB broken)\n");
     printf("   - activity=INITIATIVE (delta aligned)\n");
-    printf("   - location=ABOVE_VALUE (outside the boundary tolerance)\n\n");
+    printf("   - zone=OUTSIDE_VALUE (outside the boundary tolerance)\n\n");
 
     printf("3. The 55.6%% TESTING_BOUNDARY in your log suggests:\n");
     printf("   - Narrow Value Area, OR\n");

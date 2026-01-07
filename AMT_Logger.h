@@ -659,7 +659,6 @@ public:
     void LogAMTState(
         int bar,
         const char* state,
-        double strength,
         const char* location,
         const char* intent,
         const char* participation,
@@ -694,10 +693,9 @@ public:
         SCString msg;
         if (isTransition && prevState) {
             // Full transition snapshot
-            msg.Format("Bar %d | %s->%s str=%.2f | loc=%s int=%s part=%s act=%s | POC=%.2f VAH=%.2f VAL=%.2f | ex=%s | flags=[%s]",
+            msg.Format("Bar %d | %s->%s | loc=%s int=%s part=%s act=%s | POC=%.2f VAH=%.2f VAL=%.2f | ex=%s | flags=[%s]",
                 bar,
                 prevState, state,
-                strength,
                 location, intent, participation, activityType,
                 pocPrice, vahPrice, valPrice,
                 excessType,
@@ -705,10 +703,9 @@ public:
         }
         else {
             // Periodic snapshot
-            msg.Format("Bar %d | %s str=%.2f | loc=%s int=%s act=%s | POC=%.2f | ex=%s | [%s]",
+            msg.Format("Bar %d | %s | loc=%s int=%s act=%s | POC=%.2f | ex=%s | [%s]",
                 bar,
                 state,
-                strength,
                 location, intent, activityType,
                 pocPrice,
                 excessType,
@@ -726,8 +723,6 @@ public:
         int bar,
         const char* fromState,
         const char* toState,
-        double strength,
-        double strengthAtTransition,
         const char* location,
         const char* intent,
         const char* participation,
@@ -755,13 +750,12 @@ public:
             ibBroken ? "IB_BRK" : "");
 
         SCString msg;
-        msg.Format("[AMT-TRANSITION] Bar %d | %s->%s | str=%.2f (was %.2f) | barsInPrev=%d\n"
+        msg.Format("[AMT-TRANSITION] Bar %d | %s->%s | barsInPrev=%d\n"
                    "    loc=%s int=%s part=%s act=%s\n"
                    "    price=%.2f delta=%.1f%% | POC=%.2f VAH=%.2f VAL=%.2f\n"
                    "    excess=%s | flags=[%s]",
             bar,
-            fromState, toState,
-            strength, strengthAtTransition, barsInPrevState,
+            fromState, toState, barsInPrevState,
             location, intent, participation, activityType,
             price, deltaPct * 100.0,
             pocPrice, vahPrice, valPrice,
@@ -786,9 +780,7 @@ public:
                 bar,
                 AMTMarketStateToString(evidence.previousState),
                 AMTMarketStateToString(evidence.currentState),
-                evidence.stateStrength,
-                evidence.strengthAtTransition,
-                ValueLocationToString(evidence.location),
+                ValueZoneToString(evidence.location),
                 ValueIntentToString(evidence.activity.intent_),
                 ParticipationModeToString(evidence.activity.participation_),
                 AMTActivityTypeToString(evidence.activity.activityType),
@@ -810,8 +802,7 @@ public:
             LogAMTState(
                 bar,
                 AMTMarketStateToString(evidence.currentState),
-                evidence.stateStrength,
-                ValueLocationToString(evidence.location),
+                ValueZoneToString(evidence.location),
                 ValueIntentToString(evidence.activity.intent_),
                 ParticipationModeToString(evidence.activity.participation_),
                 AMTActivityTypeToString(evidence.activity.activityType),

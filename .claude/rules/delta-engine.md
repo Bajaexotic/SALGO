@@ -70,7 +70,31 @@ It measures WHO is more aggressive in fulfilling their order, not WHO is right.
 | `isThinTape` | Volume < P10 | Degraded/Low |
 | `isHighChop` | 4+ reversals in lookback | Degraded |
 | `isExhaustion` | Delta > P95 | Low (exhaustion risk) |
+| `isShockDelta` | Delta > P99 | Critical (capitulation/sweep) |
 | `isGlobexSession` | GLOBEX hours | Degraded (lower liquidity) |
+
+### Shock Delta Detection (Jan 2025)
+
+P99+ delta magnitude indicates extreme one-sided aggression - typically capitulation or institutional sweep:
+
+```cpp
+// Result flag
+bool isShockDelta = false;          // Delta > P99 (shock level)
+
+// Helper method (requires IsReady())
+bool IsShock() const { return IsReady() && isShockDelta; }
+
+// Usage
+if (result.IsShock()) {
+    // P99+ delta - capitulation or institutional sweep in progress
+    // Consider: hard block new entries, tighten existing stops
+}
+```
+
+**Trading Implications:**
+- Capitulation often marks exhaustion points (potential reversal)
+- Institutional sweep may indicate informed large order
+- Combine with location context: shock at value edge vs shock in discovery
 
 ---
 
@@ -223,6 +247,7 @@ struct DeltaConfig {
     // Confidence thresholds
     double thinTapeVolumePctile = 10.0;       // Below P10 = thin tape
     double exhaustionDeltaPctile = 95.0;      // Above P95 = exhaustion
+    double shockDeltaPctile = 99.0;           // Above P99 = shock (capitulation/sweep)
     int highChopReversalsThreshold = 4;       // 4+ reversals = chop
 
     // Hysteresis
@@ -496,7 +521,7 @@ const double stressRank = st->lastLiqSnap.stressRankValid
     ? (st->lastLiqSnap.stressRank / 100.0) : 0.0;
 const AMT::VolatilityRegime volRegime = st->lastVolResult.IsReady()
     ? st->lastVolResult.regime : AMT::VolatilityRegime::UNKNOWN;
-const AMT::AMTMarketState daltonState = st->lastDaltonState.phase;
+const AMT::AMTMarketState daltonState = st->lastDaltonState.marketState;
 const bool is1TF = (daltonState == AMT::AMTMarketState::IMBALANCE);
 
 // Build location context

@@ -9,7 +9,7 @@
 **PURPOSE:** Volume answers "was this move accepted by the market?"
 
 1. **Did volume support the move or reject it?** -> `AcceptanceState` enum
-2. **Is value forming higher/lower or unchanged?** -> `ValueMigrationState` enum
+2. **Is value forming higher/lower or unchanged?** -> `ValueMigration` enum
 3. **What is 'high' volume today?** -> `VolumeIntensity` (baseline-relative)
 4. **What confirmation does it provide to triggers?** -> `ConfirmationMultiplier`
 
@@ -25,7 +25,7 @@
 
 ---
 
-## 5 Volume Intensity Levels
+## 7 Volume Intensity Levels
 
 | Level | Percentile | Meaning |
 |-------|------------|---------|
@@ -33,18 +33,35 @@
 | `LOW` | P10-P25 | Below normal, low conviction |
 | `NORMAL` | P25-P75 | Typical activity |
 | `HIGH` | P75-P90 | Elevated, institutional interest |
-| `VERY_HIGH` | > P90 | Extreme, major player activity |
+| `VERY_HIGH` | P90-P95 | Significantly elevated |
+| `EXTREME` | P95-P99 | Rare event, likely institutional (sets `isExtremeVolume` flag) |
+| `SHOCK` | >= P99 | Exceptional, potential news/event (sets `isShockVolume` flag) |
+
+### Extreme Detection Flags
+
+```cpp
+// Result flags for downstream consumers
+bool isExtremeVolume = false;    // >= P95
+bool isShockVolume = false;      // >= P99
+
+// Helper methods
+bool IsExtreme() const;          // IsReady() && isExtremeVolume
+bool IsShock() const;            // IsReady() && isShockVolume
+```
 
 ---
 
-## 4 Value Migration States
+## 7 Value Migration States (ValueMigration enum - amt_core.h)
 
 | State | Detection | Meaning |
 |-------|-----------|---------|
-| `MIGRATING_HIGHER` | POC rate > 0.3 ticks/bar OR VAH expanding | Value accepting higher prices |
-| `MIGRATING_LOWER` | POC rate < -0.3 ticks/bar OR VAL expanding | Value accepting lower prices |
+| `HIGHER` | POC rate > 0.3 ticks/bar OR VAH expanding | Value accepting higher prices |
+| `LOWER` | POC rate < -0.3 ticks/bar OR VAL expanding | Value accepting lower prices |
 | `ROTATING` | VA expanding both directions | Balance day, auction bracketing |
 | `UNCHANGED` | POC stable, VA stable | No meaningful value shift |
+| `OVERLAPPING` | VAs overlap (today vs prior) | Balance/Consolidation, reversion strategies |
+| `INSIDE` | Current VA inside prior | Contraction, volatility expansion imminent |
+| `UNKNOWN` | Insufficient data | Warmup or invalid inputs |
 
 ---
 
@@ -225,7 +242,9 @@ struct VolumeAcceptanceConfig {
     double veryLowThreshold = 10.0;     // < P10
     double lowThreshold = 25.0;         // P10-P25
     double highThreshold = 75.0;        // P75-P90
-    double veryHighThreshold = 90.0;    // > P90
+    double veryHighThreshold = 90.0;    // P90-P95
+    double extremeThreshold = 95.0;     // P95-P99 (sets isExtremeVolume)
+    double shockThreshold = 99.0;       // >= P99 (sets isShockVolume)
 
     // Acceptance thresholds
     double acceptanceScoreThreshold = 0.6;

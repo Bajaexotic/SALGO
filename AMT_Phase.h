@@ -1516,7 +1516,7 @@ inline PhaseSnapshot BuildPhaseSnapshot(
 //                      tracker, daltonState, daltonPhase)
 //
 // Where:
-//   daltonState = st->lastDaltonState.phase
+//   daltonState = st->lastDaltonState.marketState
 //   daltonPhase = st->lastDaltonState.DeriveCurrentPhase()
 // ============================================================================
 

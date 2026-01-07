@@ -38,7 +38,6 @@ AMT::ValueLocationResult createMockValueLocationResult(
     double distPOC = 0.0, double distVAH = 0.0, double distVAL = 0.0)
 {
     AMT::ValueLocationResult result;
-    result.confirmedZone = zone;
     result.zone = zone;  // SSOT for location classification
     result.distFromPOCTicks = distPOC;
     result.distFromVAHTicks = distVAH;

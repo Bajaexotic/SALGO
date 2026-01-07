@@ -1563,6 +1563,130 @@ void TestAuctionLevelContextPopulation() {
 }
 
 // ============================================================================
+// TEST: Extreme Imbalance Detection (Jan 2025)
+// ============================================================================
+
+void TestExtremeImbalanceDetection() {
+    TEST_SECTION("Extreme Imbalance Detection (P95+/P99+)");
+
+    // Create engine with controlled baseline for predictable percentiles
+    // Baseline values: 100-550 (from CreatePopulatedEngine pattern)
+    ImbalanceEngine engine;
+    engine.SetPhase(SessionPhase::MID_SESSION);  // MUST set phase BEFORE PreWarm
+
+    // Pre-warm baseline with consistent values for predictable percentile ranking
+    // Range: 100 to 590 (50 values)
+    for (int i = 0; i < 50; ++i) {
+        engine.PreWarmFromBar(100.0 + i * 10.0, 0.0, 0.0);  // 100 to 590
+    }
+
+    // Test 1: Moderate diagonal delta (should NOT be extreme)
+    {
+        auto result = engine.Compute(
+            6101.00, 6099.00, 6100.50, 6099.50,
+            6100.00, 6098.00, 6099.50,
+            TICK_SIZE, 60,
+            POC, VAH, VAL,
+            0.0, 0.0, 0.0,
+            200.0, 100.0,                        // Net = 100 (low end of baseline)
+            5000.0, 100.0, 1000.0
+        );
+
+        // Moderate value should not trigger extreme
+        TEST_ASSERT(!result.isExtremeImbalance, "Moderate diagonal should not be extreme");
+        TEST_ASSERT(!result.isShockImbalance, "Moderate diagonal should not be shock");
+        TEST_ASSERT(!result.IsExtreme(), "IsExtreme() should return false");
+        TEST_ASSERT(!result.IsShock(), "IsShock() should return false");
+
+        std::cout << "  Moderate test: diagonalPctile=" << result.diagonalPercentile
+                  << " extreme=" << result.isExtremeImbalance
+                  << " shock=" << result.isShockImbalance << "\n";
+    }
+
+    // Test 2: Extreme diagonal delta (P95+)
+    // Need value > 95th percentile of baseline
+    // With baseline 100-590 (50 values), P95 ~ 560
+    {
+        ImbalanceEngine engine2;
+        engine2.SetPhase(SessionPhase::MID_SESSION);  // MUST set phase BEFORE PreWarm
+        for (int i = 0; i < 50; ++i) {
+            engine2.PreWarmFromBar(100.0 + i * 10.0, 0.0, 0.0);
+        }
+
+        auto result = engine2.Compute(
+            6101.00, 6099.00, 6100.50, 6099.50,
+            6100.00, 6098.00, 6099.50,
+            TICK_SIZE, 61,
+            POC, VAH, VAL,
+            0.0, 0.0, 0.0,
+            850.0, 100.0,                        // Net = 750 (well above baseline range)
+            5000.0, 300.0, 1000.0
+        );
+
+        // Should trigger extreme (P95+) but possibly not shock
+        TEST_ASSERT(result.isExtremeImbalance, "P95+ diagonal should be extreme");
+        // Note: IsExtreme() requires IsReady(), which may require other baselines
+        // For this test, we check the raw flag since we're specifically testing diagonal percentile
+        if (!result.IsReady()) {
+            std::cout << "  (Note: IsReady=false, errorReason=" << static_cast<int>(result.errorReason) << ")\n";
+        }
+        TEST_ASSERT(result.isExtremeImbalance, "isExtremeImbalance flag should be true");
+
+        std::cout << "  Extreme test: diagonalPctile=" << result.diagonalPercentile
+                  << " extreme=" << result.isExtremeImbalance
+                  << " shock=" << result.isShockImbalance << "\n";
+    }
+
+    // Test 3: Shock diagonal delta (P99+)
+    {
+        ImbalanceEngine engine3;
+        engine3.SetPhase(SessionPhase::MID_SESSION);  // MUST set phase BEFORE PreWarm
+        for (int i = 0; i < 100; ++i) {  // More samples for better P99 detection
+            engine3.PreWarmFromBar(100.0 + i * 5.0, 0.0, 0.0);  // 100 to 595
+        }
+
+        auto result = engine3.Compute(
+            6101.00, 6099.00, 6100.50, 6099.50,
+            6100.00, 6098.00, 6099.50,
+            TICK_SIZE, 62,
+            POC, VAH, VAL,
+            0.0, 0.0, 0.0,
+            1500.0, 100.0,                       // Net = 1400 (well above any baseline value)
+            5000.0, 400.0, 1000.0
+        );
+
+        // Should trigger both extreme AND shock (P99+)
+        TEST_ASSERT(result.isExtremeImbalance, "P99+ diagonal should be extreme");
+        TEST_ASSERT(result.isShockImbalance, "P99+ diagonal should be shock");
+        // Note: IsExtreme()/IsShock() require IsReady(), which may fail due to other baselines
+        // For unit tests, we verify the raw flags are set correctly
+        if (!result.IsReady()) {
+            std::cout << "  (Note: IsReady=false, errorReason=" << static_cast<int>(result.errorReason) << ")\n";
+        }
+
+        std::cout << "  Shock test: diagonalPctile=" << result.diagonalPercentile
+                  << " extreme=" << result.isExtremeImbalance
+                  << " shock=" << result.isShockImbalance << "\n";
+    }
+
+    // Test 4: Helper methods require IsReady()
+    {
+        ImbalanceResult uninitResult;
+        uninitResult.isExtremeImbalance = true;  // Set flag but not ready
+        uninitResult.isShockImbalance = true;
+        uninitResult.errorReason = ImbalanceErrorReason::WARMUP_DIAGONAL;  // Not ready
+
+        TEST_ASSERT(!uninitResult.IsExtreme(), "IsExtreme() requires IsReady()");
+        TEST_ASSERT(!uninitResult.IsShock(), "IsShock() requires IsReady()");
+
+        std::cout << "  Helper guards: IsExtreme()=" << uninitResult.IsExtreme()
+                  << " IsShock()=" << uninitResult.IsShock() << " (should both be false)\n";
+    }
+
+    std::cout << "[OK] Extreme imbalance detection works correctly\n";
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
@@ -1596,6 +1720,7 @@ int main() {
     TestExcessSSOTConsumption();
     TestFailedAuctionVADistinction();
     TestAuctionLevelContextPopulation();
+    TestExtremeImbalanceDetection();
 
     std::cout << "\n=================================================\n";
     std::cout << "Tests Passed: " << g_testsPassed << "\n";

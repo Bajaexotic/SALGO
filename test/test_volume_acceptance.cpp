@@ -193,18 +193,56 @@ void TestVolumeIntensityClassification() {
         }
     }
 
-    // Test VERY_HIGH (> P90) - value 105 in range 10-110 is ~95th percentile
+    // Test VERY_HIGH (P90-P95) - value 100 in range 10-110 is ~90th percentile
     {
         auto result = engine.Compute(
             5000.0, 5001.0, 4999.0, 0.25, 102,
             1000.0, 400.0, 600.0, 200.0,
             5000.25, 5002.0, 4998.0,
             0.0, 0.0, 0.0,
-            105.0  // High volume
+            100.0  // ~P90
         );
         if (result.IsReady()) {
             TEST_ASSERT(result.intensity == VolumeIntensity::VERY_HIGH,
-                        "Volume 105 in range 10-110 should be VERY_HIGH");
+                        "Volume 100 in range 10-110 should be VERY_HIGH (~P90)");
+            TEST_ASSERT(!result.isExtremeVolume, "P90 should NOT be extreme");
+            TEST_ASSERT(!result.isShockVolume, "P90 should NOT be shock");
+        }
+    }
+
+    // Test EXTREME (P95-P99) - value 106 in range 10-110 is ~96th percentile
+    {
+        auto result = engine.Compute(
+            5000.0, 5001.0, 4999.0, 0.25, 103,
+            1000.0, 400.0, 600.0, 200.0,
+            5000.25, 5002.0, 4998.0,
+            0.0, 0.0, 0.0,
+            106.0  // ~P96 (extreme)
+        );
+        if (result.IsReady()) {
+            TEST_ASSERT(result.intensity == VolumeIntensity::EXTREME,
+                        "Volume 106 in range 10-110 should be EXTREME (~P96)");
+            TEST_ASSERT(result.isExtremeVolume, "P96 should be extreme");
+            TEST_ASSERT(result.IsExtreme(), "IsExtreme() helper should return true");
+            TEST_ASSERT(!result.isShockVolume, "P96 should NOT be shock");
+        }
+    }
+
+    // Test SHOCK (>= P99) - value 110 in range 10-110 is ~100th percentile
+    {
+        auto result = engine.Compute(
+            5000.0, 5001.0, 4999.0, 0.25, 104,
+            1000.0, 400.0, 600.0, 200.0,
+            5000.25, 5002.0, 4998.0,
+            0.0, 0.0, 0.0,
+            110.0  // P99+ (shock)
+        );
+        if (result.IsReady()) {
+            TEST_ASSERT(result.intensity == VolumeIntensity::SHOCK,
+                        "Volume 110 in range 10-110 should be SHOCK (P99+)");
+            TEST_ASSERT(result.isExtremeVolume, "P99+ should be extreme");
+            TEST_ASSERT(result.isShockVolume, "P99+ should be shock");
+            TEST_ASSERT(result.IsShock(), "IsShock() helper should return true");
         }
     }
 }

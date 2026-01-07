@@ -83,6 +83,52 @@ toxicityProxy = |consumedBid - consumedAsk| / (consumedBid + consumedAsk + epsil
 
 ---
 
+## Extreme Liquidity Detection (Jan 2025)
+
+| Level | Stress Threshold | Depth Threshold | Meaning |
+|-------|------------------|-----------------|---------|
+| `EXTREME` | >= P95 | <= P5 | Dangerous conditions, reduce position size |
+| `SHOCK` | >= P99 | <= P1 | Flash crash risk, hard block recommended |
+
+**Combined OR logic:** Either extreme stress OR extreme thin depth is dangerous.
+- High stress = aggressive demand overwhelming supply (stop runs, institutional sweep)
+- Thin depth = no buffer to absorb aggression (flash crash, slippage risk)
+
+### Result Flags
+
+```cpp
+// In Liq3Result
+bool isExtremeLiquidity = false;    // Stress >= P95 OR Depth <= P5
+bool isLiquidityShock = false;      // Stress >= P99 OR Depth <= P1
+bool extremeFromStress = false;     // Stress component triggered extreme
+bool extremeFromDepth = false;      // Depth component triggered extreme
+
+// Helpers (require liqValid)
+bool IsExtremeLiquidity() const { return liqValid && isExtremeLiquidity; }
+bool IsLiquidityShock() const { return liqValid && isLiquidityShock; }
+```
+
+### Usage Pattern
+
+```cpp
+if (lastLiqSnap.IsLiquidityShock()) {
+    // P99+ stress OR P1- depth - flash crash conditions
+    // Hard block all new entries, tighten stops
+}
+else if (lastLiqSnap.IsExtremeLiquidity()) {
+    // P95+ stress OR P5- depth - dangerous but not critical
+    // Reduce position size, require additional confirmation
+    if (lastLiqSnap.extremeFromStress) {
+        // Aggressive sweep in progress
+    }
+    if (lastLiqSnap.extremeFromDepth) {
+        // Book is dangerously thin
+    }
+}
+```
+
+---
+
 ## Temporal Coherence (Option B - Dec 2024)
 
 ALL components use CLOSED BAR data for full temporal alignment:
@@ -206,6 +252,12 @@ struct LiquidityConfig {
     // Kyle's Tightness component (spread impact on composite LIQ)
     double spreadWeight = 0.15;     // Weight of spread penalty (0.15 = 15% max penalty)
     double spreadMaxTicks = 4.0;    // Spread above this is "wide" (ES: 4 ticks = 1 point)
+
+    // Extreme Liquidity Detection (Jan 2025)
+    double extremeStressThreshold = 95.0;   // Stress >= P95 = extreme demand pressure
+    double extremeDepthThreshold = 5.0;     // Depth <= P5 = extreme thin (inverted)
+    double shockStressThreshold = 99.0;     // Stress >= P99 = shock demand pressure
+    double shockDepthThreshold = 1.0;       // Depth <= P1 = shock thin (inverted)
 };
 ```
 

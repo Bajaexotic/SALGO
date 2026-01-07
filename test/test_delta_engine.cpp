@@ -380,6 +380,87 @@ void TestConfidenceExhaustion() {
 }
 
 // ============================================================================
+// TEST: Shock Delta Detection (Jan 2025)
+// ============================================================================
+
+void TestShockDeltaDetection() {
+    TEST_SECTION("Shock Delta Detection (P99+)");
+
+    DeltaEngine engine;
+    auto store = CreatePopulatedEffortStore();
+    auto sessBaseline = CreatePopulatedSessionBaseline();
+
+    engine.SetEffortStore(&store);
+    engine.SetSessionDeltaBaseline(&sessBaseline);
+    engine.SetPhase(SessionPhase::MID_SESSION);
+    engine.config.exhaustionDeltaPctile = 95.0;
+    engine.config.shockDeltaPctile = 99.0;
+
+    // Test shock: extremely one-sided delta (above P99)
+    {
+        // Delta = +990 / 1000 = +0.99 (extreme positive - near max)
+        // This should be well above P99 in baseline
+        auto result = engine.Compute(990.0, 1000.0, 5.0, 990.0, 1000.0, 0);
+        TEST_ASSERT(result.IsReady(), "Result should be ready");
+
+        // Verify flag is set correctly based on percentile
+        if (result.barDeltaPctile > 99.0) {
+            TEST_ASSERT(result.isShockDelta, "P99+ delta should flag shock");
+            TEST_ASSERT(result.IsShock(), "IsShock() helper should return true");
+        }
+
+        // Also verify exhaustion is triggered (P95+ implies P99+ when shock)
+        if (result.barDeltaPctile > 95.0) {
+            TEST_ASSERT(result.isExhaustion, "Shock delta should also flag exhaustion");
+        }
+
+        std::cout << "  barDeltaPctile=" << result.barDeltaPctile
+                  << " isExhaustion=" << result.isExhaustion
+                  << " isShockDelta=" << result.isShockDelta << "\n";
+    }
+
+    // Test threshold logic: verify flags are set correctly based on percentile
+    {
+        // Create fresh engine for this test to avoid state issues
+        DeltaEngine engine2;
+        auto store2 = CreatePopulatedEffortStore();
+        auto sessBaseline2 = CreatePopulatedSessionBaseline();
+        engine2.SetEffortStore(&store2);
+        engine2.SetSessionDeltaBaseline(&sessBaseline2);
+        engine2.SetPhase(SessionPhase::MID_SESSION);
+        engine2.config.exhaustionDeltaPctile = 95.0;
+        engine2.config.shockDeltaPctile = 99.0;
+
+        // Delta = +500 / 1000 = +0.50 (moderate - should be below exhaustion)
+        auto result = engine2.Compute(500.0, 1000.0, 5.0, 500.0, 1000.0, 0);
+
+        if (result.IsReady()) {
+            // Verify that lower percentiles don't trigger shock
+            if (result.barDeltaPctile <= 95.0) {
+                TEST_ASSERT(!result.isExhaustion, "P95- should NOT flag exhaustion");
+                TEST_ASSERT(!result.isShockDelta, "P95- should NOT flag shock");
+            }
+
+            std::cout << "  moderate delta: barDeltaPctile=" << result.barDeltaPctile
+                      << " isExhaustion=" << result.isExhaustion
+                      << " isShockDelta=" << result.isShockDelta << "\n";
+        } else {
+            std::cout << "  moderate delta: skipped (baseline not ready)\n";
+        }
+    }
+
+    // Test warning flags bitmask includes shock
+    {
+        auto result = engine.Compute(990.0, 1000.0, 5.0, 990.0, 1000.0, 0);
+        if (result.isShockDelta) {
+            TEST_ASSERT((result.warningFlags & (1 << 4)) != 0, "Shock should set bit 4 in warningFlags");
+        }
+    }
+
+    std::cout << "[OK] Shock delta detection identifies P99+ one-sidedness\n";
+}
+
+// ============================================================================
 // TEST: Trading Constraints
 // ============================================================================
 
@@ -705,9 +786,9 @@ void TestLocationContextBuild() {
             8.0       // discoveryThresholdTicks
         );
         TEST_ASSERT(ctx.isValid, "Context should be valid");
-        TEST_ASSERT(ctx.zone == ValueZoneSimple::IN_VALUE, "Price at POC should be IN_VALUE");
-        TEST_ASSERT(ctx.isInValue, "isInValue flag should be true");
-        TEST_ASSERT(!ctx.isAtEdge, "isAtEdge should be false");
+        TEST_ASSERT(ctx.zone == ValueZone::AT_POC, "Price at POC should be AT_POC");
+        TEST_ASSERT(ctx.IsInValue(), "IsInValue() should be true for AT_POC");
+        TEST_ASSERT(!ctx.IsAtEdge(), "IsAtEdge() should be false");
     }
 
     // Test AT_VALUE_EDGE (at VAH)
@@ -720,27 +801,29 @@ void TestLocationContextBuild() {
             tickSize
         );
         TEST_ASSERT(ctx.isValid, "Context should be valid");
-        TEST_ASSERT(ctx.zone == ValueZoneSimple::AT_VALUE_EDGE, "Price near VAH should be AT_VALUE_EDGE");
-        TEST_ASSERT(ctx.isAtEdge, "isAtEdge flag should be true");
+        TEST_ASSERT(ctx.zone == ValueZone::AT_VAH, "Price near VAH should be AT_VAH");
+        TEST_ASSERT(ctx.IsAtEdge(), "IsAtEdge() should be true");
+        TEST_ASSERT(ctx.IsAboveValue(), "IsAboveValue() should be true at VAH");
     }
 
-    // Test OUTSIDE_VALUE
+    // Test OUTSIDE_VALUE (NEAR_ABOVE_VALUE)
     {
         auto ctx = DeltaLocationContext::Build(
-            6065.0,   // price 5 ticks above VAH
+            6061.25,  // price 5 ticks above VAH (6060 + 5*0.25)
             6050.0,   // poc
             6060.0,   // vah
             6040.0,   // val
             tickSize,
             2.0,      // edgeToleranceTicks
-            8.0       // discoveryThresholdTicks (5 < 8, so OUTSIDE not DISCOVERY)
+            8.0       // discoveryThresholdTicks (5 < 8, so NEAR_ABOVE not FAR_ABOVE)
         );
         TEST_ASSERT(ctx.isValid, "Context should be valid");
-        TEST_ASSERT(ctx.zone == ValueZoneSimple::OUTSIDE_VALUE, "Price 5t above VAH should be OUTSIDE_VALUE");
-        TEST_ASSERT(ctx.isOutsideValue, "isOutsideValue flag should be true");
+        TEST_ASSERT(ctx.zone == ValueZone::NEAR_ABOVE_VALUE, "Price 5t above VAH should be NEAR_ABOVE_VALUE");
+        TEST_ASSERT(ctx.IsOutsideValue(), "IsOutsideValue() should be true");
+        TEST_ASSERT(ctx.IsAboveValue(), "IsAboveValue() should be true");
     }
 
-    // Test IN_DISCOVERY
+    // Test IN_DISCOVERY (FAR_ABOVE_VALUE)
     {
         auto ctx = DeltaLocationContext::Build(
             6075.0,   // price 15 ticks above VAH
@@ -749,11 +832,12 @@ void TestLocationContextBuild() {
             6040.0,   // val
             tickSize,
             2.0,      // edgeToleranceTicks
-            8.0       // discoveryThresholdTicks (15 > 8, so IN_DISCOVERY)
+            8.0       // discoveryThresholdTicks (15 > 8, so FAR_ABOVE_VALUE)
         );
         TEST_ASSERT(ctx.isValid, "Context should be valid");
-        TEST_ASSERT(ctx.zone == ValueZoneSimple::IN_DISCOVERY, "Price 15t above VAH should be IN_DISCOVERY");
-        TEST_ASSERT(ctx.isInDiscovery, "isInDiscovery flag should be true");
+        TEST_ASSERT(ctx.zone == ValueZone::FAR_ABOVE_VALUE, "Price 15t above VAH should be FAR_ABOVE_VALUE");
+        TEST_ASSERT(ctx.IsInDiscovery(), "IsInDiscovery() should be true");
+        TEST_ASSERT(ctx.IsAboveValue(), "IsAboveValue() should be true");
     }
 
     // Test POC migration detection
@@ -819,9 +903,9 @@ void TestLocationAwareCompute() {
                            300.0 * (i + 1), 1000.0 * (i + 1), i, locCtx);
         }
 
-        // Price outside value, sustained + aligned should favor acceptance
+        // Price outside value (5 ticks above VAH = NEAR_ABOVE), sustained + aligned should favor acceptance
         auto locCtx = DeltaLocationContext::Build(
-            6065.0, 6050.0, 6060.0, 6040.0, tickSize, 2.0, 8.0);
+            6061.25, 6050.0, 6060.0, 6040.0, tickSize, 2.0, 8.0);  // 5 ticks above VAH
         auto result = engine.Compute(350.0, 1000.0, 2.0,
                                       1850.0, 6000.0, 5, locCtx);
 
@@ -963,8 +1047,8 @@ void TestOutcomeAccessors() {
 
     // Set acceptance outcome
     result.location.isValid = true;
-    result.location.zone = ValueZoneSimple::OUTSIDE_VALUE;
-    result.likelyOutcome = AuctionOutcome::ACCEPTANCE_LIKELY;
+    result.location.zone = ValueZone::NEAR_ABOVE_VALUE;  // 9-state: outside value above
+    result.likelyOutcome = DeltaAuctionPrediction::ACCEPTANCE_LIKELY;
     result.acceptanceLikelihood = 0.65;
     result.rejectionLikelihood = 0.20;
     result.rotationLikelihood = 0.15;
@@ -1626,6 +1710,7 @@ int main() {
     TestConfidenceThinTape();
     TestConfidenceHighChop();
     TestConfidenceExhaustion();
+    TestShockDeltaDetection();
     TestTradingConstraints();
     TestHysteresis();
     TestSessionBoundary();

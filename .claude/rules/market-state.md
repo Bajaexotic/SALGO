@@ -4,7 +4,7 @@
 
 | SSOT Owner | Location |
 |------------|----------|
-| **`AMTMarketState`** | `DaltonEngine.phase` -> `StateEvidence.currentState` |
+| **`AMTMarketState`** | `DaltonEngine.marketState` -> `StateEvidence.currentState` |
 
 **Per Dalton: 1TF/2TF is the DETECTION MECHANISM for Balance/Imbalance.**
 - **1TF (One-Time Framing)** = IMBALANCE (one side in control, trending, ~20%)
@@ -35,7 +35,7 @@ All 500+ usages have been migrated to use `AMTMarketState` directly.
 ```cpp
 // STEP 1: Dalton computes state via 1TF/2TF (SSOT)
 st->lastDaltonState = st->daltonEngine.ProcessBar(...);
-AMT::AMTMarketState daltonState = st->lastDaltonState.phase;
+AMT::AMTMarketState daltonState = st->lastDaltonState.marketState;
 
 // STEP 2: Signal engine receives authoritative state
 evidence = st->amtSignalEngine.ProcessBar(..., daltonState);
@@ -95,7 +95,7 @@ ACCEPTING_VALUE  // Consolidating in new value area
 
 ```cpp
 // STEP 1: Dalton derives state and phase (SSOT)
-daltonState = st->lastDaltonState.phase;
+daltonState = st->lastDaltonState.marketState;
 daltonPhase = st->lastDaltonState.DeriveCurrentPhase();
 
 // STEP 2: BuildPhaseSnapshot receives daltonPhase (REQUIRED, no fallback)

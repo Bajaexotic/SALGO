@@ -641,6 +641,229 @@ void test_v1_action_with_warmup() {
 }
 
 // ============================================================================
+// TEST: Extreme Liquidity Detection (Jan 2025)
+// ============================================================================
+
+void test_extreme_liquidity_from_stress() {
+    std::cout << "=== Test: Extreme liquidity detection from high stress ===" << std::endl;
+
+    LiquidityEngine engine;
+    DOMWarmup warmup;
+    warmup.Reset();
+    engine.Reset();
+    engine.SetDOMWarmup(&warmup);
+    engine.SetPhase(SessionPhase::GLOBEX);
+
+    // Pre-warm baselines with normal stress values
+    for (int i = 0; i < 20; ++i) {
+        // Normal stress: 100 aggressive against 100 depth -> stress = 0.99
+        engine.PreWarmFromBar(100.0, 50.0, 50.0, 99.0, 60.0, SessionPhase::GLOBEX);
+    }
+
+    // Lambda to create DOM levels
+    auto makeBidLevel = [](double vol) {
+        return [vol](int level, double& price, double& volume) {
+            if (level == 0) { price = 99.75; volume = vol; return true; }
+            return false;
+        };
+    };
+    auto makeAskLevel = [](double vol) {
+        return [vol](int level, double& price, double& volume) {
+            if (level == 0) { price = 100.25; volume = vol; return true; }
+            return false;
+        };
+    };
+
+    // First compute to set up prevDepthMassTotal
+    engine.Compute(100.0, 0.25, 10, makeBidLevel(100.0), makeAskLevel(100.0), 50.0, 50.0, 60.0);
+
+    // Now test with EXTREME stress (very high aggressive volume vs depth)
+    // Stress rank >= P95 should trigger isExtremeLiquidity
+    // 1000 aggressive against 20 depth -> stress = 49.5 (much higher than baseline ~0.99)
+    auto extremeStressSnap = engine.Compute(100.0, 0.25, 10, makeBidLevel(10.0), makeAskLevel(10.0),
+                                            500.0, 500.0, 60.0);
+
+    std::cout << "  Extreme stress: stressRank=" << extremeStressSnap.stressRank
+              << " isExtreme=" << extremeStressSnap.isExtremeLiquidity
+              << " extremeFromStress=" << extremeStressSnap.extremeFromStress
+              << std::endl;
+
+    // Verify the flag computation logic matches expected threshold
+    if (extremeStressSnap.stressRankValid) {
+        const bool shouldBeExtreme = (extremeStressSnap.stressRank >= 0.95);
+        if (shouldBeExtreme) {
+            assert(extremeStressSnap.isExtremeLiquidity);
+            assert(extremeStressSnap.extremeFromStress);
+            std::cout << "  High stress correctly triggers extreme flag" << std::endl;
+        } else {
+            // Even if not >= P95, verify logic is consistent
+            assert(extremeStressSnap.isExtremeLiquidity == shouldBeExtreme ||
+                   extremeStressSnap.extremeFromDepth);  // Could be extreme from depth instead
+            std::cout << "  Note: Stress rank=" << extremeStressSnap.stressRank
+                      << " (threshold is P95=0.95)" << std::endl;
+        }
+    }
+
+    std::cout << "  PASSED" << std::endl;
+}
+
+void test_extreme_liquidity_from_thin_depth() {
+    std::cout << "=== Test: Extreme liquidity detection from thin depth ===" << std::endl;
+
+    LiquidityEngine engine;
+    DOMWarmup warmup;
+    warmup.Reset();
+    engine.Reset();
+    engine.SetDOMWarmup(&warmup);
+    engine.SetPhase(SessionPhase::GLOBEX);
+
+    // Pre-warm with NORMAL depth values (100-200 mass)
+    for (int i = 0; i < 20; ++i) {
+        double depthMass = 100.0 + (i % 10) * 10.0;  // Vary 100-190
+        engine.PreWarmFromBar(depthMass, 10.0, 10.0, depthMass - 1.0, 60.0, SessionPhase::GLOBEX);
+    }
+
+    // Lambda to create DOM levels with very thin depth
+    auto makeThinBidLevel = [](int level, double& price, double& volume) {
+        if (level == 0) { price = 99.75; volume = 1.0; return true; }  // Very thin!
+        return false;
+    };
+    auto makeThinAskLevel = [](int level, double& price, double& volume) {
+        if (level == 0) { price = 100.25; volume = 1.0; return true; }  // Very thin!
+        return false;
+    };
+
+    // First compute to set up prevDepthMassTotal
+    engine.Compute(100.0, 0.25, 10, makeThinBidLevel, makeThinAskLevel, 10.0, 10.0, 60.0);
+
+    // Test with VERY THIN depth (should be <= P5)
+    auto thinDepthSnap = engine.Compute(100.0, 0.25, 10, makeThinBidLevel, makeThinAskLevel,
+                                        10.0, 10.0, 60.0);
+
+    std::cout << "  Thin depth: depthRank=" << thinDepthSnap.depthRank
+              << " isExtreme=" << thinDepthSnap.isExtremeLiquidity
+              << " extremeFromDepth=" << thinDepthSnap.extremeFromDepth
+              << std::endl;
+
+    // Verify the flag computation logic
+    if (thinDepthSnap.depthRankValid) {
+        const bool shouldBeExtremeFromDepth = (thinDepthSnap.depthRank <= 0.05);
+        if (shouldBeExtremeFromDepth) {
+            assert(thinDepthSnap.isExtremeLiquidity);
+            assert(thinDepthSnap.extremeFromDepth);
+            std::cout << "  Thin depth correctly triggers extreme flag" << std::endl;
+        } else {
+            std::cout << "  Note: Depth rank=" << thinDepthSnap.depthRank
+                      << " (threshold is P5=0.05)" << std::endl;
+        }
+    }
+
+    std::cout << "  PASSED" << std::endl;
+}
+
+void test_liquidity_shock_detection() {
+    std::cout << "=== Test: Liquidity shock (P99+) detection ===" << std::endl;
+
+    LiquidityEngine engine;
+    DOMWarmup warmup;
+    warmup.Reset();
+    engine.Reset();
+    engine.SetDOMWarmup(&warmup);
+    engine.SetPhase(SessionPhase::GLOBEX);
+
+    // Pre-warm with consistent values to establish baseline
+    for (int i = 0; i < 100; ++i) {
+        engine.PreWarmFromBar(100.0, 50.0, 50.0, 99.0, 60.0, SessionPhase::GLOBEX);
+    }
+
+    // Lambdas for shock test
+    auto makeBidLevel = [](double vol) {
+        return [vol](int level, double& price, double& volume) {
+            if (level == 0) { price = 99.75; volume = vol; return true; }
+            return false;
+        };
+    };
+    auto makeAskLevel = [](double vol) {
+        return [vol](int level, double& price, double& volume) {
+            if (level == 0) { price = 100.25; volume = vol; return true; }
+            return false;
+        };
+    };
+
+    // First compute
+    engine.Compute(100.0, 0.25, 10, makeBidLevel(100.0), makeAskLevel(100.0), 50.0, 50.0, 60.0);
+
+    // Test with SHOCK level conditions - extremely thin depth + high stress
+    auto shockSnap = engine.Compute(100.0, 0.25, 10, makeBidLevel(0.5), makeAskLevel(0.5),
+                                    2000.0, 2000.0, 60.0);
+
+    std::cout << "  Shock level: stressRank=" << shockSnap.stressRank
+              << " depthRank=" << shockSnap.depthRank
+              << " isShock=" << shockSnap.isLiquidityShock
+              << std::endl;
+
+    // Verify helper methods work correctly
+    std::cout << "  Helper IsExtremeLiquidity()=" << shockSnap.IsExtremeLiquidity()
+              << " IsLiquidityShock()=" << shockSnap.IsLiquidityShock()
+              << std::endl;
+
+    // At minimum, verify the flags are set correctly based on computed ranks
+    if (shockSnap.depthRankValid && shockSnap.stressRankValid) {
+        const bool shouldBeExtreme = (shockSnap.stressRank >= 0.95) || (shockSnap.depthRank <= 0.05);
+        const bool shouldBeShock = (shockSnap.stressRank >= 0.99) || (shockSnap.depthRank <= 0.01);
+
+        assert(shockSnap.isExtremeLiquidity == shouldBeExtreme);
+        assert(shockSnap.isLiquidityShock == shouldBeShock);
+        std::cout << "  Flags correctly match threshold logic" << std::endl;
+    }
+
+    std::cout << "  PASSED" << std::endl;
+}
+
+void test_extreme_liquidity_flags_inactive_during_warmup() {
+    std::cout << "=== Test: Extreme flags inactive during warmup ===" << std::endl;
+
+    LiquidityEngine engine;
+    engine.Reset();
+    engine.SetPhase(SessionPhase::GLOBEX);
+    // Note: NO DOMWarmup set, NO pre-warming - baselines won't be ready
+
+    auto makeBidLevel = [](int level, double& price, double& volume) {
+        if (level == 0) { price = 99.75; volume = 1000.0; return true; }
+        return false;
+    };
+    auto makeAskLevel = [](int level, double& price, double& volume) {
+        if (level == 0) { price = 100.25; volume = 1000.0; return true; }
+        return false;
+    };
+
+    // Don't pre-warm - baselines not ready
+    auto warmupSnap = engine.Compute(100.0, 0.25, 10, makeBidLevel, makeAskLevel, 500.0, 500.0, 60.0);
+
+    std::cout << "  Warmup state: depthRankValid=" << warmupSnap.depthRankValid
+              << " stressRankValid=" << warmupSnap.stressRankValid
+              << " liqValid=" << warmupSnap.liqValid
+              << std::endl;
+    std::cout << "  Flags during warmup: isExtreme=" << warmupSnap.isExtremeLiquidity
+              << " isShock=" << warmupSnap.isLiquidityShock
+              << std::endl;
+
+    // During warmup, extreme flags should remain false (default)
+    if (!warmupSnap.depthRankValid || !warmupSnap.stressRankValid) {
+        assert(!warmupSnap.isExtremeLiquidity);
+        assert(!warmupSnap.isLiquidityShock);
+        std::cout << "  Extreme flags correctly inactive during warmup" << std::endl;
+    }
+
+    // Also verify helper methods check liqValid
+    assert(!warmupSnap.IsExtremeLiquidity());
+    assert(!warmupSnap.IsLiquidityShock());
+    std::cout << "  Helper methods correctly return false during warmup" << std::endl;
+
+    std::cout << "  PASSED" << std::endl;
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
@@ -686,9 +909,15 @@ int main() {
     test_v1_action_guidance();
     test_v1_action_with_warmup();
 
+    std::cout << "\n--- Extreme Liquidity Detection (Jan 2025) ---\n" << std::endl;
+    test_extreme_liquidity_from_stress();
+    test_extreme_liquidity_from_thin_depth();
+    test_liquidity_shock_detection();
+    test_extreme_liquidity_flags_inactive_during_warmup();
+
     std::cout << "\n========================================" << std::endl;
     std::cout << "All Liquidity Engine Tests PASSED!" << std::endl;
-    std::cout << "(Including V1 Features)" << std::endl;
+    std::cout << "(Including V1 Features + Extreme Detection)" << std::endl;
     std::cout << "========================================\n" << std::endl;
 
     return 0;

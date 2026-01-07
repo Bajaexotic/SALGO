@@ -107,7 +107,6 @@ void TestZoneClassification() {
         TEST_ASSERT(result.IsReady(), "AT_POC: Result should be ready");
         TEST_ASSERT(result.zone == ValueZone::AT_POC, "AT_POC: Should detect AT_POC zone");
         TEST_ASSERT(result.IsAtPOC(), "AT_POC: IsAtPOC() should be true");
-        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::AT_POC, "AT_POC: Coarse location should match");
     }
 
     engine.ResetForSession();
@@ -121,7 +120,6 @@ void TestZoneClassification() {
         TEST_ASSERT(result.IsReady(), "AT_VAH: Result should be ready");
         TEST_ASSERT(result.zone == ValueZone::AT_VAH, "AT_VAH: Should detect AT_VAH zone");
         TEST_ASSERT(result.IsAtVAH(), "AT_VAH: IsAtVAH() should be true");
-        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::AT_VAH, "AT_VAH: Coarse location should match");
     }
 
     engine.ResetForSession();
@@ -135,7 +133,6 @@ void TestZoneClassification() {
         TEST_ASSERT(result.IsReady(), "AT_VAL: Result should be ready");
         TEST_ASSERT(result.zone == ValueZone::AT_VAL, "AT_VAL: Should detect AT_VAL zone");
         TEST_ASSERT(result.IsAtVAL(), "AT_VAL: IsAtVAL() should be true");
-        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::AT_VAL, "AT_VAL: Coarse location should match");
     }
 
     engine.ResetForSession();
@@ -149,7 +146,6 @@ void TestZoneClassification() {
         TEST_ASSERT(result.IsReady(), "UPPER_VALUE: Result should be ready");
         TEST_ASSERT(result.zone == ValueZone::UPPER_VALUE, "UPPER_VALUE: Should detect UPPER_VALUE zone");
         TEST_ASSERT(result.IsInsideValue(), "UPPER_VALUE: IsInsideValue() should be true");
-        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::INSIDE_VALUE, "UPPER_VALUE: Coarse location should be INSIDE_VALUE");
     }
 
     engine.ResetForSession();
@@ -163,7 +159,6 @@ void TestZoneClassification() {
         TEST_ASSERT(result.IsReady(), "LOWER_VALUE: Result should be ready");
         TEST_ASSERT(result.zone == ValueZone::LOWER_VALUE, "LOWER_VALUE: Should detect LOWER_VALUE zone");
         TEST_ASSERT(result.IsInsideValue(), "LOWER_VALUE: IsInsideValue() should be true");
-        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::INSIDE_VALUE, "LOWER_VALUE: Coarse location should be INSIDE_VALUE");
     }
 
     engine.ResetForSession();
@@ -177,7 +172,6 @@ void TestZoneClassification() {
         TEST_ASSERT(result.IsReady(), "NEAR_ABOVE: Result should be ready");
         TEST_ASSERT(result.zone == ValueZone::NEAR_ABOVE_VALUE, "NEAR_ABOVE: Should detect NEAR_ABOVE_VALUE zone");
         TEST_ASSERT(result.IsAboveValue(), "NEAR_ABOVE: IsAboveValue() should be true");
-        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::ABOVE_VALUE, "NEAR_ABOVE: Coarse location should be ABOVE_VALUE");
     }
 
     engine.ResetForSession();
@@ -192,7 +186,6 @@ void TestZoneClassification() {
         TEST_ASSERT(result.zone == ValueZone::FAR_ABOVE_VALUE, "FAR_ABOVE: Should detect FAR_ABOVE_VALUE zone");
         TEST_ASSERT(result.IsAboveValue(), "FAR_ABOVE: IsAboveValue() should be true");
         TEST_ASSERT(result.IsFarOutside(), "FAR_ABOVE: IsFarOutside() should be true");
-        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::ABOVE_VALUE, "FAR_ABOVE: Coarse location should be ABOVE_VALUE");
     }
 
     engine.ResetForSession();
@@ -207,7 +200,6 @@ void TestZoneClassification() {
         TEST_ASSERT(result.zone == ValueZone::FAR_BELOW_VALUE, "FAR_BELOW: Should detect FAR_BELOW_VALUE zone");
         TEST_ASSERT(result.IsBelowValue(), "FAR_BELOW: IsBelowValue() should be true");
         TEST_ASSERT(result.IsFarOutside(), "FAR_BELOW: IsFarOutside() should be true");
-        TEST_ASSERT(result.GetCoarseLocation() == ValueLocation::BELOW_VALUE, "FAR_BELOW: Coarse location should be BELOW_VALUE");
     }
 
     std::cout << "Zone classification tests complete\n";
@@ -374,29 +366,31 @@ void TestHysteresis() {
                              0, 0, 0, structure, zm, nullptr, nullptr,
                              AMTMarketState::BALANCE);
     TEST_ASSERT(r1.zone == ValueZone::AT_POC, "Bar 1: Should be AT_POC");
-    TEST_ASSERT(r1.confirmedZone == ValueZone::UNKNOWN, "Bar 1: Confirmed should still be UNKNOWN (first bar)");
+    // NOTE: Hysteresis state is now engine-internal, result only has events
+    TEST_ASSERT(!r1.zoneChanged, "Bar 1: zoneChanged should be false (first bar)");
 
-    // Stay at POC - should confirm
+    // Stay at POC - should confirm after minConfirmationBars
     auto r2 = engine.Compute(100.25, tickSize, 2, poc, vah, val,
                              0, 0, 0, structure, zm, nullptr, nullptr,
                              AMTMarketState::BALANCE);
     TEST_ASSERT(r2.zone == ValueZone::AT_POC, "Bar 2: Should be AT_POC");
-    // After 2 bars, should confirm (minConfirmationBars = 2)
-    TEST_ASSERT(r2.confirmedZone == ValueZone::AT_POC, "Bar 2: Should confirm AT_POC");
+    // After 2 bars at same zone, engine internally confirms (but result doesn't expose state)
+    // We can verify via engine.confirmedZone (public member)
+    TEST_ASSERT(engine.confirmedZone == ValueZone::AT_POC, "Bar 2: Engine should confirm AT_POC");
 
-    // Move to UPPER_VALUE - should be transitioning
+    // Move to UPPER_VALUE - should not trigger zoneChanged yet (needs confirmation)
     auto r3 = engine.Compute(102.5, tickSize, 3, poc, vah, val,
                              0, 0, 0, structure, zm, nullptr, nullptr,
                              AMTMarketState::BALANCE);
     TEST_ASSERT(r3.zone == ValueZone::UPPER_VALUE, "Bar 3: Raw zone should be UPPER_VALUE");
-    TEST_ASSERT(r3.isTransitioning, "Bar 3: Should be transitioning");
-    TEST_ASSERT(r3.confirmedZone == ValueZone::AT_POC, "Bar 3: Confirmed should still be AT_POC");
+    TEST_ASSERT(!r3.zoneChanged, "Bar 3: zoneChanged should be false (transition not confirmed)");
+    TEST_ASSERT(engine.confirmedZone == ValueZone::AT_POC, "Bar 3: Engine should still confirm AT_POC");
 
-    // Stay at UPPER_VALUE - should confirm transition
+    // Stay at UPPER_VALUE - should confirm transition and trigger zoneChanged
     auto r4 = engine.Compute(102.75, tickSize, 4, poc, vah, val,
                              0, 0, 0, structure, zm, nullptr, nullptr,
                              AMTMarketState::BALANCE);
-    TEST_ASSERT(r4.confirmedZone == ValueZone::UPPER_VALUE, "Bar 4: Should confirm UPPER_VALUE");
+    TEST_ASSERT(engine.confirmedZone == ValueZone::UPPER_VALUE, "Bar 4: Engine should confirm UPPER_VALUE");
     TEST_ASSERT(r4.zoneChanged, "Bar 4: Should signal zone changed");
 
     std::cout << "Hysteresis tests complete\n";
@@ -438,9 +432,12 @@ void TestReferenceLevels() {
     TEST_ASSERT(result.IsReady(), "REF: Result should be ready");
     TEST_ASSERT(!result.nearbyLevels.empty(), "REF: Should have nearby levels");
 
-    // Should detect at HVN (100 is in hvnLevels)
-    TEST_ASSERT(result.atHVN, "REF: Should be at HVN");
-    TEST_ASSERT(!result.atLVN, "REF: Should not be at LVN");
+    // Should detect at HVN (100 is in hvnLevels) - using distance primitives
+    TEST_ASSERT(result.nearestHVNValid, "REF: Should have valid nearest HVN");
+    TEST_ASSERT(result.IsAtHVN(), "REF: Should be at HVN (via derived method)");
+    TEST_ASSERT(!result.IsAtLVN(), "REF: Should not be at LVN");
+    // Distance primitive gives actual ticks (price 100 at HVN 100 = 0 ticks)
+    TEST_ASSERT(std::abs(result.nearestHVNDistTicks) < 1.0, "REF: Should be very close to HVN");
 
     // Should have multiple levels within range
     TEST_ASSERT(result.levelsWithin5Ticks >= 1, "REF: Should have levels within 5 ticks");
@@ -457,11 +454,19 @@ void TestReferenceLevels() {
 }
 
 // ============================================================================
-// TEST: Strategy Gating
+// TEST: Strategy Gating - REMOVED (Jan 2025)
+// ============================================================================
+// NOTE: StrategyGating was removed from ValueLocationResult because policy
+// decisions (ShouldFade, ShouldBreakout) belong in a decision/arbitration
+// layer that consumes all engine outputs, NOT in the location SSOT.
+// ValueLocationEngine now outputs descriptive primitives only.
 // ============================================================================
 
-void TestStrategyGating() {
-    TEST_SECTION("Strategy Gating");
+void TestNoStrategyGating() {
+    TEST_SECTION("No Strategy Gating (SSOT Purity)");
+
+    // Verify that ValueLocationResult does NOT have gating fields
+    // (compilation would fail if they existed and we tried to access them)
 
     ValueLocationEngine engine;
     engine.SetPhase(SessionPhase::MID_SESSION);
@@ -474,43 +479,22 @@ void TestStrategyGating() {
     auto structure = CreateTestStructure(108.0, 92.0, 106.0, 94.0);
     auto zm = CreateTestZoneManager();
 
-    // Test AT_POC gating (neutral zone)
-    {
-        auto result = engine.Compute(100.0, tickSize, 1, poc, vah, val,
-                                     100.0, 105.0, 95.0,  // Overlapping prior
-                                     structure, zm, nullptr, nullptr,
-                                     AMTMarketState::BALANCE);
-        TEST_ASSERT(result.gating.isNeutralZone, "POC: Should be neutral zone");
-        TEST_ASSERT(result.gating.fadeConfidenceMultiplier < 1.0, "POC: Fade mult should be reduced");
-        TEST_ASSERT(result.gating.breakoutConfidenceMultiplier < 1.0, "POC: Breakout mult should be reduced");
-    }
+    auto result = engine.Compute(100.0, tickSize, 1, poc, vah, val,
+                                 0, 0, 0, structure, zm, nullptr, nullptr,
+                                 AMTMarketState::BALANCE);
 
-    engine.ResetForSession();
+    // Result should still be ready - just no gating
+    TEST_ASSERT(result.IsReady(), "Result should be ready");
+    TEST_ASSERT(result.zone == ValueZone::AT_POC, "Zone detection still works");
 
-    // Test AT_VAH in BALANCE (fade favorable)
-    {
-        auto result = engine.Compute(105.0, tickSize, 1, poc, vah, val,
-                                     100.0, 105.0, 95.0,  // Overlapping prior
-                                     structure, zm, nullptr, nullptr,
-                                     AMTMarketState::BALANCE);
-        TEST_ASSERT(result.gating.fadeConfidenceMultiplier >= 1.0, "VAH+BAL: Fade mult should be boosted");
-        TEST_ASSERT(result.gating.preferShortSide, "VAH+BAL: Should prefer short side");
-    }
+    // Verify descriptive primitives are available
+    TEST_ASSERT(result.distFromPOCTicks < 1.0, "Distance primitives still work");
+    TEST_ASSERT(result.IsAtPOC(), "Location queries still work");
+    TEST_ASSERT(result.IsBalanceStructure() || result.IsTrendStructure() ||
+                result.overlapState == VAOverlapState::UNKNOWN,
+                "Structure queries still work");
 
-    engine.ResetForSession();
-
-    // Test FAR_ABOVE in IMBALANCE (trend favorable)
-    {
-        auto result = engine.Compute(112.0, tickSize, 1, poc, vah, val,
-                                     100.0, 105.0, 95.0,
-                                     structure, zm, nullptr, nullptr,
-                                     AMTMarketState::IMBALANCE);
-        TEST_ASSERT(!result.gating.allowMeanReversion, "FAR+IMB: Should not allow mean reversion");
-        TEST_ASSERT(result.gating.allowTrend, "FAR+IMB: Should allow trend following");
-        TEST_ASSERT(result.gating.preferLongSide, "FAR+IMB: Should prefer long side (above value)");
-    }
-
-    std::cout << "Strategy gating tests complete\n";
+    std::cout << "No strategy gating test complete (SSOT purity verified)\n";
 }
 
 // ============================================================================
@@ -640,13 +624,12 @@ void TestLogFormatting() {
     std::string structLog = result.FormatStructureForLog();
     std::string sessLog = result.FormatSessionForLog();
     std::string refLog = result.FormatReferencesForLog();
-    std::string gateLog = result.FormatGatingForLog();
+    // NOTE: FormatGatingForLog() removed (Jan 2025) - gating moved to arbitration layer
 
     TEST_ASSERT(!mainLog.empty(), "Main log should not be empty");
     TEST_ASSERT(!structLog.empty(), "Structure log should not be empty");
     TEST_ASSERT(!sessLog.empty(), "Session log should not be empty");
     TEST_ASSERT(!refLog.empty(), "Reference log should not be empty");
-    TEST_ASSERT(!gateLog.empty(), "Gating log should not be empty");
 
     // Print sample output
     std::cout << "Sample log output:\n";
@@ -654,7 +637,6 @@ void TestLogFormatting() {
     std::cout << "  [VAL-STRUCT] " << structLog << "\n";
     std::cout << "  [VAL-SESS] " << sessLog << "\n";
     std::cout << "  [VAL-REF] " << refLog << "\n";
-    std::cout << "  [VAL-GATE] " << gateLog << "\n";
 
     std::cout << "Log formatting tests complete\n";
 }
@@ -673,7 +655,7 @@ int main() {
     TestVAOverlap();
     TestHysteresis();
     TestReferenceLevels();
-    TestStrategyGating();
+    TestNoStrategyGating();
     TestEventDetection();
     TestValidityGating();
     TestLogFormatting();
