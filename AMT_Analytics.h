@@ -591,10 +591,19 @@ namespace AMT {
         double pocAcceptanceRateOfDecisions = 0.0;
 
         /**
-         * Calculate phase distribution percentage
+         * Calculate phase distribution percentage (excludes UNKNOWN bars from denominator)
+         * This ensures known phases sum to 100%
          */
         double GetPhasePercent(int phaseBars) const {
-            return totalBars > 0 ? (static_cast<double>(phaseBars) / totalBars * 100.0) : 0.0;
+            const int knownBars = totalBars - unknownBars;
+            return knownBars > 0 ? (static_cast<double>(phaseBars) / knownBars * 100.0) : 0.0;
+        }
+
+        /**
+         * Get count of bars with known phase (excludes UNKNOWN/warmup)
+         */
+        int GetKnownBars() const {
+            return totalBars - unknownBars;
         }
 
         /**
